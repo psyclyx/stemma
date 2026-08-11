@@ -31,6 +31,15 @@ pub const Point = struct {
     col: usize,
 };
 
+/// A line/column position where `col` counts UTF-16 code units within the
+/// line — the coordinate system of the Language Server Protocol (and other
+/// JavaScript-adjacent consumers). Distinct from `Point` so byte columns and
+/// UTF-16 columns can never be confused by type.
+pub const PointUtf16 = struct {
+    row: usize,
+    col: usize,
+};
+
 /// Tie-breaking side for an `Anchor` sitting exactly at an edit boundary.
 pub const Bias = enum { left, right };
 

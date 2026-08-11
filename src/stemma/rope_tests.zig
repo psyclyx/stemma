@@ -659,6 +659,89 @@ test "large borrowed backing: many spans, cross-leaf edits, invariants" {
     try t.expect(!r.eql(snap));
 }
 
+test "find/findLast property: matches std.mem on flattened content" {
+    const gpa = t.allocator;
+    var prng = std.Random.DefaultPrng.init(0xf19d);
+    const random = prng.random();
+
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(gpa);
+    while (doc.items.len < 2048) {
+        try doc.appendSlice(gpa, pool[random.uintLessThan(usize, pool.len)]);
+    }
+    // chunk_capacity=8 → needles longer than 8 bytes always straddle leaves.
+    var r = try TinyRope.fromSlice(gpa, doc.items);
+    defer r.deinit(gpa);
+    const full: Range = .{ .start = 0, .end = doc.items.len };
+
+    for (0..200) |_| {
+        const a = random.uintLessThan(usize, doc.items.len - 24);
+        const nlen = 1 + random.uintLessThan(usize, 20);
+        const needle = doc.items[a..][0..nlen];
+        try t.expectEqual(std.mem.indexOf(u8, doc.items, needle), r.find(full, needle));
+        try t.expectEqual(std.mem.lastIndexOf(u8, doc.items, needle), r.findLast(full, needle));
+
+        // Sub-range agreement.
+        const lo = random.uintLessThan(usize, doc.items.len / 2);
+        const hi = lo + random.uintLessThan(usize, doc.items.len - lo);
+        const sub: Range = .{ .start = lo, .end = hi };
+        const expect_sub: ?usize = if (std.mem.indexOfPos(u8, doc.items[0..hi], lo, needle)) |p| p else null;
+        try t.expectEqual(expect_sub, r.find(sub, needle));
+    }
+
+    try t.expectEqual(@as(?usize, null), r.find(full, "~~~not present~~~"));
+
+    // Iterator finds every non-overlapping occurrence.
+    var n_std: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, doc.items, pos, "he")) |p| {
+        n_std += 1;
+        pos = p + 2;
+    }
+    var n_rope: usize = 0;
+    var it = r.findIterator(full, "he");
+    while (it.next()) |_| n_rope += 1;
+    try t.expectEqual(n_std, n_rope);
+}
+
+test "lineIterator agrees with lineRange" {
+    const gpa = t.allocator;
+    const text = "first\nsecond line\n\nfourth 𝄞\nlast without newline";
+    var r = try TinyRope.fromSlice(gpa, text);
+    defer r.deinit(gpa);
+
+    var lines = r.lineIterator(0);
+    var row: usize = 0;
+    while (lines.next()) |range| : (row += 1) {
+        const expected = r.lineRange(row);
+        try t.expectEqual(expected, range);
+    }
+    try t.expectEqual(r.lineCount(), row);
+
+    // Starting mid-document.
+    var from2 = r.lineIterator(2);
+    try t.expectEqual(r.lineRange(2), from2.next().?);
+    try t.expectEqual(r.lineRange(3), from2.next().?);
+}
+
+test "PointUtf16 conversions vs std.unicode reference" {
+    const gpa = t.allocator;
+    const text = "ascii row\n𝄞𝄞 astral\nmixed é€ạ row\n";
+    var r = try TinyRope.fromSlice(gpa, text);
+    defer r.deinit(gpa);
+
+    var bounds = try refBoundaries(gpa, text);
+    defer bounds.deinit(gpa);
+    for (bounds.items) |off| {
+        const p = r.offsetToPointUtf16(off);
+        const bp = refPoint(text, off);
+        try t.expectEqual(bp.row, p.row);
+        const line_start = off - bp.col;
+        try t.expectEqual(try std.unicode.calcUtf16LeLen(text[line_start..off]), p.col);
+        try t.expectEqual(off, r.pointUtf16ToOffset(p));
+    }
+}
+
 test "dimension-stripped instantiation compiles and works" {
     const gpa = t.allocator;
     const Bare = rope_mod.RopeWith(.{

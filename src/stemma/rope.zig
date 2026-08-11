@@ -23,6 +23,7 @@ const assert = std.debug.assert;
 
 const geometry = @import("geometry.zig");
 const Point = geometry.Point;
+const PointUtf16 = geometry.PointUtf16;
 const Range = geometry.Range;
 const Edit = geometry.Edit;
 
@@ -1138,8 +1139,158 @@ pub fn RopeWith(comptime opts: Options) type {
         };
 
         // ════════════════════════════════════════════════════════════════
-        // Structural validation (tests / debugging)
+        // Search (byte-literal; regex and case folding layer above)
         // ════════════════════════════════════════════════════════════════
+
+        /// True iff the rope bytes starting at `abs` match `rest` (which must
+        /// fit before `limit`).
+        fn matchesFrom(self: RopeT, abs: usize, rest: []const u8, limit: usize) bool {
+            if (abs + rest.len > limit) return false;
+            var cur = self.cursorAt(abs);
+            var r = rest;
+            while (r.len > 0) {
+                const c = cur.nextChunk() orelse return false;
+                const m = @min(c.len, r.len);
+                if (!std.mem.eql(u8, c[0..m], r[0..m])) return false;
+                r = r[m..];
+            }
+            return true;
+        }
+
+        /// Byte offset of the first occurrence of `needle` in `range`, or
+        /// `null`. Matches may straddle chunk boundaries. `needle` is a byte
+        /// pattern; if both haystack and needle are valid UTF-8 (the rope
+        /// always is), matches land on scalar boundaries for free.
+        pub fn find(self: RopeT, range: Range, needle: []const u8) ?usize {
+            assert(needle.len > 0);
+            assert(range.end <= self.byteLen());
+            if (range.len() < needle.len) return null;
+            var cur = self.cursorAt(range.start);
+            while (cur.offset < range.end) {
+                const chunk_start = cur.offset;
+                const raw = cur.nextChunk() orelse break;
+                const c = if (chunk_start + raw.len > range.end)
+                    raw[0 .. range.end - chunk_start]
+                else
+                    raw;
+                // Wholly-in-chunk match is the earliest possible in this chunk.
+                if (std.mem.indexOf(u8, c, needle)) |p| return chunk_start + p;
+                // Straddle candidates: tail positions whose chunk suffix is a
+                // needle prefix, verified across subsequent chunks.
+                const first_tail = if (c.len >= needle.len) c.len - needle.len + 1 else 0;
+                for (first_tail..c.len) |p| {
+                    const head = c.len - p;
+                    if (std.mem.eql(u8, c[p..], needle[0..head]) and
+                        self.matchesFrom(chunk_start + c.len, needle[head..], range.end))
+                    {
+                        return chunk_start + p;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// Byte offset of the last occurrence of `needle` in `range`, or
+        /// `null`.
+        pub fn findLast(self: RopeT, range: Range, needle: []const u8) ?usize {
+            assert(needle.len > 0);
+            assert(range.end <= self.byteLen());
+            if (range.len() < needle.len) return null;
+            var cur = self.cursorAt(range.end);
+            while (cur.offset > range.start) {
+                const chunk_end = cur.offset;
+                const raw = cur.prevChunk() orelse break;
+                const chunk_start = chunk_end - raw.len;
+                const lo = if (chunk_start < range.start) range.start - chunk_start else 0;
+                const c = raw[lo..];
+                const abs = chunk_start + lo;
+                var best: ?usize = null;
+                if (std.mem.lastIndexOf(u8, c, needle)) |p| {
+                    if (abs + p + needle.len <= range.end) best = abs + p;
+                }
+                // Straddle candidates start in this chunk's tail and extend
+                // rightward; any match starting further right was already
+                // checked in a previous (later) chunk iteration.
+                const first_tail = if (c.len >= needle.len) c.len - needle.len + 1 else 0;
+                var p = c.len;
+                while (p > first_tail) {
+                    p -= 1;
+                    if (best != null and best.? >= abs + p) break;
+                    const head = c.len - p;
+                    if (head < needle.len and std.mem.eql(u8, c[p..], needle[0..head]) and
+                        self.matchesFrom(chunk_start + raw.len, needle[head..], range.end))
+                    {
+                        best = @max(best orelse 0, abs + p);
+                        break; // rightmost straddle in this chunk
+                    }
+                }
+                if (best) |b| return b;
+            }
+            return null;
+        }
+
+        /// Iterator over non-overlapping occurrences of `needle` in `range`,
+        /// left to right. Same invalidation rule as `Cursor`.
+        pub fn findIterator(self: RopeT, range: Range, needle: []const u8) FindIterator {
+            assert(needle.len > 0);
+            return .{ .rope = self, .pos = range.start, .end = range.end, .needle = needle };
+        }
+
+        pub const FindIterator = struct {
+            rope: RopeT,
+            pos: usize,
+            end: usize,
+            needle: []const u8,
+
+            pub fn next(self: *FindIterator) ?usize {
+                if (self.pos >= self.end) return null;
+                const hit = self.rope.find(.{ .start = self.pos, .end = self.end }, self.needle) orelse {
+                    self.pos = self.end;
+                    return null;
+                };
+                self.pos = hit + self.needle.len;
+                return hit;
+            }
+        };
+
+        // ════════════════════════════════════════════════════════════════
+        // Line iteration (amortized O(1) per line vs O(log n) lineRange)
+        // ════════════════════════════════════════════════════════════════
+
+        /// Iterate line ranges from `start_row` to the last line. Each range
+        /// excludes its terminating newline (`slice()` it for the bytes).
+        /// Same invalidation rule as `Cursor`.
+        pub fn lineIterator(self: RopeT, start_row: usize) LineIterator {
+            comptime if (!opts.track_lines) @compileError("lines dimension disabled");
+            assert(start_row < self.lineCount());
+            const start = if (start_row == 0) 0 else offsetAfterNewlines(self.root, start_row);
+            return .{ .cursor = self.cursorAt(start), .line_start = start, .done = false };
+        }
+
+        pub const LineIterator = struct {
+            cursor: Cursor,
+            line_start: usize,
+            done: bool,
+
+            pub fn next(self: *LineIterator) ?Range {
+                if (self.done) return null;
+                const cur = &self.cursor;
+                while (cur.nextChunk()) |raw| {
+                    const chunk_start = cur.offset - raw.len;
+                    if (std.mem.indexOfScalar(u8, raw, '\n')) |p| {
+                        const nl = chunk_start + p;
+                        const r: Range = .{ .start = self.line_start, .end = nl };
+                        self.line_start = nl + 1;
+                        // Rewind within the current leaf: nl+1 is inside or at
+                        // the end of it, both valid cursor positions.
+                        cur.offset = nl + 1;
+                        return r;
+                    }
+                }
+                self.done = true;
+                return .{ .start = self.line_start, .end = cur.len };
+            }
+        };
 
         /// Exhaustive O(n) structural check: uniform heights, fanout bounds,
         /// non-empty leaves within capacity, per-node summaries consistent
@@ -1320,6 +1471,31 @@ pub fn RopeWith(comptime opts: Options) type {
             comptime if (!opts.track_utf16) @compileError("utf16 dimension disabled");
             assert(utf16_offset <= self.utf16Len());
             return offsetOfCount(self.root, utf16_offset, .utf16);
+        }
+
+        /// Byte offset → LSP-style (row, UTF-16 col within line).
+        pub fn offsetToPointUtf16(self: RopeT, byte_offset: usize) PointUtf16 {
+            comptime if (!opts.track_lines) @compileError("lines dimension disabled");
+            comptime if (!opts.track_utf16) @compileError("utf16 dimension disabled");
+            assert(byte_offset <= self.byteLen());
+            const row = prefixCount(self.root, byte_offset, .newlines);
+            const line_start = if (row == 0) 0 else offsetAfterNewlines(self.root, row);
+            const col = prefixCount(self.root, byte_offset, .utf16) -
+                prefixCount(self.root, line_start, .utf16);
+            return .{ .row = row, .col = col };
+        }
+
+        /// LSP-style (row, UTF-16 col) → byte offset. Preconditions: `row` is
+        /// a valid line; `col` lands on a scalar boundary within it (not
+        /// mid-surrogate).
+        pub fn pointUtf16ToOffset(self: RopeT, point: PointUtf16) usize {
+            comptime if (!opts.track_lines) @compileError("lines dimension disabled");
+            comptime if (!opts.track_utf16) @compileError("utf16 dimension disabled");
+            const line_start = if (point.row == 0) 0 else offsetAfterNewlines(self.root, point.row);
+            const base = prefixCount(self.root, line_start, .utf16);
+            const offset = offsetOfCount(self.root, base + point.col, .utf16);
+            assert(offset <= self.byteLen());
+            return offset;
         }
 
         // ════════════════════════════════════════════════════════════════

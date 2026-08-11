@@ -46,3 +46,9 @@ Reading the numbers:
 - **2026-08-10 — c1024b16**: best scan (65 GB/s) and load (2.2 GB/s) but
   conversions +40–60% and typing +20% — rejected as default; viable
   specialization for scan-dominated read-mostly workloads via `RopeWith`.
+- **2026-08-11 — consumer-surface additions** (find/lineIterator/AnchorSet/
+  PointUtf16): random-edit median moved 322→334 ns in a same-session
+  stash A/B despite the new code never executing on that path — attributed
+  to code-layout/alignment effects of a larger compilation unit (best-case
+  312-316 ns unchanged, all other workloads flat). Accepted; revisit only
+  if it compounds.

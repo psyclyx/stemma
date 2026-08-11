@@ -29,11 +29,13 @@ const std = @import("std");
 
 const geometry = @import("geometry.zig");
 const rope = @import("rope.zig");
+const anchors = @import("anchors.zig");
 
 pub const graph = @import("graph.zig");
 
 // ── Value types ──
 pub const Point = geometry.Point;
+pub const PointUtf16 = geometry.PointUtf16;
 pub const Range = geometry.Range;
 pub const Bias = geometry.Bias;
 pub const Edit = geometry.Edit;
@@ -44,9 +46,14 @@ pub const Options = rope.Options;
 pub const RopeWith = rope.RopeWith;
 pub const Rope = rope.Rope;
 
+// ── Bulk edit-stable positions (diagnostics, marks, multi-cursor) ──
+pub const AnchorSet = anchors.AnchorSet;
+
 test {
     _ = geometry;
     _ = rope;
+    _ = anchors;
     _ = graph;
     _ = @import("rope_tests.zig");
+    _ = @import("usage_tests.zig");
 }
