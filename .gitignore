@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+.worktrees/
+result
+result-*
+vgcore.*
+perf.data
+perf.data.old
+.direnv/
+CLAUDE.md
