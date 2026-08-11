@@ -111,7 +111,8 @@ fn checkAgainstReference(r: anytype, ref: []const u8) !void {
         try t.expectEqualStrings(ref, rebuilt.items);
     }
 
-    // Cursor scalar walk matches std.unicode iteration.
+    // Cursor scalar walk matches std.unicode iteration — and walking back
+    // from the end reproduces it in reverse, landing exactly at 0.
     {
         var cur = r.cursorAt(0);
         var view = (try std.unicode.Utf8View.init(ref)).iterator();
@@ -119,7 +120,32 @@ fn checkAgainstReference(r: anytype, ref: []const u8) !void {
             try t.expectEqual(@as(?u21, expected), cur.next());
         }
         try t.expectEqual(@as(?u21, null), cur.next());
+
+        var fwd: std.ArrayList(u21) = .empty;
+        defer fwd.deinit(gpa);
+        var view2 = (try std.unicode.Utf8View.init(ref)).iterator();
+        while (view2.nextCodepoint()) |cp| try fwd.append(gpa, cp);
+        var back = r.cursorAt(ref.len);
+        var remaining = fwd.items.len;
+        while (back.prev()) |cp| {
+            remaining -= 1;
+            try t.expectEqual(fwd.items[remaining], cp);
+        }
+        try t.expectEqual(@as(usize, 0), remaining);
+        try t.expectEqual(@as(usize, 0), back.byteOffset());
     }
+
+    // Reverse chunk walk reassembles the contents.
+    {
+        var rebuilt: std.ArrayList(u8) = .empty;
+        defer rebuilt.deinit(gpa);
+        var cur = r.cursorAt(ref.len);
+        while (cur.prevChunk()) |c| try rebuilt.insertSlice(gpa, 0, c);
+        try t.expectEqualStrings(ref, rebuilt.items);
+    }
+
+    // Structural invariants hold.
+    r.validate();
 }
 
 fn runOracle(comptime RopeT: type, seed: u64, op_count: usize) !void {
@@ -351,6 +377,91 @@ test "split/append at extremes" {
     // Append into empty.
     try r.append(gpa, &right2);
     try t.expectEqual(@as(usize, 10), r.byteLen());
+}
+
+test "eql: sharing, structure-independence, and difference" {
+    const gpa = t.allocator;
+    var a = try TinyRope.fromSlice(gpa, "same content, different trees\n");
+    defer a.deinit(gpa);
+
+    // Snapshot shares the root: O(1) true.
+    var snap = a.snapshot();
+    defer snap.deinit(gpa);
+    try t.expect(a.eql(snap));
+
+    // Same content built by a different edit history: still equal.
+    var b = try TinyRope.fromSlice(gpa, "different trees\n");
+    defer b.deinit(gpa);
+    _ = try b.insert(gpa, 0, "same content, ");
+    try t.expect(a.eql(b));
+    try t.expect(b.eql(a));
+
+    // One byte of difference: not equal.
+    _ = try b.replace(gpa, .{ .start = 0, .end = 4 }, "sane");
+    try t.expect(!a.eql(b));
+
+    // Length short-circuit.
+    _ = try b.delete(gpa, .{ .start = 0, .end = 5 });
+    try t.expect(!a.eql(b));
+
+    var e1: TinyRope = .empty;
+    var e2: TinyRope = .empty;
+    try t.expect(e1.eql(e2));
+    try t.expect(!e1.eql(a));
+    _ = &e1;
+    _ = &e2;
+}
+
+test "zigzag cursor: interleaved next/prev tracks reference" {
+    const gpa = t.allocator;
+    const text = "aé€𝄞\nbcℝ\nxyz日本語 end";
+    var r = try TinyRope.fromSlice(gpa, text);
+    defer r.deinit(gpa);
+
+    var prng = std.Random.DefaultPrng.init(0x2162);
+    const random = prng.random();
+    var cur = r.cursorAt(0);
+    var off: usize = 0;
+    for (0..300) |_| {
+        if (random.boolean()) {
+            if (cur.next()) |cp| {
+                off += std.unicode.utf8CodepointSequenceLength(cp) catch unreachable;
+            } else try t.expectEqual(text.len, off);
+        } else {
+            if (cur.prev()) |cp| {
+                off -= std.unicode.utf8CodepointSequenceLength(cp) catch unreachable;
+                // The scalar we stepped back over starts at the new offset.
+                const l = std.unicode.utf8ByteSequenceLength(text[off]) catch unreachable;
+                try t.expectEqual(std.unicode.utf8Decode(text[off..][0..l]) catch unreachable, cp);
+            } else try t.expectEqual(@as(usize, 0), off);
+        }
+        try t.expectEqual(off, cur.byteOffset());
+    }
+}
+
+test "streamReader: ranged, chunked, Reader-API compatible" {
+    const gpa = t.allocator;
+    const text = "stream a rope through std.Io.Reader — even 日本語 survives chunking";
+    var r = try TinyRope.fromSlice(gpa, text);
+    defer r.deinit(gpa);
+
+    // Whole-buffer streaming into a fixed writer.
+    {
+        var sr = r.streamReader(.{ .start = 0, .end = r.byteLen() }, &.{});
+        var out: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&out);
+        const n = try sr.interface.streamRemaining(&w);
+        try t.expectEqual(text.len, n);
+        try t.expectEqualStrings(text, w.buffered());
+    }
+    // Sub-range via readSliceAll (exercises the readVec → stream path).
+    {
+        var sr = r.streamReader(.{ .start = 7, .end = 13 }, &.{});
+        var out: [6]u8 = undefined;
+        try sr.interface.readSliceAll(&out);
+        try t.expectEqualStrings("a rope", &out);
+        try t.expectError(error.EndOfStream, sr.interface.readSliceAll(&out));
+    }
 }
 
 test "dimension-stripped instantiation compiles and works" {

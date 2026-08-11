@@ -1009,6 +1009,102 @@ pub fn RopeWith(comptime opts: Options) type {
             while (chunks.next()) |c| try writer.writeAll(c);
         }
 
+        /// Content equality. O(1) when the ropes share a root (snapshots of
+        /// an unedited buffer); otherwise a lockstep chunk compare with an
+        /// O(1) length short-circuit.
+        pub fn eql(self: RopeT, other: RopeT) bool {
+            if (self.root == other.root) return true;
+            const len = self.byteLen();
+            if (len != other.byteLen()) return false;
+            var ca = self.cursorAt(0);
+            var cb = other.cursorAt(0);
+            var a: []const u8 = &.{};
+            var b: []const u8 = &.{};
+            while (true) {
+                if (a.len == 0) a = ca.nextChunk() orelse return true;
+                if (b.len == 0) b = cb.nextChunk() orelse unreachable; // same length
+                const m = @min(a.len, b.len);
+                if (!std.mem.eql(u8, a[0..m], b[0..m])) return false;
+                a = a[m..];
+                b = b[m..];
+            }
+        }
+
+        /// A `std.Io.Reader` over `range`, streaming borrowed chunks with no
+        /// intermediate copy — feed the rope to any Reader-consuming API
+        /// (parsers, hashers, save pipelines). Same invalidation rule as
+        /// `Cursor`. `buffer` may be empty for pure streaming use; size it if
+        /// the consumer peeks.
+        pub fn streamReader(self: RopeT, range: Range, buffer: []u8) StreamReader {
+            assert(range.end <= self.byteLen());
+            return .{
+                .cursor = self.cursorAt(range.start),
+                .end = range.end,
+                .interface = .{
+                    .vtable = &.{ .stream = StreamReader.stream },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        pub const StreamReader = struct {
+            cursor: Cursor,
+            end: usize,
+            interface: std.Io.Reader,
+
+            fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                const self: *StreamReader = @alignCast(@fieldParentPtr("interface", io_r));
+                const cur = &self.cursor;
+                if (cur.offset >= self.end) return error.EndOfStream;
+                if (cur.offset - cur.leaf_start == cur.leaf.len) cur.advanceLeaf();
+                const pos = cur.offset - cur.leaf_start;
+                const avail = @min(cur.leaf.len - pos, self.end - cur.offset);
+                const chunk = limit.sliceConst(cur.leaf[pos..][0..avail]);
+                const n = try w.write(chunk);
+                cur.offset += n; // stays within the current leaf
+                return n;
+            }
+        };
+
+        // ════════════════════════════════════════════════════════════════
+        // Structural validation (tests / debugging)
+        // ════════════════════════════════════════════════════════════════
+
+        /// Exhaustive O(n) structural check: uniform heights, fanout bounds,
+        /// non-empty leaves within capacity, per-node summaries consistent
+        /// with contents, live refcounts. Panics on violation; intended for
+        /// tests and debugging, not production paths.
+        pub fn validate(self: RopeT) void {
+            const r = self.root orelse return;
+            const s = validateNode(r);
+            assert(s.bytes == r.summary.bytes);
+        }
+
+        fn validateNode(n: *Node) Summary {
+            const live_refs = if (opts.thread_safe) n.refs.load(.acquire) else n.refs;
+            assert(live_refs >= 1);
+            if (n.isLeaf()) {
+                const b = n.data.leaf.bytes();
+                assert(b.len > 0);
+                if (n.data.leaf == .owned) assert(b.len <= opts.chunk_capacity);
+                assert(std.unicode.utf8ValidateSlice(b));
+                const s = Summary.of(b);
+                assert(std.meta.eql(s, n.summary));
+                return s;
+            }
+            const cs = n.data.internal.slice();
+            assert(cs.len >= 2 and cs.len <= opts.branch_factor);
+            var s: Summary = .{};
+            for (cs) |c| {
+                assert(c.height == n.height - 1);
+                s = Summary.add(s, validateNode(c));
+            }
+            assert(std.meta.eql(s, n.summary));
+            return s;
+        }
+
         // ════════════════════════════════════════════════════════════════
         // Coordinate conversion (O(log n) + one in-leaf scan)
         // ════════════════════════════════════════════════════════════════
@@ -1222,24 +1318,58 @@ pub fn RopeWith(comptime opts: Options) type {
                 return c;
             }
 
+            /// Step back one scalar and return it, or `null` at the start.
+            pub fn prev(self: *Cursor) ?u21 {
+                if (self.offset == 0) return null;
+                const target = self.offset - 1;
+                if (target < self.leaf_start or target >= self.leaf_start + self.leaf.len) {
+                    self.descendContaining(target);
+                }
+                var p = target - self.leaf_start;
+                // Chunks never split scalars, so the lead byte is in this leaf.
+                while (self.leaf[p] & 0xC0 == 0x80) p -= 1;
+                const l = std.unicode.utf8ByteSequenceLength(self.leaf[p]) catch unreachable;
+                const cp = std.unicode.utf8Decode(self.leaf[p..][0..l]) catch unreachable;
+                self.offset = self.leaf_start + p;
+                return cp;
+            }
+
+            /// Step back to the start of the current chunk and return the
+            /// bytes from there to the current position, or `null` at the
+            /// start of the buffer.
+            pub fn prevChunk(self: *Cursor) ?[]const u8 {
+                if (self.offset == 0) return null;
+                const target = self.offset - 1;
+                if (target < self.leaf_start or target >= self.leaf_start + self.leaf.len) {
+                    self.descendContaining(target);
+                }
+                const c = self.leaf[0 .. self.offset - self.leaf_start];
+                self.offset = self.leaf_start;
+                return c;
+            }
+
             /// Reposition (backward or forward). O(log n).
             pub fn seekTo(self: *Cursor, byte_offset: usize) void {
                 assert(byte_offset <= self.len);
                 self.offset = byte_offset;
-                self.depth = 0;
-                const root = self.root orelse {
-                    self.leaf = &.{};
-                    self.leaf_start = 0;
-                    return;
-                };
-                if (byte_offset == self.len) {
-                    // End position: park on an empty tail; next() returns null.
+                if (self.root == null or byte_offset == self.len) {
+                    // Empty rope or end position: park on an empty tail;
+                    // next() returns null, prev() re-descends.
+                    self.depth = 0;
                     self.leaf = &.{};
                     self.leaf_start = self.len;
                     return;
                 }
-                var n = root;
-                var local = byte_offset;
+                self.descendContaining(byte_offset);
+            }
+
+            /// Point the leaf cache and descent stack at the leaf containing
+            /// byte `target`. Does not touch `self.offset`.
+            fn descendContaining(self: *Cursor, target: usize) void {
+                assert(target < self.len);
+                self.depth = 0;
+                var n = self.root.?;
+                var local = target;
                 var abs_start: usize = 0;
                 while (!n.isLeaf()) {
                     var idx: usize = 0;

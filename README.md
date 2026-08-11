@@ -42,8 +42,9 @@ dissolved instead:
 ## Scope — decomplected on purpose
 
 **Owns:** the sequence (always valid UTF-8), metrics, coordinate conversion,
-O(1) snapshots, chunk/scalar cursors, `split`/`append`, and the `Edit` +
-`Anchor.shift` primitives that keep caller positions valid across edits.
+O(1) snapshots, bidirectional chunk/scalar cursors, `split`/`append`, `eql`,
+a zero-copy `std.Io.Reader` adapter, and the `Edit` + `Anchor.shift`
+primitives that keep caller positions valid across edits.
 
 **Leaves to the caller:** grapheme/word/display-column segmentation (the
 atomic unit is the Unicode scalar), cursors and selections as editor state (a
