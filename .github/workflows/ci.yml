@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The entire toolchain comes from shell.nix via the npins-pinned nixpkgs —
+# one pin for local dev and CI, no drift. Same gates as hooks/pre-commit,
+# enforced.
+jobs:
+  tests:
+    name: Format + tests (Debug/ReleaseSafe/ReleaseFast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('npins/sources.json', 'shell.nix', 'default.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      # Upstream Nix (unlike Determinate Nix) ships no NIX_PATH, but the
+      # nix-shell binary evaluates (import <nixpkgs> {}).bashInteractive for
+      # its shell environment — fatal on a channel-less install. Point
+      # <nixpkgs> at the same npins pin shell.nix uses, so no drift.
+      - name: Pin NIX_PATH to the npins nixpkgs
+        run: echo "NIX_PATH=nixpkgs=$(nix-instantiate --eval --raw --expr '(import ./npins).nixpkgs.outPath')" >> "$GITHUB_ENV"
+
+      - name: Formatting
+        run: nix-shell --run "treefmt --fail-on-change"
+
+      - name: Tests (Debug)
+        run: nix-shell --run "zig build test"
+
+      - name: Tests (ReleaseSafe)
+        run: nix-shell --run "zig build test -Doptimize=ReleaseSafe"
+
+      - name: Tests (ReleaseFast)
+        run: nix-shell --run "zig build test -Doptimize=ReleaseFast"
+
+      # Compiles the bench harness and every knob instantiation without
+      # running workloads (the filter matches nothing) — keeps dev/bench and
+      # the RopeWith sweep surface building.
+      - name: Bench harness builds
+        run: nix-shell --run "zig build bench -- ci-build-smoke-no-match"
+
+  nix:
+    name: Nix package builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('npins/sources.json', 'shell.nix', 'default.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - name: Build the standalone package
+        run: nix-build -A default

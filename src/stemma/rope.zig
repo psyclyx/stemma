@@ -861,11 +861,13 @@ pub fn RopeWith(comptime opts: Options) type {
                 if (tryFastInsert(r, byte_offset, text, delta)) return edit;
             }
 
-            // General path: split, build the middle, concat — with the old
-            // root retained so failure leaves the rope unchanged.
+            // General path: build the middle first (rope state untouched if
+            // that fails), then split + concat with the old root retained so
+            // any later failure restores it. Once splitRoot runs, our root
+            // ref is consumed — error paths must only reinstate `saved`.
+            const mid = try treeFromBytes(gpa, text, .owned);
             const saved = if (self.root) |r| retain(r) else null;
             errdefer self.root = saved;
-            const mid = try treeFromBytes(gpa, text, .owned);
             const halves = splitRoot(gpa, self.root, byte_offset) catch |e| {
                 releaseOpt(gpa, mid);
                 return e;
@@ -914,15 +916,82 @@ pub fn RopeWith(comptime opts: Options) type {
 
         const scratch_len = @min(opts.chunk_capacity, 512);
 
-        /// Replace `range` with `text`: one call, one combined `Edit`; no
-        /// intermediate state is observable to the caller. On allocation
-        /// failure the rope is either unchanged or has only the delete
-        /// applied — treat the rope as unchanged in content terms by
-        /// retrying or reloading.
+        fn tryFastReplace(n: *Node, start: usize, count: usize, text: []const u8, delta_sub: Summary, delta_add: Summary) bool {
+            if (!isUnique(n)) return false;
+            if (n.isLeaf()) {
+                switch (n.data.leaf) {
+                    .borrowed => return false,
+                    .owned => |*o| {
+                        const new_len = o.len - count + text.len;
+                        if (new_len == 0 or new_len > opts.chunk_capacity) return false;
+                        const tail = o.buf[start + count .. o.len];
+                        if (text.len < count) {
+                            std.mem.copyForwards(u8, o.buf[start + text.len ..][0..tail.len], tail);
+                        } else if (text.len > count) {
+                            std.mem.copyBackwards(u8, o.buf[start + text.len ..][0..tail.len], tail);
+                        }
+                        @memcpy(o.buf[start..][0..text.len], text);
+                        o.len = @intCast(new_len);
+                        n.summary = Summary.add(Summary.sub(n.summary, delta_sub), delta_add);
+                        return true;
+                    },
+                }
+            }
+            var acc: usize = 0;
+            for (n.data.internal.slice()) |c| {
+                if (start >= acc and start + count <= acc + c.summary.bytes) {
+                    if (tryFastReplace(c, start - acc, count, text, delta_sub, delta_add)) {
+                        n.summary = Summary.add(Summary.sub(n.summary, delta_sub), delta_add);
+                        return true;
+                    }
+                    return false;
+                }
+                acc += c.summary.bytes;
+            }
+            return false; // range spans children
+        }
+
+        /// Replace `range` with `text`: one call, one combined `Edit`. On
+        /// allocation failure the rope is unchanged.
         pub fn replace(self: *RopeT, gpa: Allocator, range: Range, text: []const u8) Error!Edit {
+            const edit: Edit = .{ .offset = range.start, .removed = range.len(), .inserted = text.len };
+            if (range.isEmpty()) {
+                _ = try self.insert(gpa, range.start, text);
+                return edit;
+            }
+            if (text.len == 0) {
+                _ = try self.delete(gpa, range);
+                return edit;
+            }
+            assert(range.end <= self.byteLen());
+            self.assertScalarBoundary(range.start);
+            self.assertScalarBoundary(range.end);
+            if (runtime_safety) assert(std.unicode.utf8ValidateSlice(text));
+
+            if (self.root) |r| fast: {
+                if (range.len() >= r.summary.bytes) break :fast;
+                var scratch: [scratch_len]u8 = undefined;
+                if (range.len() <= scratch.len) {
+                    self.copyRange(scratch[0..range.len()], range);
+                    const delta_sub = Summary.of(scratch[0..range.len()]);
+                    const delta_add = Summary.of(text);
+                    if (tryFastReplace(r, range.start, range.len(), text, delta_sub, delta_add)) return edit;
+                }
+            }
+
+            // General path: delete + insert, made atomic by holding a ref on
+            // the pre-replace root. delete/insert each restore themselves on
+            // failure, so `self.root` is always a valid tree here; on error we
+            // release whichever state we're in and reinstate the original.
+            const saved = if (self.root) |r| retain(r) else null;
+            errdefer {
+                releaseOpt(gpa, self.root);
+                self.root = saved;
+            }
             _ = try self.delete(gpa, range);
             _ = try self.insert(gpa, range.start, text);
-            return .{ .offset = range.start, .removed = range.len(), .inserted = text.len };
+            releaseOpt(gpa, saved);
+            return edit;
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -1205,7 +1274,7 @@ pub fn RopeWith(comptime opts: Options) type {
             assert(byte_offset <= self.byteLen());
             const row = prefixCount(self.root, byte_offset, .newlines);
             const line_start = if (row == 0) 0 else offsetAfterNewlines(self.root, row);
-            return .{ .row = @intCast(row), .col = @intCast(byte_offset - line_start) };
+            return .{ .row = row, .col = byte_offset - line_start };
         }
 
         pub fn pointToOffset(self: RopeT, point: Point) usize {
@@ -1287,7 +1356,7 @@ pub fn RopeWith(comptime opts: Options) type {
                 comptime if (!opts.track_lines) @compileError("lines dimension disabled");
                 const row = prefixCount(self.root, self.offset, .newlines);
                 const line_start = if (row == 0) 0 else offsetAfterNewlines(self.root, row);
-                return .{ .row = @intCast(row), .col = @intCast(self.offset - line_start) };
+                return .{ .row = row, .col = self.offset - line_start };
             }
 
             /// UTF-16 offset of the current position. O(log n).

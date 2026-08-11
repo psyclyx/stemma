@@ -36,7 +36,7 @@ const pool = [_][]const u8{
 };
 
 fn refPoint(bytes: []const u8, off: usize) Point {
-    var row: u32 = 0;
+    var row: usize = 0;
     var line_start: usize = 0;
     for (bytes[0..off], 0..) |b, i| {
         if (b == '\n') {
@@ -44,7 +44,7 @@ fn refPoint(bytes: []const u8, off: usize) Point {
             line_start = i + 1;
         }
     }
-    return .{ .row = row, .col = @intCast(off - line_start) };
+    return .{ .row = row, .col = off - line_start };
 }
 
 /// All scalar-boundary offsets of `bytes`, including 0 and len.
@@ -462,6 +462,201 @@ test "streamReader: ranged, chunked, Reader-API compatible" {
         try t.expectEqualStrings("a rope", &out);
         try t.expectError(error.EndOfStream, sr.interface.readSliceAll(&out));
     }
+}
+
+// ── Serious-editor hardening ────────────────────────────────────────────
+
+/// Content equality without allocating (safe under a failing allocator).
+fn expectContent(r: anytype, expected: []const u8) !void {
+    try t.expectEqual(expected.len, r.byteLen());
+    var i: usize = 0;
+    var chunks = r.slice(.{ .start = 0, .end = expected.len });
+    while (chunks.next()) |c| {
+        try t.expect(std.mem.eql(u8, expected[i..][0..c.len], c));
+        i += c.len;
+    }
+    try t.expectEqual(expected.len, i);
+}
+
+/// Scripted general-path sequence for allocation-fault injection. Every
+/// alloc-failing op must leave the rope (and a live snapshot) byte-identical
+/// to its pre-op state before propagating OOM; every node must be freed
+/// afterwards (the harness leak-checks each fail index).
+fn oomScript(gpa: std.mem.Allocator) !void {
+    const d0 = "abcdefghij" ** 10; // deep tree at chunk_capacity=8
+    const ins = "INSERTED_TEXT_LONGER_THAN_LEAF";
+    const e1 = d0[0..50] ++ ins ++ d0[50..];
+    const e2 = e1[0..40] ++ e1[90..];
+    const e3 = e2[0..10] ++ "xyz" ++ e2[20..];
+
+    var r = try TinyRope.fromSlice(gpa, d0);
+    defer r.deinit(gpa);
+
+    var snap = r.snapshot();
+    defer snap.deinit(gpa);
+
+    _ = r.insert(gpa, 50, ins) catch |err| {
+        try expectContent(&r, d0);
+        return err;
+    };
+    try expectContent(&r, e1);
+
+    _ = r.delete(gpa, .{ .start = 40, .end = 90 }) catch |err| {
+        try expectContent(&r, e1);
+        try expectContent(&snap, d0);
+        return err;
+    };
+    try expectContent(&r, e2);
+
+    _ = r.replace(gpa, .{ .start = 10, .end = 20 }, "xyz") catch |err| {
+        try expectContent(&r, e2);
+        return err;
+    };
+    try expectContent(&r, e3);
+
+    var right = r.split(gpa, 30) catch |err| {
+        try expectContent(&r, e3);
+        return err;
+    };
+    errdefer right.deinit(gpa);
+    try expectContent(&r, e3[0..30]);
+    r.append(gpa, &right) catch |err| {
+        try expectContent(&r, e3[0..30]);
+        try expectContent(&right, e3[30..]);
+        return err;
+    };
+    try expectContent(&r, e3);
+
+    // The snapshot rode through everything untouched.
+    try expectContent(&snap, d0);
+    r.validate();
+    snap.validate();
+}
+
+test "OOM: every allocation failure leaves the rope unchanged and leak-free" {
+    try std.testing.checkAllAllocationFailures(t.allocator, oomScript, .{});
+}
+
+test "snapshots cross threads: readers verify frozen state under live edits" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    // testing.allocator is not thread-safe; snapshots deinit on other threads.
+    const A = std.heap.smp_allocator;
+
+    const ReaderThread = struct {
+        fn run(snap: Rope, expected: []const u8) void {
+            var s = snap;
+            defer s.deinit(std.heap.smp_allocator);
+            defer std.heap.smp_allocator.free(expected);
+            for (0..64) |_| {
+                var i: usize = 0;
+                var chunks = s.slice(.{ .start = 0, .end = s.byteLen() });
+                while (chunks.next()) |c| {
+                    std.debug.assert(std.mem.eql(u8, expected[i..][0..c.len], c));
+                    i += c.len;
+                }
+                std.debug.assert(i == expected.len);
+                std.debug.assert(s.offsetToPoint(i / 2).row <= s.lineCount());
+            }
+        }
+    };
+
+    var r = try Rope.fromSlice(A, "base line\n" ** 40);
+    defer r.deinit(A);
+
+    var threads: [6]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |th| th.join();
+    for (&threads) |*th| {
+        // Edit between spawns so every snapshot freezes a different state
+        // and the writer keeps mutating while readers verify.
+        for (0..120) |k| {
+            _ = try r.insert(A, r.byteLen() / 2, "concurrent edit ");
+            if (k % 3 == 0) {
+                const start = r.byteLen() / 3;
+                _ = try r.delete(A, .{ .start = start, .end = start + 8 });
+            }
+        }
+        const snap = r.snapshot();
+        const expected = try r.toOwnedSlice(A);
+        th.* = try std.Thread.spawn(.{}, ReaderThread.run, .{ snap, expected });
+        spawned += 1;
+    }
+}
+
+fn fuzzOps(_: void, smith: *std.testing.Smith) !void {
+    const gpa = t.allocator;
+    var ref: std.ArrayList(u8) = .empty;
+    defer ref.deinit(gpa);
+    var r: TinyRope = .empty;
+    defer r.deinit(gpa);
+
+    var ops: usize = 0;
+    while (ops < 512 and !smith.eosWithHash(0x5731)) : (ops += 1) {
+        var bounds = try refBoundaries(gpa, ref.items);
+        defer bounds.deinit(gpa);
+        const a = bounds.items[smith.indexWithHash(bounds.items.len, 0x0a11)];
+        const b = bounds.items[smith.indexWithHash(bounds.items.len, 0x0b22)];
+        const range: Range = .{ .start = @min(a, b), .end = @max(a, b) };
+        const text = pool[smith.indexWithHash(pool.len, 0x7e37)];
+        switch (smith.valueRangeLessThanWithHash(u8, 0, 4, 0x0004)) {
+            0 => {
+                _ = try r.insert(gpa, a, text);
+                try ref.insertSlice(gpa, a, text);
+            },
+            1 => {
+                _ = try r.delete(gpa, range);
+                try ref.replaceRange(gpa, range.start, range.len(), &.{});
+            },
+            2 => {
+                _ = try r.replace(gpa, range, text);
+                try ref.replaceRange(gpa, range.start, range.len(), text);
+            },
+            3 => {
+                var right = try r.split(gpa, a);
+                try r.append(gpa, &right);
+            },
+            else => unreachable,
+        }
+        try t.expectEqual(ref.items.len, r.byteLen());
+    }
+    try checkAgainstReference(&r, ref.items);
+}
+
+test "fuzz: smith-driven op stream against the oracle" {
+    try std.testing.fuzz({}, fuzzOps, .{});
+}
+
+test "large borrowed backing: many spans, cross-leaf edits, invariants" {
+    const gpa = t.allocator;
+    const Borrow64K = rope_mod.RopeWith(.{ .borrowed_capacity = 1 << 16 });
+
+    // 8 MiB deterministic doc, newline every 64 bytes → 128 borrowed spans.
+    const size = 8 << 20;
+    const doc = try gpa.alloc(u8, size);
+    defer gpa.free(doc);
+    for (doc, 0..) |*byte, i| {
+        byte.* = if (i % 64 == 63) '\n' else 'a' + @as(u8, @intCast(i % 26));
+    }
+
+    var r = try Borrow64K.fromBacking(gpa, doc);
+    defer r.deinit(gpa);
+    try t.expectEqual(size, r.byteLen());
+    try t.expectEqual(size / 64 + 1, r.lineCount());
+    try t.expectEqual(Point{ .row = 1, .col = 0 }, r.offsetToPoint(64));
+    try t.expectEqual(@as(usize, size / 2), r.offsetToScalar(size / 2));
+
+    var snap = r.snapshot();
+    defer snap.deinit(gpa);
+
+    // Edits crossing multiple borrowed leaves.
+    _ = try r.insert(gpa, size / 2, "spliced into the middle of an mmap span");
+    _ = try r.delete(gpa, .{ .start = 1 << 16, .end = (1 << 16) * 3 }); // two whole spans + boundary
+    _ = try r.replace(gpa, .{ .start = 0, .end = 128 }, "rewritten head\n");
+    r.validate();
+
+    // Snapshot still equals the pristine backing; rope diverged.
+    try expectContent(&snap, doc);
+    try t.expect(!r.eql(snap));
 }
 
 test "dimension-stripped instantiation compiles and works" {

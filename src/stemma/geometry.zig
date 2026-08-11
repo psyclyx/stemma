@@ -24,10 +24,11 @@ pub const Range = struct {
 
 /// A line/column position. `col` is a **byte** offset within the line — not a
 /// grapheme or display column (those are the caller's job). Row and column are
-/// 0-based; the newline terminating a row is not part of the row.
+/// 0-based; the newline terminating a row is not part of the row. Full-width
+/// integers on purpose: a multi-gigabyte single-line file must not truncate.
 pub const Point = struct {
-    row: u32,
-    col: u32,
+    row: usize,
+    col: usize,
 };
 
 /// Tie-breaking side for an `Anchor` sitting exactly at an edit boundary.
