@@ -1,0 +1,16 @@
+.{
+    .name = .stemma,
+    .version = "0.0.0",
+    // Generated once by the Zig toolchain; never changes.
+    .fingerprint = 0x963783a5a0ad8308,
+    .minimum_zig_version = "0.16.0",
+    // Publish only the consumable project — Nix pins, dev scaffolding, and
+    // generated outputs are not package inputs.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
