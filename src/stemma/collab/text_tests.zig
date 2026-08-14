@@ -9,15 +9,13 @@
 const std = @import("std");
 const t = std.testing;
 
-const doc_mod = @import("text.zig");
+const TextDoc = @import("TextDoc.zig");
 const geometry = @import("../geometry.zig");
-const anchors_mod = @import("../anchors.zig");
+const AnchorSet = @import("../AnchorSet.zig");
 
-const TextDoc = doc_mod.TextDoc;
-const EventId = doc_mod.EventId;
+const EventId = TextDoc.EventId;
 const Range = geometry.Range;
 const Edit = geometry.Edit;
-const AnchorSet = anchors_mod.AnchorSet;
 
 fn docText(gpa: std.mem.Allocator, d: *const TextDoc) ![]u8 {
     return d.text().toOwnedSlice(gpa);

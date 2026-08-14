@@ -15,11 +15,10 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
-const sequence = @import("sequence.zig");
+const Sequence = @import("Sequence.zig");
 const Lv = causal.Lv;
 const EventId = causal.EventId;
-const Sequence = sequence.Sequence;
-const none = sequence.none;
+const none = Sequence.none;
 
 /// String reference into the owning ObjectDoc's append-only arena.
 pub const Str = struct { start: u32, len: u32 };

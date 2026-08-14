@@ -37,7 +37,7 @@ const runtime_safety = switch (builtin.mode) {
 /// Compile-time configuration for `RopeWith`. The defaults are the library's
 /// blessed instantiation (`Rope`); specialize to shed dimensions or atomics
 /// you don't use — disabled dimensions cost zero bytes and zero work.
-pub const Options = struct {
+pub const RopeOptions = struct {
     /// Max bytes per owned (heap) leaf chunk. Default set by benchmark sweep
     /// (dev/bench): vs 256, 512 is ~17% faster on random edits, ~2.8× on
     /// chunk scans, +23% on bulk load, for ~15% slower point conversions
@@ -60,9 +60,9 @@ pub const Options = struct {
     track_lines: bool = true,
 };
 
-/// A `Rope` type specialized for `opts`. See `Options`; `Rope` (the default
+/// A `Rope` type specialized for `opts`. See `RopeOptions`; `Rope` (the default
 /// instantiation) is what most callers want.
-pub fn RopeWith(comptime opts: Options) type {
+pub fn RopeWith(comptime opts: RopeOptions) type {
     comptime {
         assert(opts.chunk_capacity >= 8);
         assert(opts.branch_factor >= 3);

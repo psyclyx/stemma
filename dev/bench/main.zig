@@ -228,7 +228,7 @@ fn benchLoadAndScan(comptime RopeT: type, io: Io, w: *Io.Writer, name_prefix: []
 /// throughput (v1 replays from genesis — these numbers are the baseline the
 /// optimization ladder in BENCHMARKS.md is measured against).
 fn benchCollab(io: Io, w: *Io.Writer) !void {
-    const TextDoc = stemma.collab.TextDoc;
+    const TextDoc = stemma.TextDoc;
 
     // Local typing through TextDoc (event recording + rope) vs bare rope.
     {

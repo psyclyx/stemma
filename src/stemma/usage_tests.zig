@@ -8,12 +8,11 @@ const t = std.testing;
 
 const rope_mod = @import("rope.zig");
 const geometry = @import("geometry.zig");
-const anchors = @import("anchors.zig");
+const AnchorSet = @import("AnchorSet.zig");
 
 const Range = geometry.Range;
 const Anchor = geometry.Anchor;
 const Edit = geometry.Edit;
-const AnchorSet = anchors.AnchorSet;
 
 // Small chunks so these exercise real tree structure.
 const Rope = rope_mod.RopeWith(.{ .chunk_capacity = 16, .thread_safe = false });

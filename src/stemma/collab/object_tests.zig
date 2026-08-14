@@ -5,9 +5,8 @@
 const std = @import("std");
 const t = std.testing;
 
-const json = @import("objects.zig");
+const ObjectDoc = @import("ObjectDoc.zig");
 const geometry = @import("../geometry.zig");
-const ObjectDoc = json.ObjectDoc;
 const Range = geometry.Range;
 
 fn syncOne(gpa: std.mem.Allocator, from: *const ObjectDoc, to: *ObjectDoc) !void {

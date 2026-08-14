@@ -3,35 +3,42 @@
 //! *stemma (n., pl. stemmata): a diagram showing the descent and
 //! relationships of the surviving manuscripts of a text.*
 //!
-//! The long-term shape is an event-graph CRDT library (eg-walker family):
-//! a causal DAG of editing events, walked on demand to merge divergent
-//! histories, generic over materialized types — with text as the first and
-//! flagship materializer. See `collab` for the engine's contract-in-progress.
+//! Two layers, one flat surface:
 //!
-//! What ships today is the flagship's foundation: `Rope`, a persistent,
-//! snapshot-able UTF-8 text buffer (B-tree of chunks with per-node metric
-//! summaries) built to be the fastest correct core for a text editor —
-//! single-user editing pays zero collaboration tax.
+//! The **buffer**: `Rope`, a persistent, snapshot-able UTF-8 text buffer
+//! (B-tree of chunks with per-node metric summaries) built to be the
+//! fastest correct core for a text editor, plus `AnchorSet` for bulk
+//! edit-stable positions.
+//!
+//! The **collaboration layer** (eg-walker family — Gentle & Kleppmann,
+//! EuroSys 2025): the durable artifact is the causal event graph, the
+//! *stemma* of the document; CRDT state is transient, rebuilt during
+//! merges. `TextDoc` is a collaborative text document (lean events,
+//! compaction, time travel, identity anchors); `ObjectDoc` is a
+//! collaborative object tree (multi-value maps, lists, text nodes) for
+//! JSON-blob-shaped applications. FugueMax ordering, opaque portable
+//! version tokens, wire-ready sync. Replica-local identifiers never cross
+//! the wire.
 //!
 //! ## Contracts (library-wide)
-//! - Byte offsets are the native coordinate; they must land on Unicode scalar
-//!   boundaries. The atomic unit is the scalar value: graphemes, words, and
-//!   display columns are the caller's concern.
+//! - Byte offsets are the native coordinate; they must land on Unicode
+//!   scalar boundaries. The atomic unit is the scalar value: graphemes,
+//!   words, and display columns are the caller's concern.
 //! - Content is always valid UTF-8; validity of *inputs* is an asserted
-//!   precondition (checked in safe builds), not a returned error.
-//! - Allocation is explicit and unmanaged: no type stores an allocator, and
-//!   the same allocator must be used across a value and everything derived
-//!   from it (snapshots, splits).
-//! - Cursors/selections/undo *policy* live in the caller, composed from
-//!   `Edit` deltas, `Anchor.shift`, and O(1) `snapshot()`s.
+//!   precondition (checked in safe builds), not a returned error. Hostile
+//!   *wire* input is fully validated and can never crash a replica.
+//! - Allocation is explicit and unmanaged: no type stores an allocator,
+//!   and the same allocator must be used across a value and everything
+//!   derived from it.
+//! - Cursors/selections/undo *policy*, transport, presence payloads, and
+//!   collaborative undo live in the caller, composed from `Edit` deltas,
+//!   `Anchor.shift`, snapshots, and the merge change streams.
 
 const std = @import("std");
 
 const geometry = @import("geometry.zig");
 const rope = @import("rope.zig");
-const anchors = @import("anchors.zig");
-
-pub const collab = @import("collab.zig");
+const causal = @import("collab/causal.zig");
 
 // ── Value types ──
 pub const Point = geometry.Point;
@@ -42,18 +49,32 @@ pub const Edit = geometry.Edit;
 pub const Anchor = geometry.Anchor;
 
 // ── The text buffer ──
-pub const Options = rope.Options;
+pub const RopeOptions = rope.RopeOptions;
 pub const RopeWith = rope.RopeWith;
 pub const Rope = rope.Rope;
+pub const AnchorSet = @import("AnchorSet.zig");
 
-// ── Bulk edit-stable positions (diagnostics, marks, multi-cursor) ──
-pub const AnchorSet = anchors.AnchorSet;
+// ── The collaboration layer ──
+pub const TextDoc = @import("collab/TextDoc.zig");
+pub const ObjectDoc = @import("collab/ObjectDoc.zig");
+pub const EventGraph = causal.EventGraph;
+pub const AgentId = causal.AgentId;
+pub const EventId = causal.EventId;
+pub const VersionOrder = causal.VersionOrder;
 
 test {
     _ = geometry;
     _ = rope;
-    _ = anchors;
-    _ = collab;
+    _ = AnchorSet;
+    _ = causal;
+    _ = TextDoc;
+    _ = ObjectDoc;
+    _ = @import("collab/core.zig");
+    _ = @import("collab/Sequence.zig");
+    _ = @import("collab/objects_state.zig");
+    _ = @import("collab/wire.zig");
     _ = @import("rope_tests.zig");
     _ = @import("usage_tests.zig");
+    _ = @import("collab/text_tests.zig");
+    _ = @import("collab/object_tests.zig");
 }
