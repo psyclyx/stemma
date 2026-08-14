@@ -69,7 +69,7 @@ const version_magic = "stv\x01";
 
 pub const TextDoc = struct {
     rope: Rope = .empty,
-    graph: Graph = .empty,
+    history: Graph = .empty,
     agent: ?AgentId = null,
 
     /// Frozen compacted pre-history (UTF-8), or empty.
@@ -89,7 +89,7 @@ pub const TextDoc = struct {
 
     pub fn deinit(self: *TextDoc, gpa: Allocator) void {
         self.rope.deinit(gpa);
-        self.graph.deinit(gpa);
+        self.history.deinit(gpa);
         gpa.free(self.base_bytes);
         gpa.free(self.base_version);
         self.* = .{};
@@ -99,7 +99,7 @@ pub const TextDoc = struct {
     /// must be globally unique among collaborating replicas (it is also the
     /// deterministic tiebreak for concurrent inserts).
     pub fn setAgent(self: *TextDoc, gpa: Allocator, name: []const u8) Allocator.Error!void {
-        self.agent = try self.graph.registerAgent(gpa, name);
+        self.agent = try self.history.registerAgent(gpa, name);
     }
 
     /// Read access to the materialized document.
@@ -120,7 +120,7 @@ pub const TextDoc = struct {
         var i: u64 = 0;
         var it = (std.unicode.Utf8View.init(content) catch unreachable).iterator();
         while (it.nextCodepoint()) |ch| : (i += 1) {
-            _ = try self.graph.addLocal(gpa, agent, .{ .ins = .{ .pos = scalar_pos + i, .ch = ch } });
+            _ = try self.history.addLocal(gpa, agent, .{ .ins = .{ .pos = scalar_pos + i, .ch = ch } });
         }
         _ = try self.rope.insert(gpa, byte_offset, content);
         return edit;
@@ -137,7 +137,7 @@ pub const TextDoc = struct {
         for (0..scalar_count) |_| {
             // Each unit deletes at the same position: the next scalar slides
             // into place after the previous unit's deletion.
-            _ = try self.graph.addLocal(gpa, agent, .{ .del = scalar_start });
+            _ = try self.history.addLocal(gpa, agent, .{ .del = scalar_start });
         }
         _ = try self.rope.delete(gpa, range);
         return edit;
@@ -155,10 +155,10 @@ pub const TextDoc = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
         try out.appendSlice(gpa, version_magic);
-        try putUv(gpa, &out, self.graph.frontier.items.len);
-        for (self.graph.frontier.items) |lv| {
-            const id = self.graph.idOf(lv);
-            const name = self.graph.agentName(id.agent);
+        try putUv(gpa, &out, self.history.frontier.items.len);
+        for (self.history.frontier.items) |lv| {
+            const id = self.history.idOf(lv);
+            const name = self.history.agentName(id.agent);
             try putUv(gpa, &out, name.len);
             try out.appendSlice(gpa, name);
             try putUv(gpa, &out, id.seq);
@@ -186,8 +186,8 @@ pub const TextDoc = struct {
             const name = cur[0..nlen];
             cur = cur[nlen..];
             const seq = try getUv(&cur);
-            const lv: ?Lv = if (self.graph.findAgent(name)) |agent|
-                self.graph.lvOf(.{ .agent = agent, .seq = seq })
+            const lv: ?Lv = if (self.history.findAgent(name)) |agent|
+                self.history.lvOf(.{ .agent = agent, .seq = seq })
             else
                 null;
             if (lv) |v| {
@@ -218,7 +218,7 @@ pub const TextDoc = struct {
         var b: std.ArrayList(Lv) = .empty;
         defer b.deinit(gpa);
         try self.decodeVersion(gpa, b_token, true, &b);
-        return self.graph.compareFrontiers(gpa, a.items, b.items);
+        return self.history.compareFrontiers(gpa, a.items, b.items);
     }
 
     /// Parse the single (name, seq) entry of a version token.
@@ -249,7 +249,7 @@ pub const TextDoc = struct {
             error.MissingDependency => unreachable, // lenient mode
             else => |err| return err,
         };
-        var missing = try self.graph.missingFrom(gpa, known.items);
+        var missing = try self.history.missingFrom(gpa, known.items);
         defer missing.deinit(gpa);
         return self.encodeEvents(gpa, missing.items);
     }
@@ -257,7 +257,7 @@ pub const TextDoc = struct {
     /// The whole document as its event graph (plus the base snapshot when
     /// compacted) — the durable form.
     pub fn serialize(self: *const TextDoc, gpa: Allocator) Allocator.Error![]u8 {
-        var missing = try self.graph.missingFrom(gpa, &.{});
+        var missing = try self.history.missingFrom(gpa, &.{});
         defer missing.deinit(gpa);
         return self.encodeEvents(gpa, missing.items);
     }
@@ -281,15 +281,15 @@ pub const TextDoc = struct {
         defer heads.deinit(gpa);
         try self.decodeVersion(gpa, version_token, true, &heads);
 
-        const n = self.graph.eventCount();
+        const n = self.history.eventCount();
         const include = try gpa.alloc(bool, n);
         defer gpa.free(include);
         @memset(include, false);
-        var d = try self.graph.diff(gpa, heads.items, &.{});
+        var d = try self.history.diff(gpa, heads.items, &.{});
         defer d.deinit(gpa);
         for (d.a_only.items) |lv| include[lv] = true;
 
-        var w = Walker.init(&self.graph);
+        var w = Walker.init(&self.history);
         defer w.deinit(gpa);
         if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
         var sink: std.ArrayList(ScalarEdit) = .empty;
@@ -310,7 +310,7 @@ pub const TextDoc = struct {
             const ch = if (alive.lv == base_lv)
                 base_chars[alive.arena]
             else
-                self.graph.opOf(alive.lv).ins.ch;
+                self.history.opOf(alive.lv).ins.ch;
             const len = std.unicode.utf8Encode(ch, &buf) catch unreachable;
             try bytes.appendSlice(gpa, buf[0..len]);
         }
@@ -374,9 +374,9 @@ pub const TextDoc = struct {
         while (it.next()) |alive| : (i += 1) {
             if (i == target_index) {
                 if (alive.lv == base_lv) return error.Compacted;
-                const id = self.graph.idOf(alive.lv);
+                const id = self.history.idOf(alive.lv);
                 return .{
-                    .agent = try gpa.dupe(u8, self.graph.agentName(id.agent)),
+                    .agent = try gpa.dupe(u8, self.history.agentName(id.agent)),
                     .seq = id.seq,
                     .side = stickiness,
                 };
@@ -415,12 +415,12 @@ pub const TextDoc = struct {
                 };
                 continue;
             }
-            const agent = self.graph.findAgent(a.agent) orelse return error.MissingDependency;
+            const agent = self.history.findAgent(a.agent) orelse return error.MissingDependency;
             const id: EventId = .{ .agent = agent, .seq = a.seq };
-            const lv = self.graph.lvOf(id) orelse {
-                return if (self.graph.isKnown(id)) error.Compacted else error.MissingDependency;
+            const lv = self.history.lvOf(id) orelse {
+                return if (self.history.isKnown(id)) error.Compacted else error.MissingDependency;
             };
-            if (self.graph.opOf(lv) != .ins) return error.Corrupt;
+            if (self.history.opOf(lv) != .ins) return error.Corrupt;
             const arena = w.item_of.items[lv];
             assert(arena != -1);
             const item = &w.items.items[@intCast(arena)];
@@ -432,12 +432,12 @@ pub const TextDoc = struct {
 
     /// Full silent replay of the whole graph (current state).
     fn silentReplay(self: *const TextDoc, gpa: Allocator) Allocator.Error!Walker {
-        var w = Walker.init(&self.graph);
+        var w = Walker.init(&self.history);
         errdefer w.deinit(gpa);
         if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
         var sink: std.ArrayList(ScalarEdit) = .empty;
         defer sink.deinit(gpa);
-        w.replayAll(gpa, @intCast(self.graph.eventCount()), null, &sink) catch |e| switch (e) {
+        w.replayAll(gpa, @intCast(self.history.eventCount()), null, &sink) catch |e| switch (e) {
             error.Corrupt => unreachable, // trusted local history
             else => |err| return err,
         };
@@ -462,11 +462,11 @@ pub const TextDoc = struct {
         if (heads.items.len != 1) return error.NotCompactable;
         const s = heads.items[0];
 
-        const n = self.graph.eventCount();
+        const n = self.history.eventCount();
         const in_base = try gpa.alloc(bool, n);
         defer gpa.free(in_base);
         @memset(in_base, false);
-        var d = try self.graph.diff(gpa, &.{s}, &.{});
+        var d = try self.history.diff(gpa, &.{s}, &.{});
         defer d.deinit(gpa);
         for (d.a_only.items) |lv| in_base[lv] = true;
 
@@ -474,7 +474,7 @@ pub const TextDoc = struct {
         // through retained events (or `s` itself).
         for (0..n) |lv| {
             if (in_base[lv]) continue;
-            for (self.graph.parentsOf(@intCast(lv))) |p| {
+            for (self.history.parentsOf(@intCast(lv))) |p| {
                 if (in_base[p] and p != s) return error.NotCompactable;
             }
         }
@@ -493,8 +493,8 @@ pub const TextDoc = struct {
         // the base, retained events re-added in causal order.
         var new_graph: Graph = .empty;
         errdefer new_graph.deinit(gpa);
-        for (self.graph.agents.items, 0..) |a, i| {
-            const name = self.graph.names.items[a.name_start..][0..a.name_len];
+        for (self.history.agents.items, 0..) |a, i| {
+            const name = self.history.names.items[a.name_start..][0..a.name_len];
             const aid = try new_graph.registerAgent(gpa, name);
             assert(@intFromEnum(aid) == i);
             var compacted: u64 = 0;
@@ -510,27 +510,27 @@ pub const TextDoc = struct {
         for (0..n) |old_lv| {
             if (in_base[old_lv]) continue;
             parent_buf.clearRetainingCapacity();
-            for (self.graph.parentsOf(@intCast(old_lv))) |p| {
+            for (self.history.parentsOf(@intCast(old_lv))) |p| {
                 if (p == s) continue; // implicit: based on the base
                 assert(!in_base[p]);
                 try parent_buf.append(gpa, lv_map[p]);
             }
-            const e = self.graph.events.items[old_lv];
+            const e = self.history.events.items[old_lv];
             lv_map[old_lv] = try new_graph.add(gpa, e.id, parent_buf.items, e.op);
         }
 
         // Commit.
-        const head_id = self.graph.idOf(s);
-        const head_name = try gpa.dupe(u8, self.graph.agentName(head_id.agent));
+        const head_id = self.history.idOf(s);
+        const head_name = try gpa.dupe(u8, self.history.agentName(head_id.agent));
         defer gpa.free(head_name);
-        self.graph.deinit(gpa);
-        self.graph = new_graph;
+        self.history.deinit(gpa);
+        self.history = new_graph;
         gpa.free(self.base_bytes);
         gpa.free(self.base_version);
         self.base_bytes = new_base_bytes;
         self.base_scalars = new_base_scalars;
         self.base_version = new_base_version;
-        self.base_head = .{ .agent = self.graph.findAgent(head_name).?, .seq = head_id.seq };
+        self.base_head = .{ .agent = self.history.findAgent(head_name).?, .seq = head_id.seq };
     }
 
     // ── Merge ───────────────────────────────────────────────────────────
@@ -550,7 +550,7 @@ pub const TextDoc = struct {
 
         // Base compatibility (before any mutation).
         const bootstrap = dec.base != null and self.base_version.len == 0 and
-            self.graph.eventCount() == 0 and self.rope.isEmpty();
+            self.history.eventCount() == 0 and self.rope.isEmpty();
         if (dec.base) |b| {
             if (!bootstrap and !std.mem.eql(u8, self.base_version, b.version)) {
                 return error.MissingDependency;
@@ -564,8 +564,8 @@ pub const TextDoc = struct {
         const eff_base = try gpa.alloc(u64, dec.names.items.len);
         defer gpa.free(eff_base);
         for (dec.names.items, aids, eff_base, dec.seq_bases.items) |name, *aid, *eff, batch_base| {
-            aid.* = try self.graph.registerAgent(gpa, name);
-            const have = self.graph.agents.items[@intFromEnum(aid.*)].seq_base;
+            aid.* = try self.history.registerAgent(gpa, name);
+            const have = self.history.agents.items[@intFromEnum(aid.*)].seq_base;
             if (bootstrap) {
                 eff.* = batch_base;
             } else if (batch_base != 0 and batch_base != have) {
@@ -580,7 +580,7 @@ pub const TextDoc = struct {
         var batch_head: ?EventId = self.base_head;
         if (bootstrap) {
             const entry = try versionSingleEntry(dec.base.?.version);
-            const agent = self.graph.findAgent(entry.name) orelse return error.Corrupt;
+            const agent = self.history.findAgent(entry.name) orelse return error.Corrupt;
             batch_head = .{ .agent = agent, .seq = entry.seq };
         }
 
@@ -597,7 +597,7 @@ pub const TextDoc = struct {
             self.base_scalars = b.scalars;
             self.base_head = batch_head;
             for (aids, eff_base) |aid, eff| {
-                self.graph.agents.items[@intFromEnum(aid)].seq_base = eff;
+                self.history.agents.items[@intFromEnum(aid)].seq_base = eff;
             }
             self.rope = try Rope.fromSlice(gpa, b.bytes);
         }
@@ -607,7 +607,7 @@ pub const TextDoc = struct {
         // failed bootstrap leaves a coherent base-only document).
         var scalar_edits: std.ArrayList(ScalarEdit) = .empty;
         defer scalar_edits.deinit(gpa);
-        const any_new = try self.graphPhase(gpa, &dec, aids, &scalar_edits);
+        const any_new = try self.historyPhase(gpa, &dec, aids, &scalar_edits);
         if (!any_new) return try gpa.alloc(Edit, 0);
 
         // Apply to the rope, converting scalar → byte space, coalescing runs.
@@ -650,65 +650,65 @@ pub const TextDoc = struct {
     /// Add the batch to the graph and replay. Atomic: on any error the graph
     /// reverts to its pre-batch state. Returns whether any new events were
     /// integrated.
-    fn graphPhase(
+    fn historyPhase(
         self: *TextDoc,
         gpa: Allocator,
         dec: *const Decoder,
         aids: []const AgentId,
         scalar_edits: *std.ArrayList(ScalarEdit),
     ) MergeError!bool {
-        const pre_events = self.graph.events.items.len;
-        const pre_pool = self.graph.parents_pool.items.len;
-        const pre_frontier = try gpa.dupe(Lv, self.graph.frontier.items);
+        const pre_events = self.history.events.items.len;
+        const pre_pool = self.history.parents_pool.items.len;
+        const pre_frontier = try gpa.dupe(Lv, self.history.frontier.items);
         defer gpa.free(pre_frontier);
-        const pre_seq_lens = try gpa.alloc(usize, self.graph.agents.items.len);
+        const pre_seq_lens = try gpa.alloc(usize, self.history.agents.items.len);
         defer gpa.free(pre_seq_lens);
-        for (self.graph.agents.items, pre_seq_lens) |a, *len| len.* = a.lv_by_seq.items.len;
-        errdefer self.rollbackGraph(pre_events, pre_pool, pre_frontier, pre_seq_lens);
+        for (self.history.agents.items, pre_seq_lens) |a, *len| len.* = a.lv_by_seq.items.len;
+        errdefer self.rollbackHistory(pre_events, pre_pool, pre_frontier, pre_seq_lens);
 
-        const first_new: Lv = @intCast(self.graph.eventCount());
+        const first_new: Lv = @intCast(self.history.eventCount());
         var any_new = false;
         for (dec.events.items) |ev| {
             const id: EventId = .{ .agent = aids[ev.agent_idx], .seq = ev.seq };
-            if (self.graph.isKnown(id)) continue; // duplicate or compacted
+            if (self.history.isKnown(id)) continue; // duplicate or compacted
             var parent_lvs: std.ArrayList(Lv) = .empty;
             defer parent_lvs.deinit(gpa);
             for (dec.parentsOf(ev)) |pref| {
                 const pid: EventId = .{ .agent = aids[pref.agent_idx], .seq = pref.seq };
-                if (self.graph.lvOf(pid)) |plv| {
+                if (self.history.lvOf(pid)) |plv| {
                     try parent_lvs.append(gpa, plv);
                 }
                 // else: validated to be the base head — implicit.
             }
-            _ = try self.graph.add(gpa, id, parent_lvs.items, ev.op);
+            _ = try self.history.add(gpa, id, parent_lvs.items, ev.op);
             any_new = true;
         }
         if (!any_new) return false;
 
-        var w = Walker.init(&self.graph);
+        var w = Walker.init(&self.history);
         defer w.deinit(gpa);
         if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
         try w.replayAll(gpa, first_new, null, scalar_edits);
         return true;
     }
 
-    fn rollbackGraph(
+    fn rollbackHistory(
         self: *TextDoc,
         pre_events: usize,
         pre_pool: usize,
         pre_frontier: []const Lv,
         pre_seq_lens: []const usize,
     ) void {
-        self.graph.events.items.len = pre_events;
-        self.graph.parents_pool.items.len = pre_pool;
+        self.history.events.items.len = pre_events;
+        self.history.parents_pool.items.len = pre_pool;
         // Agents registered during decode may outnumber pre_seq_lens; their
         // seq lists were empty before the batch.
-        for (self.graph.agents.items, 0..) |*a, i| {
+        for (self.history.agents.items, 0..) |*a, i| {
             a.lv_by_seq.items.len = if (i < pre_seq_lens.len) pre_seq_lens[i] else 0;
         }
-        self.graph.frontier.clearRetainingCapacity();
+        self.history.frontier.clearRetainingCapacity();
         // Capacity never shrinks, so this cannot fail.
-        self.graph.frontier.appendSliceAssumeCapacity(pre_frontier);
+        self.history.frontier.appendSliceAssumeCapacity(pre_frontier);
     }
 
     // ── Wire format ─────────────────────────────────────────────────────
@@ -742,9 +742,9 @@ pub const TextDoc = struct {
         var table: std.ArrayList(AgentId) = .empty;
         defer table.deinit(gpa);
         for (lvs) |lv| {
-            try tableAdd(gpa, &table, self.graph.idOf(lv).agent);
-            for (self.graph.parentsOf(lv)) |p| {
-                try tableAdd(gpa, &table, self.graph.idOf(p).agent);
+            try tableAdd(gpa, &table, self.history.idOf(lv).agent);
+            for (self.history.parentsOf(lv)) |p| {
+                try tableAdd(gpa, &table, self.history.idOf(p).agent);
             }
         }
         if (compacted) {
@@ -752,22 +752,22 @@ pub const TextDoc = struct {
         }
         try putUv(gpa, &out, table.items.len);
         for (table.items) |aid| {
-            const name = self.graph.agentName(aid);
+            const name = self.history.agentName(aid);
             try putUv(gpa, &out, name.len);
             try out.appendSlice(gpa, name);
             if (compacted) {
-                try putUv(gpa, &out, self.graph.agents.items[@intFromEnum(aid)].seq_base);
+                try putUv(gpa, &out, self.history.agents.items[@intFromEnum(aid)].seq_base);
             }
         }
 
         try putUv(gpa, &out, lvs.len);
         for (lvs) |lv| {
-            const id = self.graph.idOf(lv);
+            const id = self.history.idOf(lv);
             try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
             try putUv(gpa, &out, id.seq);
-            const parents = self.graph.parentsOf(lv);
-            const implicit_base = parents.len == 0 and self.base_head != null and lv < self.graph.eventCount();
-            if (implicit_base and self.graph.parentsOf(lv).len == 0) {
+            const parents = self.history.parentsOf(lv);
+            const implicit_base = parents.len == 0 and self.base_head != null and lv < self.history.eventCount();
+            if (implicit_base and self.history.parentsOf(lv).len == 0) {
                 // Events based directly on the base re-encode their implicit
                 // parent as the base head, so uncompacted-era decoders (and
                 // validation) see an explicit dependency.
@@ -778,12 +778,12 @@ pub const TextDoc = struct {
             } else {
                 try putUv(gpa, &out, parents.len);
                 for (parents) |p| {
-                    const pid = self.graph.idOf(p);
+                    const pid = self.history.idOf(p);
                     try putUv(gpa, &out, tableIndexOf(table.items, pid.agent));
                     try putUv(gpa, &out, pid.seq);
                 }
             }
-            switch (self.graph.opOf(lv)) {
+            switch (self.history.opOf(lv)) {
                 .ins => |ins| {
                     try out.append(gpa, 0);
                     try putUv(gpa, &out, ins.pos);
@@ -931,7 +931,7 @@ pub const TextDoc = struct {
         ) error{MissingDependency}!void {
             for (self.events.items, 0..) |ev, i| {
                 const agent = aids[ev.agent_idx];
-                const stored = doc.graph.agents.items[@intFromEnum(agent)].lv_by_seq.items.len;
+                const stored = doc.history.agents.items[@intFromEnum(agent)].lv_by_seq.items.len;
                 const next = eff_base[ev.agent_idx] + stored;
                 if (ev.seq < next) continue; // duplicate or compacted
                 const contiguous = ev.seq == next or
@@ -940,7 +940,7 @@ pub const TextDoc = struct {
                 for (self.parentsOf(ev)) |pref| {
                     const pagent = aids[pref.agent_idx];
                     const pid: EventId = .{ .agent = pagent, .seq = pref.seq };
-                    if (doc.graph.lvOf(pid) != null) continue;
+                    if (doc.history.lvOf(pid) != null) continue;
                     if (self.seenEarlier(i, pref.agent_idx, pref.seq)) continue;
                     if (batch_head) |h| {
                         if (h.agent == pagent and h.seq == pref.seq) continue;

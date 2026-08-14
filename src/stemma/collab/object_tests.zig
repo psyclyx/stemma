@@ -1,16 +1,16 @@
-//! Convergence oracle for JsonDoc: maps (with honest MV conflicts), lists,
+//! Convergence oracle for ObjectDoc: maps (with honest MV conflicts), lists,
 //! nested text objects, wire round-trips, and gossip — replicas that have
 //! seen the same events must render byte-identical canonical JSON.
 
 const std = @import("std");
 const t = std.testing;
 
-const json = @import("json.zig");
+const json = @import("objects.zig");
 const geometry = @import("../geometry.zig");
-const JsonDoc = json.JsonDoc;
+const ObjectDoc = json.ObjectDoc;
 const Range = geometry.Range;
 
-fn syncOne(gpa: std.mem.Allocator, from: *const JsonDoc, to: *JsonDoc) !void {
+fn syncOne(gpa: std.mem.Allocator, from: *const ObjectDoc, to: *ObjectDoc) !void {
     const ver = try to.version(gpa);
     defer gpa.free(ver);
     const batch = try from.eventsSince(gpa, ver);
@@ -19,12 +19,12 @@ fn syncOne(gpa: std.mem.Allocator, from: *const JsonDoc, to: *JsonDoc) !void {
     gpa.free(changes);
 }
 
-fn syncBoth(gpa: std.mem.Allocator, a: *JsonDoc, b: *JsonDoc) !void {
+fn syncBoth(gpa: std.mem.Allocator, a: *ObjectDoc, b: *ObjectDoc) !void {
     try syncOne(gpa, a, b);
     try syncOne(gpa, b, a);
 }
 
-fn expectConverged(docs: []const *JsonDoc) !void {
+fn expectConverged(docs: []const *ObjectDoc) !void {
     const gpa = t.allocator;
     const first = try docs[0].toJson(gpa);
     defer gpa.free(first);
@@ -37,7 +37,7 @@ fn expectConverged(docs: []const *JsonDoc) !void {
 
 test "local tree building renders canonical JSON" {
     const gpa = t.allocator;
-    var d: JsonDoc = .empty;
+    var d: ObjectDoc = .empty;
     defer d.deinit(gpa);
     try d.setAgent(gpa, "solo");
 
@@ -74,9 +74,9 @@ test "local tree building renders canonical JSON" {
 
 test "concurrent map sets: both survive as conflicts, winner deterministic" {
     const gpa = t.allocator;
-    var alice: JsonDoc = .empty;
+    var alice: ObjectDoc = .empty;
     defer alice.deinit(gpa);
-    var bob: JsonDoc = .empty;
+    var bob: ObjectDoc = .empty;
     defer bob.deinit(gpa);
     try alice.setAgent(gpa, "alice");
     try bob.setAgent(gpa, "bob");
@@ -88,7 +88,7 @@ test "concurrent map sets: both survive as conflicts, winner deterministic" {
     _ = try alice.mapSet(gpa, null, "status", .{ .str = "review" });
     _ = try bob.mapSet(gpa, null, "status", .{ .str = "final" });
     try syncBoth(gpa, &alice, &bob);
-    try expectConverged(&[_]*JsonDoc{ &alice, &bob });
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
 
     // Honest MV: both values present, same deterministic winner everywhere.
     try t.expectEqual(@as(usize, 2), alice.root().mapConflictCount("status"));
@@ -107,9 +107,9 @@ test "concurrent map sets: both survive as conflicts, winner deterministic" {
 
 test "concurrent set vs delete: the set survives (add wins over absent)" {
     const gpa = t.allocator;
-    var alice: JsonDoc = .empty;
+    var alice: ObjectDoc = .empty;
     defer alice.deinit(gpa);
-    var bob: JsonDoc = .empty;
+    var bob: ObjectDoc = .empty;
     defer bob.deinit(gpa);
     try alice.setAgent(gpa, "alice");
     try bob.setAgent(gpa, "bob");
@@ -119,7 +119,7 @@ test "concurrent set vs delete: the set survives (add wins over absent)" {
     _ = try alice.mapSet(gpa, null, "k", .{ .int = 2 });
     try bob.mapDelete(gpa, null, "k");
     try syncBoth(gpa, &alice, &bob);
-    try expectConverged(&[_]*JsonDoc{ &alice, &bob });
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
     // Bob's delete removed the value he saw (1); alice's concurrent set of 2
     // was not seen by the delete, so it survives.
     try t.expectEqual(@as(i64, 2), bob.root().mapGet("k").?.asInt());
@@ -127,9 +127,9 @@ test "concurrent set vs delete: the set survives (add wins over absent)" {
 
 test "concurrent list inserts converge without duplication" {
     const gpa = t.allocator;
-    var alice: JsonDoc = .empty;
+    var alice: ObjectDoc = .empty;
     defer alice.deinit(gpa);
-    var bob: JsonDoc = .empty;
+    var bob: ObjectDoc = .empty;
     defer bob.deinit(gpa);
     try alice.setAgent(gpa, "alice");
     try bob.setAgent(gpa, "bob");
@@ -151,22 +151,22 @@ test "concurrent list inserts converge without duplication" {
     _ = try alice.listInsert(gpa, items, 2, .{ .int = 2 });
     _ = try bob.listInsert(gpa, bob_items, 1, .{ .int = 10 });
     try syncBoth(gpa, &alice, &bob);
-    try expectConverged(&[_]*JsonDoc{ &alice, &bob });
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
     try t.expectEqual(@as(usize, 4), alice.root().mapGet("items").?.listLen());
 
     // Concurrent deletes of the same element collapse to one removal.
     _ = try alice.listDelete(gpa, items, 0);
     _ = try bob.listDelete(gpa, bob_items, 0);
     try syncBoth(gpa, &alice, &bob);
-    try expectConverged(&[_]*JsonDoc{ &alice, &bob });
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
     try t.expectEqual(@as(usize, 3), alice.root().mapGet("items").?.listLen());
 }
 
 test "nested text objects: concurrent editing converges; changes are valid edits" {
     const gpa = t.allocator;
-    var alice: JsonDoc = .empty;
+    var alice: ObjectDoc = .empty;
     defer alice.deinit(gpa);
-    var bob: JsonDoc = .empty;
+    var bob: ObjectDoc = .empty;
     defer bob.deinit(gpa);
     try alice.setAgent(gpa, "alice");
     try bob.setAgent(gpa, "bob");
@@ -196,7 +196,7 @@ test "nested text objects: concurrent editing converges; changes are valid edits
         try t.expectEqual(bob.root().mapGet("body").?.textRope().byteLen(), len);
     }
     try syncOne(gpa, &bob, &alice);
-    try expectConverged(&[_]*JsonDoc{ &alice, &bob });
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
 
     const txt = try alice.root().mapGet("body").?.textRope().toOwnedSlice(gpa);
     defer gpa.free(txt);
@@ -205,7 +205,7 @@ test "nested text objects: concurrent editing converges; changes are valid edits
 
 test "serialize/open roundtrip; compareVersions over json docs" {
     const gpa = t.allocator;
-    var d: JsonDoc = .empty;
+    var d: ObjectDoc = .empty;
     defer d.deinit(gpa);
     try d.setAgent(gpa, "author");
     _ = try d.mapSet(gpa, null, "x", .{ .float = 1.5 });
@@ -221,26 +221,26 @@ test "serialize/open roundtrip; compareVersions over json docs" {
 
     const bytes = try d.serialize(gpa);
     defer gpa.free(bytes);
-    var re = try JsonDoc.open(gpa, bytes);
+    var re = try ObjectDoc.open(gpa, bytes);
     defer re.deinit(gpa);
-    try expectConverged(&[_]*JsonDoc{ &d, &re });
+    try expectConverged(&[_]*ObjectDoc{ &d, &re });
 
     // The reopened doc collaborates.
     try re.setAgent(gpa, "editor");
     _ = try re.mapSet(gpa, null, "x", .{ .float = 2.5 });
     try syncBoth(gpa, &re, &d);
-    try expectConverged(&[_]*JsonDoc{ &d, &re });
+    try expectConverged(&[_]*ObjectDoc{ &d, &re });
 }
 
 test "malicious json batches rejected without damage" {
     const gpa = t.allocator;
-    var victim: JsonDoc = .empty;
+    var victim: ObjectDoc = .empty;
     defer victim.deinit(gpa);
     try victim.setAgent(gpa, "victim");
     _ = try victim.mapSet(gpa, null, "safe", .{ .int = 1 });
     const before = try victim.toJson(gpa);
     defer gpa.free(before);
-    const events_before = victim.graph.eventCount();
+    const events_before = victim.history.eventCount();
 
     try t.expectError(error.Corrupt, victim.merge(gpa, "junk"));
 
@@ -257,7 +257,7 @@ test "malicious json batches rejected without damage" {
         [_]u8{ 0, 1, 1, 0, 0, 4, 1, 0, 0, 5, 'x' }; // text_ins obj=(evil,0)
     try t.expectError(error.Corrupt, victim.merge(gpa, evil_text_on_int));
 
-    try t.expectEqual(events_before, victim.graph.eventCount());
+    try t.expectEqual(events_before, victim.history.eventCount());
     const after = try victim.toJson(gpa);
     defer gpa.free(after);
     try t.expectEqualStrings(before, after);
@@ -265,7 +265,7 @@ test "malicious json batches rejected without damage" {
 
 test "three peers, seeded random gossip over mixed structures, convergence" {
     const gpa = t.allocator;
-    var docs: [3]JsonDoc = .{ .empty, .empty, .empty };
+    var docs: [3]ObjectDoc = .{ .empty, .empty, .empty };
     defer for (&docs) |*d| d.deinit(gpa);
     const names = [_][]const u8{ "alice", "bob", "carol" };
     for (&docs, names) |*d, n| try d.setAgent(gpa, n);
@@ -316,14 +316,14 @@ test "three peers, seeded random gossip over mixed structures, convergence" {
                 }
             }
         }
-        try expectConverged(&[_]*JsonDoc{ &docs[0], &docs[1], &docs[2] });
+        try expectConverged(&[_]*ObjectDoc{ &docs[0], &docs[1], &docs[2] });
     }
 }
 
 fn oomScript(gpa: std.mem.Allocator) !void {
-    var a: JsonDoc = .empty;
+    var a: ObjectDoc = .empty;
     defer a.deinit(gpa);
-    var b: JsonDoc = .empty;
+    var b: ObjectDoc = .empty;
     defer b.deinit(gpa);
     try a.setAgent(gpa, "a");
     try b.setAgent(gpa, "b");
@@ -349,7 +349,7 @@ test "OOM: json collaboration paths are leak-free" {
 
 fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
     const gpa = t.allocator;
-    var author: JsonDoc = .empty;
+    var author: ObjectDoc = .empty;
     defer author.deinit(gpa);
     try author.setAgent(gpa, "author");
     const l = (try author.mapSet(gpa, null, "l", .list)).?;
@@ -364,13 +364,13 @@ fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
     for (0..1 + smith.indexWithHash(4, 0x0f11)) |_| {
         mutated[smith.indexWithHash(mutated.len, 0x0a7e)] = smith.valueWithHash(u8, 0xb17e);
     }
-    var victim: JsonDoc = .empty;
+    var victim: ObjectDoc = .empty;
     defer victim.deinit(gpa);
     if (victim.merge(gpa, mutated)) |changes| {
         gpa.free(changes);
     } else |err| switch (err) {
         error.Corrupt, error.MissingDependency => {
-            try t.expectEqual(@as(usize, 0), victim.graph.eventCount());
+            try t.expectEqual(@as(usize, 0), victim.history.eventCount());
         },
         else => |e| return e,
     }

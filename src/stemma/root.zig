@@ -6,7 +6,7 @@
 //! The long-term shape is an event-graph CRDT library (eg-walker family):
 //! a causal DAG of editing events, walked on demand to merge divergent
 //! histories, generic over materialized types — with text as the first and
-//! flagship materializer. See `graph` for the engine's contract-in-progress.
+//! flagship materializer. See `collab` for the engine's contract-in-progress.
 //!
 //! What ships today is the flagship's foundation: `Rope`, a persistent,
 //! snapshot-able UTF-8 text buffer (B-tree of chunks with per-node metric
@@ -31,7 +31,7 @@ const geometry = @import("geometry.zig");
 const rope = @import("rope.zig");
 const anchors = @import("anchors.zig");
 
-pub const graph = @import("graph.zig");
+pub const collab = @import("collab.zig");
 
 // ── Value types ──
 pub const Point = geometry.Point;
@@ -53,7 +53,7 @@ test {
     _ = geometry;
     _ = rope;
     _ = anchors;
-    _ = graph;
+    _ = collab;
     _ = @import("rope_tests.zig");
     _ = @import("usage_tests.zig");
 }

@@ -227,8 +227,8 @@ fn benchLoadAndScan(comptime RopeT: type, io: Io, w: *Io.Writer, name_prefix: []
 /// Collaboration-layer benchmarks: the collab tax on local typing, and merge
 /// throughput (v1 replays from genesis — these numbers are the baseline the
 /// optimization ladder in BENCHMARKS.md is measured against).
-fn benchGraph(io: Io, w: *Io.Writer) !void {
-    const TextDoc = stemma.graph.TextDoc;
+fn benchCollab(io: Io, w: *Io.Writer) !void {
+    const TextDoc = stemma.collab.TextDoc;
 
     // Local typing through TextDoc (event recording + rope) vs bare rope.
     {
@@ -248,7 +248,7 @@ fn benchGraph(io: Io, w: *Io.Writer) !void {
             s.* = timer.lap();
             std.mem.doNotOptimizeAway(d.text().byteLen());
         }
-        try report(w, "graph doc-typing ascii", &samples, ops_per_block, "ns");
+        try report(w, "collab doc-typing ascii", &samples, ops_per_block, "ns");
     }
     // Merge a linear 4k-unit document into an empty doc (open()).
     {
@@ -268,7 +268,7 @@ fn benchGraph(io: Io, w: *Io.Writer) !void {
             s.* = timer.lap();
             d.deinit(gpa);
         }
-        try report(w, "graph merge linear 4k units", &samples, 4096, "ns");
+        try report(w, "collab merge linear 4k units", &samples, 4096, "ns");
     }
     // Cross-merge two concurrent 1k-unit branches.
     {
@@ -299,7 +299,7 @@ fn benchGraph(io: Io, w: *Io.Writer) !void {
             gpa.free(edits);
             std.mem.doNotOptimizeAway(bob.text().byteLen());
         }
-        try report(w, "graph merge concurrent 1k+1k", &samples, 1024, "ns");
+        try report(w, "collab merge concurrent 1k+1k", &samples, 1024, "ns");
     }
 }
 
@@ -333,7 +333,7 @@ pub fn main(init: std.process.Init) !void {
     // answer the chunk-capacity / branch-factor question on the same
     // workloads.
     try runSuite(Rope, io, w, "", filter);
-    if (filter == null or std.mem.indexOf(u8, "graph", filter.?) != null) try benchGraph(io, w);
+    if (filter == null or std.mem.indexOf(u8, "collab", filter.?) != null) try benchCollab(io, w);
     if (filter != null) {
         try runSuite(stemma.RopeWith(.{ .chunk_capacity = 128 }), io, w, "c128/", filter);
         try runSuite(stemma.RopeWith(.{ .chunk_capacity = 512 }), io, w, "c512/", filter);

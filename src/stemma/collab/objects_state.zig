@@ -34,7 +34,7 @@ pub const ValPayload = union(enum) {
     new_text,
 };
 
-pub const JsonOp = union(enum) {
+pub const ObjectOp = union(enum) {
     map_set: struct { obj: ?ObjId, key: Str, val: ValPayload },
     map_del: struct { obj: ?ObjId, key: Str },
     list_ins: struct { obj: ObjId, pos: u64, val: ValPayload },
@@ -43,7 +43,7 @@ pub const JsonOp = union(enum) {
     text_del: struct { obj: ObjId, pos: u64 },
 };
 
-pub const Graph = causal.EventGraph(JsonOp);
+pub const Graph = causal.EventGraph(ObjectOp);
 
 /// Effects emitted for NEW events during replay, in application order.
 /// Positions are indices/scalars valid against the state produced by all

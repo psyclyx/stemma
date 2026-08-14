@@ -9,7 +9,7 @@
 const std = @import("std");
 const t = std.testing;
 
-const doc_mod = @import("doc.zig");
+const doc_mod = @import("text.zig");
 const geometry = @import("../geometry.zig");
 const anchors_mod = @import("../anchors.zig");
 
@@ -341,7 +341,7 @@ test "malicious batch: out-of-range position is rejected atomically" {
     defer victim.deinit(gpa);
     try victim.setAgent(gpa, "victim");
     _ = try victim.insert(gpa, 0, "stable");
-    const before_events = victim.graph.eventCount();
+    const before_events = victim.history.eventCount();
 
     // Hand-crafted batch: agent "evil", one event, seq 0, no parents,
     // insert at position 999 (LEB128: 0xE7 0x07) — far out of range.
@@ -350,7 +350,7 @@ test "malicious batch: out-of-range position is rejected atomically" {
     try t.expectError(error.Corrupt, victim.merge(gpa, evil));
 
     // Fully atomic: no events retained, document intact, still functional.
-    try t.expectEqual(before_events, victim.graph.eventCount());
+    try t.expectEqual(before_events, victim.history.eventCount());
     try expectDocText(&victim, "stable");
     _ = try victim.insert(gpa, 6, "!");
     try expectDocText(&victim, "stable!");
@@ -394,7 +394,7 @@ fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
     } else |err| switch (err) {
         error.Corrupt, error.MissingDependency => {
             // Rejected batches must leave the graph untouched.
-            try t.expectEqual(@as(usize, 0), victim.graph.eventCount());
+            try t.expectEqual(@as(usize, 0), victim.history.eventCount());
         },
         else => |e| return e,
     }
@@ -599,12 +599,12 @@ test "compact: history collapses, text unchanged, collaboration continues" {
     defer gpa.free(stable);
     const text_before = try docText(gpa, &alice);
     defer gpa.free(text_before);
-    const events_before = alice.graph.eventCount();
+    const events_before = alice.history.eventCount();
 
     // Both peers compact at the same stable point.
     try alice.compact(gpa, stable);
     try bob.compact(gpa, stable);
-    try t.expectEqual(@as(usize, 0), alice.graph.eventCount());
+    try t.expectEqual(@as(usize, 0), alice.history.eventCount());
     try t.expect(events_before > 0);
     try expectDocText(&alice, text_before);
 
@@ -641,7 +641,7 @@ test "compact: mid-history point keeps later events working" {
     defer gpa.free(text_now);
 
     try d.compact(gpa, mid);
-    try t.expect(d.graph.eventCount() > 0); // later events retained
+    try t.expect(d.history.eventCount() > 0); // later events retained
     try expectDocText(&d, text_now);
 
     // Current version still materializes (with base placeholders).
