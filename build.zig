@@ -46,4 +46,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks (pass a filter substring after --)");
     bench_step.dependOn(&run_bench.step);
+
+    // ── WASM target (browser peers speak the same wire protocol) ──
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/stemma/root.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi }),
+        .optimize = .ReleaseSmall,
+    });
+    const wasm_lib = b.addLibrary(.{
+        .name = "stemma",
+        .root_module = wasm_mod,
+        .linkage = .static,
+    });
+    const wasm_step = b.step("wasm", "Build the library for wasm32-wasi");
+    wasm_step.dependOn(&b.addInstallArtifact(wasm_lib, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
 }

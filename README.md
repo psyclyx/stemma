@@ -65,11 +65,23 @@ metadata on the document — the eg-walker model); `merge` integrates remote
 batches and returns the same byte-space `[]Edit` stream local edits produce,
 so `AnchorSet`s and cursors survive remote edits with zero extra machinery.
 Versions are opaque portable tokens; `eventsSince` is wire-ready;
-`serialize`/`open` persist the graph (the document of record). Convergence is
-oracle-tested: multi-peer seeded gossip, concurrent conflict shapes, batch
-splitting, fuzzed two-peer sessions — all replicas byte-identical, every
-merge's edit stream validated. Deferred to callers: transport, presence,
-collaborative undo policy.
+`serialize`/`open` persist the graph (the document of record).
+
+Beyond the basics: **FugueMax ordering** (maximally non-interleaving in both
+directions — locked by block-contiguity tests before any replica ever
+shipped); **`materializeAt`** (time travel to any known version);
+**identity anchors** (portable name+seq positions for remote cursors that
+survive concurrent edits, batch-resolvable on any replica); **`compact`**
+(collapse all-peers-stable history into a frozen base — graph growth
+bounded by post-base activity, not document lifetime); and a **wasm32
+target** (`zig build wasm`) so browser peers can speak the protocol.
+
+Hostile input cannot crash a replica: malformed and malicious batches
+(including out-of-range positions) are rejected atomically, fuzz-gated.
+Convergence is oracle-tested: multi-peer seeded gossip, concurrent conflict
+shapes, batch splitting, fuzzed sessions — all replicas byte-identical,
+every merge's edit stream validated. Deferred to callers: transport,
+presence payloads, collaborative undo policy.
 
 ## Status
 

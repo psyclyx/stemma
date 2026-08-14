@@ -34,25 +34,35 @@ Reading the numbers:
   copy; what remains is the summary scan, which is the inherent floor for a
   metrics-carrying rope.
 
-## Graph layer baseline — 2026-08-14
+## Graph layer baseline — 2026-08-14 (FugueMax walker)
 
 ```
-graph doc-typing ascii             56 ns/op  (best       54)  n=11
-graph merge linear 4k units      7304 ns/op  (best     7249)  n=5
-graph merge concurrent 1k+1k     3485 ns/op  (best     3424)  n=5
+graph doc-typing ascii             64 ns/op  (best       60)  n=11
+graph merge linear 4k units      3619 ns/op  (best     3590)  n=5
+graph merge concurrent 1k+1k     2140 ns/op  (best     2079)  n=5
 ```
 
-- **doc-typing 56 ns vs 20 ns bare rope**: the local collab tax is event
-  recording (~36 ns/keystroke: frontier snapshot + graph append). No CRDT
-  work happens on the local path — this is bookkeeping only.
-- **Merges are the deliberate v1 baseline**: replay-from-genesis over unit
-  events in a linked list, O(n·m)-ish by design (correctness first). The
+- **doc-typing ~60 ns vs 20 ns bare rope**: the local collab tax is event
+  recording (frontier snapshot + graph append). No CRDT work happens on
+  the local path — this is bookkeeping only. (Initial linked-list walker
+  measured 56 ns; the delta is compilation-unit layout scale, not a path
+  change — local typing never touches the walker.)
+- **The FugueMax swap halved merge cost for free**: the YjsMod integrate
+  loop wanted array-order comparisons, and the resulting seq-array walker
+  state (vs the original linked list) merged 4k linear units at 3.6 µs/unit
+  vs 7.3, concurrent at 2.1 vs 3.5 — cache-friendly scans beating pointer
+  chasing before any deliberate optimization.
+- **Merges remain the deliberate v1 baseline**: replay-from-genesis/base
+  over unit events, O(n·m)-ish by design (correctness first). The
   optimization ladder, each rung to be landed against these numbers with
   convergence tests green:
   1. run-RLE event storage (typing runs collapse ~64×);
   2. LCA-bounded replay with placeholder runs (eg-walker's actual
-     contribution — merge cost proportional to divergence, not history);
+     contribution — merge cost proportional to divergence, not history;
+     the placeholder machinery already exists for compaction bases);
   3. B-tree walker state (positional scans O(log n)).
+  `compact()` is the fourth lever in practice: a compacted document's
+  replay cost is proportional to post-base history, not lifetime history.
 
 ## Tuning ledger
 
