@@ -34,6 +34,26 @@ Reading the numbers:
   copy; what remains is the summary scan, which is the inherent floor for a
   metrics-carrying rope.
 
+## Graph layer baseline — 2026-08-14
+
+```
+graph doc-typing ascii             56 ns/op  (best       54)  n=11
+graph merge linear 4k units      7304 ns/op  (best     7249)  n=5
+graph merge concurrent 1k+1k     3485 ns/op  (best     3424)  n=5
+```
+
+- **doc-typing 56 ns vs 20 ns bare rope**: the local collab tax is event
+  recording (~36 ns/keystroke: frontier snapshot + graph append). No CRDT
+  work happens on the local path — this is bookkeeping only.
+- **Merges are the deliberate v1 baseline**: replay-from-genesis over unit
+  events in a linked list, O(n·m)-ish by design (correctness first). The
+  optimization ladder, each rung to be landed against these numbers with
+  convergence tests green:
+  1. run-RLE event storage (typing runs collapse ~64×);
+  2. LCA-bounded replay with placeholder runs (eg-walker's actual
+     contribution — merge cost proportional to divergence, not history);
+  3. B-tree walker state (positional scans O(log n)).
+
 ## Tuning ledger
 
 - **2026-08-10 — chunk 256→512, branch 8→16** (sweep over c128/c256/c512/

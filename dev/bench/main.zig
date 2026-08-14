@@ -224,6 +224,85 @@ fn benchLoadAndScan(comptime RopeT: type, io: Io, w: *Io.Writer, name_prefix: []
     }
 }
 
+/// Collaboration-layer benchmarks: the collab tax on local typing, and merge
+/// throughput (v1 replays from genesis — these numbers are the baseline the
+/// optimization ladder in BENCHMARKS.md is measured against).
+fn benchGraph(io: Io, w: *Io.Writer) !void {
+    const TextDoc = stemma.graph.TextDoc;
+
+    // Local typing through TextDoc (event recording + rope) vs bare rope.
+    {
+        const ops_per_block = 20_000;
+        var samples: [blocks]u64 = undefined;
+        for (&samples) |*s| {
+            var d: TextDoc = .empty;
+            defer d.deinit(gpa);
+            try d.setAgent(gpa, "bench");
+            var pos: usize = 0;
+            var timer = Timer.start_(io);
+            for (0..ops_per_block) |i| {
+                const text = typing_pool[i % typing_pool.len];
+                _ = try d.insert(gpa, pos, text);
+                pos += text.len;
+            }
+            s.* = timer.lap();
+            std.mem.doNotOptimizeAway(d.text().byteLen());
+        }
+        try report(w, "graph doc-typing ascii", &samples, ops_per_block, "ns");
+    }
+    // Merge a linear 4k-unit document into an empty doc (open()).
+    {
+        var author: TextDoc = .empty;
+        defer author.deinit(gpa);
+        try author.setAgent(gpa, "author");
+        for (0..4096) |i| {
+            _ = try author.insert(gpa, author.text().byteLen(), if (i % 64 == 63) "\n" else "x");
+        }
+        const bytes = try author.serialize(gpa);
+        defer gpa.free(bytes);
+        const merge_blocks = 5;
+        var samples: [merge_blocks]u64 = undefined;
+        for (&samples) |*s| {
+            var timer = Timer.start_(io);
+            var d = try TextDoc.open(gpa, bytes);
+            s.* = timer.lap();
+            d.deinit(gpa);
+        }
+        try report(w, "graph merge linear 4k units", &samples, 4096, "ns");
+    }
+    // Cross-merge two concurrent 1k-unit branches.
+    {
+        const merge_blocks = 5;
+        var samples: [merge_blocks]u64 = undefined;
+        for (&samples) |*s| {
+            var alice: TextDoc = .empty;
+            defer alice.deinit(gpa);
+            var bob: TextDoc = .empty;
+            defer bob.deinit(gpa);
+            try alice.setAgent(gpa, "alice");
+            try bob.setAgent(gpa, "bob");
+            _ = try alice.insert(gpa, 0, "base ");
+            const base = try alice.serialize(gpa);
+            defer gpa.free(base);
+            gpa.free(try bob.merge(gpa, base));
+            for (0..1024) |_| {
+                _ = try alice.insert(gpa, alice.text().byteLen(), "a");
+                _ = try bob.insert(gpa, 5, "b");
+            }
+            const vb = try bob.version(gpa);
+            defer gpa.free(vb);
+            const batch = try alice.eventsSince(gpa, vb);
+            defer gpa.free(batch);
+            var timer = Timer.start_(io);
+            const edits = try bob.merge(gpa, batch);
+            s.* = timer.lap();
+            gpa.free(edits);
+            std.mem.doNotOptimizeAway(bob.text().byteLen());
+        }
+        try report(w, "graph merge concurrent 1k+1k", &samples, 1024, "ns");
+    }
+}
+
 fn runSuite(comptime RopeT: type, io: Io, w: *Io.Writer, comptime prefix: []const u8, filter: ?[]const u8) !void {
     const want = struct {
         fn want(f: ?[]const u8, name: []const u8) bool {
@@ -254,6 +333,7 @@ pub fn main(init: std.process.Init) !void {
     // answer the chunk-capacity / branch-factor question on the same
     // workloads.
     try runSuite(Rope, io, w, "", filter);
+    if (filter == null or std.mem.indexOf(u8, "graph", filter.?) != null) try benchGraph(io, w);
     if (filter != null) {
         try runSuite(stemma.RopeWith(.{ .chunk_capacity = 128 }), io, w, "c128/", filter);
         try runSuite(stemma.RopeWith(.{ .chunk_capacity = 512 }), io, w, "c512/", filter);

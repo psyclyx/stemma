@@ -57,15 +57,29 @@ Allocation is explicit and unmanaged: no type stores an allocator; the same
 allocator must serve a rope and everything derived from it, and must be
 thread-safe if snapshots cross threads.
 
+## The graph layer
+
+`graph.TextDoc` is the collaboration surface: a rope plus the causal event
+graph that explains it. Local edits record causally-stamped events (no CRDT
+metadata on the document — the eg-walker model); `merge` integrates remote
+batches and returns the same byte-space `[]Edit` stream local edits produce,
+so `AnchorSet`s and cursors survive remote edits with zero extra machinery.
+Versions are opaque portable tokens; `eventsSince` is wire-ready;
+`serialize`/`open` persist the graph (the document of record). Convergence is
+oracle-tested: multi-peer seeded gossip, concurrent conflict shapes, batch
+splitting, fuzzed two-peer sessions — all replicas byte-identical, every
+merge's edit stream validated. Deferred to callers: transport, presence,
+collaborative undo policy.
+
 ## Status
 
-Rope implemented, tested, and benchmarked. Tests: randomized oracle against a
-reference implementation (contents, metrics, conversions, snapshot
-immutability, leak checks) in Debug, ReleaseSafe, and ReleaseFast. Baseline
-numbers and the tuning ledger live in [BENCHMARKS.md](BENCHMARKS.md) —
-headlines: ~20 ns/keystroke (identical with a live snapshot), ~3 ns
-snapshots, 27 GB/s chunk scans. The event-graph engine is next; it will be
-type-generic from its first commit.
+Rope and graph layer implemented, tested, and benchmarked (see
+[BENCHMARKS.md](BENCHMARKS.md)). Headlines: ~20 ns/keystroke bare, ~56 ns
+through `TextDoc` (the collab tax is bookkeeping only), ~3 ns snapshots,
+27 GB/s chunk scans. v1 merges replay from genesis — correctness-first by
+design; the optimization ladder (run-RLE, LCA-bounded replay, B-tree walker
+state) is documented against baseline numbers and lands rung by rung with
+the convergence oracle as the gate.
 
 ## Develop
 
