@@ -544,6 +544,172 @@ test "identity anchors: survive concurrent merges across replicas" {
     try t.expectEqual(bob.text().byteLen(), offs[1]);
 }
 
+test "compact: history collapses, text unchanged, collaboration continues" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    // Build shared history from both agents, then a linearization point.
+    _ = try alice.insert(gpa, 0, "collaborative 内容 here");
+    try syncBoth(gpa, &alice, &bob);
+    _ = try bob.insert(gpa, 0, "[bob] ");
+    try syncBoth(gpa, &alice, &bob);
+    _ = try alice.insert(gpa, alice.text().byteLen(), " (end)"); // single head
+    try syncBoth(gpa, &alice, &bob);
+
+    const stable = try alice.version(gpa);
+    defer gpa.free(stable);
+    const text_before = try docText(gpa, &alice);
+    defer gpa.free(text_before);
+    const events_before = alice.graph.eventCount();
+
+    // Both peers compact at the same stable point.
+    try alice.compact(gpa, stable);
+    try bob.compact(gpa, stable);
+    try t.expectEqual(@as(usize, 0), alice.graph.eventCount());
+    try t.expect(events_before > 0);
+    try expectDocText(&alice, text_before);
+
+    // Editing and syncing continue across the shared base.
+    _ = try alice.insert(gpa, 0, "A");
+    _ = try bob.insert(gpa, bob.text().byteLen(), "B");
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+
+    // Serialize/open round-trips the compacted form (v2 with base), and the
+    // reopened doc keeps collaborating.
+    const bytes = try alice.serialize(gpa);
+    defer gpa.free(bytes);
+    var reopened = try TextDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try expectConverged(&[_]*TextDoc{ &alice, &reopened });
+    try reopened.setAgent(gpa, "carol");
+    _ = try reopened.insert(gpa, 0, "C");
+    try syncBoth(gpa, &reopened, &alice);
+    try expectConverged(&[_]*TextDoc{ &alice, &reopened });
+}
+
+test "compact: mid-history point keeps later events working" {
+    const gpa = t.allocator;
+    var d: TextDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+    _ = try d.insert(gpa, 0, "early work…");
+    const mid = try d.version(gpa);
+    defer gpa.free(mid);
+    _ = try d.insert(gpa, d.text().byteLen(), " later work");
+    _ = try d.delete(gpa, .{ .start = 0, .end = 6 });
+    const text_now = try docText(gpa, &d);
+    defer gpa.free(text_now);
+
+    try d.compact(gpa, mid);
+    try t.expect(d.graph.eventCount() > 0); // later events retained
+    try expectDocText(&d, text_now);
+
+    // Current version still materializes (with base placeholders).
+    const now = try d.version(gpa);
+    defer gpa.free(now);
+    var at_now = try d.materializeAt(gpa, now);
+    defer at_now.deinit(gpa);
+    try t.expect(at_now.eql(d.rope));
+}
+
+test "compact: rejects multi-head and concurrent-remainder versions" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    // Bob edits against an OLD version of alice's history, so his event is
+    // concurrent to alice's later (would-be stable) head.
+    _ = try alice.insert(gpa, 0, "a");
+    try syncBoth(gpa, &alice, &bob);
+    _ = try alice.insert(gpa, 1, "b"); // the later head
+    const stale_head = try alice.version(gpa);
+    defer gpa.free(stale_head);
+    _ = try bob.insert(gpa, 1, "x"); // parents: only "a" — concurrent to "b"
+    try syncBoth(gpa, &alice, &bob);
+
+    // Two concurrent heads: not a linearization point.
+    const two_heads = try alice.version(gpa);
+    defer gpa.free(two_heads);
+    try t.expectError(error.NotCompactable, alice.compact(gpa, two_heads));
+
+    // Single head, but bob's retained event anchors to base *interior*
+    // (its parent is "a", inside the would-be base, not the head "b").
+    try t.expectError(error.NotCompactable, alice.compact(gpa, stale_head));
+
+    // Doc still fully functional after rejections.
+    _ = try alice.insert(gpa, 0, "!");
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+}
+
+test "compact: uncompacted peer cannot merge a based batch; anchors into base are Compacted" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.insert(gpa, 0, "history");
+    try syncBoth(gpa, &alice, &bob);
+    const stable = try alice.version(gpa);
+    defer gpa.free(stable);
+    try alice.compact(gpa, stable);
+    _ = try alice.insert(gpa, 0, "x");
+
+    // Bob (uncompacted, non-empty) receives alice's compacted batch: reject.
+    const vb = try bob.version(gpa);
+    defer gpa.free(vb);
+    const batch = try alice.eventsSince(gpa, vb);
+    defer gpa.free(batch);
+    try t.expectError(error.MissingDependency, bob.merge(gpa, batch));
+
+    // After compacting to the same point, sync works again.
+    try bob.compact(gpa, stable);
+    gpa.free(try syncOne(gpa, &alice, &bob));
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+
+    // Identity anchors cannot target compacted characters…
+    try t.expectError(error.Compacted, alice.anchorAt(gpa, 3, .before));
+    // …but post-base characters anchor fine.
+    const a = try alice.anchorAt(gpa, 0, .before);
+    defer gpa.free(a.agent);
+    var off: [1]usize = undefined;
+    try alice.resolveAnchors(gpa, &.{a}, &off);
+    try t.expectEqual(@as(usize, 0), off[0]);
+}
+
+fn compactOomScript(gpa: std.mem.Allocator) !void {
+    var d: TextDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "oom");
+    _ = try d.insert(gpa, 0, "compact under pressure");
+    const stable = try d.version(gpa);
+    defer gpa.free(stable);
+    _ = try d.insert(gpa, 0, "x");
+    try d.compact(gpa, stable);
+    // Post-compaction the doc still round-trips.
+    const bytes = try d.serialize(gpa);
+    defer gpa.free(bytes);
+    var re = try TextDoc.open(gpa, bytes);
+    defer re.deinit(gpa);
+}
+
+test "OOM: compaction paths are leak-free under every allocation failure" {
+    try std.testing.checkAllAllocationFailures(t.allocator, compactOomScript, .{});
+}
+
 fn oomScript(gpa: std.mem.Allocator) !void {
     var alice: TextDoc = .empty;
     defer alice.deinit(gpa);

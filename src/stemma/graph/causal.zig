@@ -45,7 +45,10 @@ pub fn EventGraph(comptime Op: type) type {
         const Agent = struct {
             name_start: u32,
             name_len: u32,
-            /// seq → Lv (unit events arrive per-agent in seq order).
+            /// Sequence numbers below this are compacted: known to have
+            /// happened (duplicate detection) but no longer stored.
+            seq_base: u64 = 0,
+            /// (seq - seq_base) → Lv (unit events arrive per-agent in order).
             lv_by_seq: std.ArrayList(Lv) = .empty,
         };
 
@@ -106,14 +109,24 @@ pub fn EventGraph(comptime Op: type) type {
 
         /// Next unused sequence number for `agent`.
         pub fn nextSeq(self: *const Self, agent: AgentId) u64 {
-            return self.agents.items[@intFromEnum(agent)].lv_by_seq.items.len;
+            const a = self.agents.items[@intFromEnum(agent)];
+            return a.seq_base + a.lv_by_seq.items.len;
         }
 
-        /// Resolve a global id to this replica's Lv, if known.
+        /// Resolve a global id to this replica's Lv. Null for unknown ids
+        /// AND for compacted ones — distinguish with `isKnown`.
         pub fn lvOf(self: *const Self, id: EventId) ?Lv {
-            const seqs = self.agents.items[@intFromEnum(id.agent)].lv_by_seq.items;
-            if (id.seq >= seqs.len) return null;
-            return seqs[id.seq];
+            const a = self.agents.items[@intFromEnum(id.agent)];
+            if (id.seq < a.seq_base) return null; // compacted
+            const rel = id.seq - a.seq_base;
+            if (rel >= a.lv_by_seq.items.len) return null;
+            return a.lv_by_seq.items[rel];
+        }
+
+        /// Whether this replica has ever seen the event (stored OR
+        /// compacted). Known-but-null-Lv means compacted.
+        pub fn isKnown(self: *const Self, id: EventId) bool {
+            return id.seq < self.nextSeq(id.agent);
         }
 
         pub fn idOf(self: *const Self, lv: Lv) EventId {
