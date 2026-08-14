@@ -47,6 +47,9 @@ const causal = @import("causal.zig");
 const walker_mod = @import("walker.zig");
 const rope_mod = @import("../rope.zig");
 const geometry = @import("../geometry.zig");
+const wire = @import("wire.zig");
+const putUv = wire.putUv;
+const getUv = wire.getUv;
 
 pub const AgentId = causal.AgentId;
 pub const EventId = causal.EventId;
@@ -193,6 +196,29 @@ pub const TextDoc = struct {
                 return error.MissingDependency;
             }
         }
+    }
+
+    pub const VersionOrder = causal.VersionOrder;
+
+    /// Causal relation between two version tokens (from `a`'s perspective:
+    /// `.ancestor` = `a` is strictly earlier). Every entry of both tokens
+    /// must be stored by this replica (`error.MissingDependency` otherwise —
+    /// e.g. tokens from ahead-of-us peers or from below the compaction
+    /// horizon). Typical use: "is my saved version stale?", "did these two
+    /// diverge?".
+    pub fn compareVersions(
+        self: *const TextDoc,
+        gpa: Allocator,
+        a_token: []const u8,
+        b_token: []const u8,
+    ) MergeError!VersionOrder {
+        var a: std.ArrayList(Lv) = .empty;
+        defer a.deinit(gpa);
+        try self.decodeVersion(gpa, a_token, true, &a);
+        var b: std.ArrayList(Lv) = .empty;
+        defer b.deinit(gpa);
+        try self.decodeVersion(gpa, b_token, true, &b);
+        return self.graph.compareFrontiers(gpa, a.items, b.items);
     }
 
     /// Parse the single (name, seq) entry of a version token.
@@ -932,35 +958,6 @@ pub const TextDoc = struct {
         }
     };
 };
-
-// LEB128 helpers over byte slices.
-fn putUv(gpa: Allocator, out: *std.ArrayList(u8), value: u64) Allocator.Error!void {
-    var v = value;
-    while (true) {
-        const byte: u8 = @intCast(v & 0x7f);
-        v >>= 7;
-        if (v == 0) {
-            try out.append(gpa, byte);
-            return;
-        }
-        try out.append(gpa, byte | 0x80);
-    }
-}
-
-fn getUv(cur: *[]const u8) error{Corrupt}!u64 {
-    var result: u64 = 0;
-    var shift: u6 = 0;
-    for (0..10) |_| {
-        if (cur.len == 0) return error.Corrupt;
-        const byte = cur.*[0];
-        cur.* = cur.*[1..];
-        result |= @as(u64, byte & 0x7f) << shift;
-        if (byte & 0x80 == 0) return result;
-        if (shift >= 56) return error.Corrupt;
-        shift += 7;
-    }
-    return error.Corrupt;
-}
 
 test {
     std.testing.refAllDecls(@This());

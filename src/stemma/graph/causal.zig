@@ -31,6 +31,10 @@ pub const Lv = u32;
 
 pub const max_events = std.math.maxInt(Lv) - 1;
 
+/// Causal relation between two versions, from the first version's
+/// perspective: `.ancestor` means the first is strictly before the second.
+pub const VersionOrder = enum { equal, ancestor, descendant, concurrent };
+
 pub fn EventGraph(comptime Op: type) type {
     return struct {
         const Self = @This();
@@ -276,6 +280,18 @@ pub fn EventGraph(comptime Op: type) type {
             var d = try self.diff(gpa, self.frontier.items, remote_frontier);
             d.b_only.deinit(gpa);
             return d.a_only;
+        }
+
+        /// Causal relation between two frontiers.
+        pub fn compareFrontiers(self: *const Self, gpa: Allocator, a: []const Lv, b: []const Lv) Allocator.Error!VersionOrder {
+            var d = try self.diff(gpa, a, b);
+            defer d.deinit(gpa);
+            const a_extra = d.a_only.items.len > 0;
+            const b_extra = d.b_only.items.len > 0;
+            if (!a_extra and !b_extra) return .equal;
+            if (!a_extra) return .ancestor;
+            if (!b_extra) return .descendant;
+            return .concurrent;
         }
     };
 }

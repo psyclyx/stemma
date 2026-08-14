@@ -29,16 +29,23 @@ const std = @import("std");
 pub const causal = @import("graph/causal.zig");
 const walker = @import("graph/walker.zig");
 const doc = @import("graph/doc.zig");
+const json = @import("graph/json.zig");
 
 pub const AgentId = causal.AgentId;
 pub const EventId = causal.EventId;
 pub const EventGraph = causal.EventGraph;
+pub const VersionOrder = causal.VersionOrder;
 pub const TextOp = walker.TextOp;
 pub const TextDoc = doc.TextDoc;
+pub const JsonDoc = json.JsonDoc;
+pub const ObjId = json.ObjId;
 
 test {
     _ = causal;
     _ = walker;
     _ = doc;
+    _ = json;
+    _ = @import("graph/wire.zig");
     _ = @import("graph/graph_tests.zig");
+    _ = @import("graph/json_tests.zig");
 }

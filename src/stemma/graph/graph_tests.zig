@@ -456,6 +456,40 @@ test "three peers, seeded random gossip, full convergence" {
     }
 }
 
+test "compareVersions: equal, ancestor, descendant, concurrent" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.insert(gpa, 0, "base");
+    const v1 = try alice.version(gpa);
+    defer gpa.free(v1);
+    try syncBoth(gpa, &alice, &bob);
+
+    try t.expectEqual(.equal, try alice.compareVersions(gpa, v1, v1));
+
+    _ = try alice.insert(gpa, 0, "more");
+    const v2 = try alice.version(gpa);
+    defer gpa.free(v2);
+    try t.expectEqual(.ancestor, try alice.compareVersions(gpa, v1, v2));
+    try t.expectEqual(.descendant, try alice.compareVersions(gpa, v2, v1));
+
+    // Bob edits concurrently; alice learns of it, then compares.
+    _ = try bob.insert(gpa, 4, "!");
+    const vb = try bob.version(gpa);
+    defer gpa.free(vb);
+    gpa.free(try syncOne(gpa, &bob, &alice));
+    try t.expectEqual(.concurrent, try alice.compareVersions(gpa, v2, vb));
+
+    // Tokens naming events we don't have are honest errors.
+    const unknown = "stv\x01" ++ [_]u8{ 1, 5 } ++ "ghost" ++ [_]u8{3};
+    try t.expectError(error.MissingDependency, alice.compareVersions(gpa, v1, unknown));
+}
+
 test "materializeAt: time travel to any known version" {
     const gpa = t.allocator;
     var d: TextDoc = .empty;
