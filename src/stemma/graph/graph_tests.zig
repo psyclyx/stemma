@@ -153,6 +153,58 @@ test "concurrent runs do not interleave" {
     try t.expect(ok);
 }
 
+test "backward interleaving: concurrent prepend blocks stay contiguous (FugueMax)" {
+    // The anomaly that separates FugueMax from plain Yjs: two peers each
+    // building a block by repeatedly inserting at position 0. Under Yjs the
+    // blocks can interleave; under FugueMax each block stays contiguous.
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.insert(gpa, 0, "|");
+    try syncBoth(gpa, &alice, &bob);
+
+    // Each peer prepends three units, one at a time, all at position 0.
+    for ("cba") |c| _ = try alice.insert(gpa, 0, &.{c});
+    for ("zyx") |c| _ = try bob.insert(gpa, 0, &.{c});
+    // alice: "abc|", bob: "xyz|"
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+
+    const got = try docText(gpa, &alice);
+    defer gpa.free(got);
+    const ok = std.mem.eql(u8, got, "abcxyz|") or std.mem.eql(u8, got, "xyzabc|");
+    if (!ok) std.debug.print("interleaved: {s}\n", .{got});
+    try t.expect(ok);
+}
+
+test "forward interleaving: concurrent append blocks stay contiguous" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.insert(gpa, 0, "|");
+    try syncBoth(gpa, &alice, &bob);
+    for ("abc", 1..) |c, i| _ = try alice.insert(gpa, i, &.{c});
+    for ("xyz", 1..) |c, i| _ = try bob.insert(gpa, i, &.{c});
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+
+    const got = try docText(gpa, &alice);
+    defer gpa.free(got);
+    const ok = std.mem.eql(u8, got, "|abcxyz") or std.mem.eql(u8, got, "|xyzabc");
+    if (!ok) std.debug.print("interleaved: {s}\n", .{got});
+    try t.expect(ok);
+}
+
 test "concurrent delete + insert inside the deleted span" {
     const gpa = t.allocator;
     var alice: TextDoc = .empty;

@@ -280,7 +280,7 @@ pub const TextDoc = struct {
 
         var w = Walker.init(&self.graph);
         defer w.deinit(gpa);
-        try w.replayAll(gpa, first_new, scalar_edits);
+        try w.replayAll(gpa, first_new, null, scalar_edits);
         return true;
     }
 
