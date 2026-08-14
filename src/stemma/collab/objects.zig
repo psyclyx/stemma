@@ -57,32 +57,32 @@ const version_magic = core.version_magic;
 const no_node: u32 = std.math.maxInt(u32);
 const root_key = Walker.root_key;
 
-/// Input values for local edits.
-pub const Value = union(enum) {
-    null_,
-    bool_: bool,
-    int: i64,
-    float: f64,
-    str: []const u8,
-    map,
-    list,
-    text,
-};
-
-pub const Kind = enum { null_, bool_, int, float, str, map, list, text };
-
-pub const Change = union(enum) {
-    /// A key's value set changed (added, removed, or overwritten) — re-read
-    /// via `mapGet`/`mapConflicts`. `key` borrows the doc's string arena
-    /// (valid for the doc's lifetime).
-    map: struct { obj: ?ObjId, key: []const u8 },
-    list_ins: struct { obj: ObjId, index: usize },
-    list_del: struct { obj: ObjId, index: usize },
-    /// Byte-space edit within a text object; shift that object's anchors.
-    text: struct { obj: ObjId, edit: Edit },
-};
-
 pub const ObjectDoc = struct {
+    /// Input values for local edits.
+    pub const Value = union(enum) {
+        null_,
+        bool_: bool,
+        int: i64,
+        float: f64,
+        str: []const u8,
+        map,
+        list,
+        text,
+    };
+
+    pub const Kind = enum { null_, bool_, int, float, str, map, list, text };
+
+    pub const Change = union(enum) {
+        /// A key's value set changed (added, removed, or overwritten) —
+        /// re-read via `mapGet`/`mapConflicts`. `key` borrows the doc's
+        /// string arena (valid for the doc's lifetime).
+        map: struct { obj: ?ObjId, key: []const u8 },
+        list_ins: struct { obj: ObjId, index: usize },
+        list_del: struct { obj: ObjId, index: usize },
+        /// Byte-space edit within a text object; shift that object's anchors.
+        text: struct { obj: ObjId, edit: Edit },
+    };
+
     history: Graph = .empty,
     agent: ?AgentId = null,
     /// Append-only arena for keys and string values (Str refs point here).
