@@ -38,6 +38,15 @@ dissolved instead:
   (`RopeWith(.{...})`): a build that doesn't speak LSP drops UTF-16 tracking
   and pays zero bytes and zero scan work for it. `Rope` is the
   all-dimensions default.
+- **Eager vs lazy.** A rope over remote or unfetched data starts as an
+  unrealized *hole* of known length (`fromUnrealized` — O(1), no reads);
+  the caller fetches windows on its own transport and `realize`s them
+  (offsets never shift — anchors are unaffected). Byte-domain operations
+  work on holes; content access panics deterministically until realized
+  (`isRealized`/`unrealized` are the fetch list); content metrics count
+  realized text only and converge as fetching proceeds. Seeking the middle
+  of a 10 GB network file is arithmetic plus one window fetch. The rope
+  itself does no I/O, ever.
 
 ## Scope — decomplected on purpose
 

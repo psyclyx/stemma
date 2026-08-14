@@ -742,6 +742,133 @@ test "PointUtf16 conversions vs std.unicode reference" {
     }
 }
 
+// ── Lazy / unrealized content ───────────────────────────────────────────
+
+test "unrealized: out-of-order realization converges to the reference" {
+    const gpa = t.allocator;
+    // Reference "remote file": realized in scattered windows, both copied
+    // and borrowed, until complete.
+    var ref: std.ArrayList(u8) = .empty;
+    defer ref.deinit(gpa);
+    var prng = std.Random.DefaultPrng.init(0x1a2b);
+    const random = prng.random();
+    while (ref.items.len < 2048) {
+        try ref.appendSlice(gpa, pool[random.uintLessThan(usize, pool.len)]);
+    }
+    const doc = ref.items;
+
+    var r = try TinyRope.fromUnrealized(gpa, doc.len);
+    defer r.deinit(gpa);
+    try t.expectEqual(doc.len, r.byteLen());
+    try t.expect(!r.isRealized(.{ .start = 0, .end = doc.len }));
+    try t.expectEqual(@as(usize, 1), r.lineCount()); // no realized newlines yet
+
+    // Window boundaries must be scalar boundaries of the true content.
+    var bounds = try refBoundaries(gpa, doc);
+    defer bounds.deinit(gpa);
+    const cut = struct {
+        fn cut(b: []const usize, approx: usize) usize {
+            var best: usize = 0;
+            for (b) |x| {
+                if (x <= approx) best = x else break;
+            }
+            return best;
+        }
+    }.cut;
+    const c1 = cut(bounds.items, doc.len / 3);
+    const c2 = cut(bounds.items, 2 * doc.len / 3);
+
+    // Realize middle first (borrowed), then tail (copied), then head.
+    try r.realizeBacking(gpa, c1, doc[c1..c2]);
+    try t.expect(r.isRealized(.{ .start = c1, .end = c2 }));
+    try t.expect(!r.isRealized(.{ .start = 0, .end = doc.len }));
+    {
+        // The fetch list is exactly the two remaining runs.
+        var it = r.unrealized(.{ .start = 0, .end = doc.len });
+        try t.expectEqual(Range{ .start = 0, .end = c1 }, it.next().?);
+        try t.expectEqual(Range{ .start = c2, .end = doc.len }, it.next().?);
+        try t.expectEqual(@as(?Range, null), it.next());
+    }
+    try r.realize(gpa, c2, doc[c2..]);
+    try r.realize(gpa, 0, doc[0..c1]);
+    try t.expect(r.isRealized(.{ .start = 0, .end = doc.len }));
+
+    // Fully realized: contents and every metric match the reference.
+    try checkAgainstReference(&r, doc);
+}
+
+test "unrealized: byte-domain edits work on and around holes" {
+    const gpa = t.allocator;
+    var r = try TinyRope.fromUnrealized(gpa, 1000);
+    defer r.deinit(gpa);
+
+    // Snapshot before any realization: shares the hole.
+    var snap = r.snapshot();
+    defer snap.deinit(gpa);
+
+    // Insert INTO the middle of the hole (splits it).
+    _ = try r.insert(gpa, 500, "<mark>");
+    try t.expectEqual(@as(usize, 1006), r.byteLen());
+    try t.expect(r.isRealized(.{ .start = 500, .end = 506 }));
+
+    // Delete a fully-unrealized span (never fetched — pure structure).
+    _ = try r.delete(gpa, .{ .start = 0, .end = 100 });
+    try t.expectEqual(@as(usize, 906), r.byteLen());
+
+    // Delete spanning unrealized + realized: drops 2 hole bytes + "<m".
+    _ = try r.delete(gpa, .{ .start = 398, .end = 402 });
+    try t.expectEqual(@as(usize, 902), r.byteLen());
+
+    // Split/append round-trip with holes.
+    var right = try r.split(gpa, 400);
+    try t.expectEqual(@as(usize, 400), r.byteLen());
+    try r.append(gpa, &right);
+    try t.expectEqual(@as(usize, 902), r.byteLen());
+    r.validate();
+
+    // The snapshot still sees the original untouched hole.
+    try t.expectEqual(@as(usize, 1000), snap.byteLen());
+    try t.expect(!snap.isRealized(.{ .start = 0, .end = 1000 }));
+    snap.validate();
+
+    // Metrics count realized content only: "ark>" survives the deletes.
+    try t.expectEqual(@as(usize, 4), r.scalarLen());
+}
+
+test "unrealized: partial metrics converge as realization proceeds" {
+    const gpa = t.allocator;
+    const doc = "line one\nline two\nline three\n";
+    var r = try Rope.fromUnrealized(gpa, doc.len);
+    defer r.deinit(gpa);
+
+    try t.expectEqual(@as(usize, 1), r.lineCount());
+    try r.realize(gpa, 0, doc[0..9]); // "line one\n"
+    try t.expectEqual(@as(usize, 2), r.lineCount());
+    try t.expectEqual(@as(usize, 9), r.scalarLen());
+    try r.realize(gpa, 9, doc[9..]);
+    try t.expectEqual(@as(usize, 4), r.lineCount());
+    const got = try r.toOwnedSlice(gpa);
+    defer gpa.free(got);
+    try t.expectEqualStrings(doc, got);
+}
+
+fn unrealizedOomScript(gpa: std.mem.Allocator) !void {
+    var r = try TinyRope.fromUnrealized(gpa, 64);
+    defer r.deinit(gpa);
+    try r.realize(gpa, 16, "0123456789abcdef");
+    _ = try r.insert(gpa, 32, "xx");
+    _ = try r.delete(gpa, .{ .start = 0, .end = 8 });
+    try r.realizeBacking(gpa, 40, "ABCDEFGH");
+    var right = try r.split(gpa, 30);
+    errdefer right.deinit(gpa);
+    try r.append(gpa, &right);
+    r.validate();
+}
+
+test "OOM: unrealized paths are leak-free and restore on failure" {
+    try std.testing.checkAllAllocationFailures(t.allocator, unrealizedOomScript, .{});
+}
+
 test "dimension-stripped instantiation compiles and works" {
     const gpa = t.allocator;
     const Bare = rope_mod.RopeWith(.{

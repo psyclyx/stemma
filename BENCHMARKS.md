@@ -76,6 +76,13 @@ graph merge concurrent 1k+1k     2140 ns/op  (best     2079)  n=5
 - **2026-08-10 — c1024b16**: best scan (65 GB/s) and load (2.2 GB/s) but
   conversions +40–60% and typing +20% — rejected as default; viable
   specialization for scan-dominated read-mostly workloads via `RopeWith`.
+- **2026-08-14 — unrealized-content (holes) feature**: guarding the delete
+  fast path with an isRealized walk cost random-edit ~+8% (351 vs ~320 ns).
+  Fixed with a sticky `may_have_holes` flag (set by fromUnrealized,
+  inherited by snapshot/split/append, never cleared): ropes that never
+  touched lazy content skip every hole check. Re-measured 320 ns — back in
+  the noise band. Lesson repeated: any check added to a hot path needs a
+  "does this rope even need it" gate.
 - **2026-08-11 — consumer-surface additions** (find/lineIterator/AnchorSet/
   PointUtf16): random-edit median moved 322→334 ns in a same-session
   stash A/B despite the new code never executing on that path — attributed

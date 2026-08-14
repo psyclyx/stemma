@@ -73,6 +73,11 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
 
         /// Shared, refcounted tree root. `null` is the canonical empty rope.
         root: ?*Node = null,
+        /// Sticky: true iff this rope MAY contain unrealized holes (set by
+        /// `fromUnrealized`, inherited through snapshot/split/append; never
+        /// cleared). Ropes that never touched lazy content skip all hole
+        /// checks on hot paths.
+        may_have_holes: bool = false,
 
         /// The empty rope. Costs nothing and needs no `deinit` until it has
         /// been edited into a non-empty state.
@@ -163,11 +168,17 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
         const Leaf = union(enum) {
             owned: Owned,
             borrowed: []const u8,
+            /// Unrealized content: byte length known (node summary), bytes
+            /// absent. Structural operations work; content access panics —
+            /// fetch and `realize()` first (`isRealized`/`unrealized` tell
+            /// you what to fetch).
+            hole,
 
             fn bytes(l: *const Leaf) []const u8 {
                 return switch (l.*) {
                     .owned => |*o| o.buf[0..o.len],
                     .borrowed => |b| b,
+                    .hole => @panic("stemma.Rope: content access to an unrealized range — fetch and realize() first"),
                 };
             }
         };
@@ -246,6 +257,18 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             return newLeafOwned2(gpa, bytes, &.{});
         }
 
+        fn newLeafHole(gpa: Allocator, len: usize) Error!*Node {
+            assert(len > 0);
+            const n = try gpa.create(Node);
+            n.* = .{
+                .refs = refsInit(),
+                .height = 0,
+                .summary = .{ .bytes = len },
+                .data = .{ .leaf = .hole },
+            };
+            return n;
+        }
+
         fn newLeafBorrowed(gpa: Allocator, span: []const u8) Error!*Node {
             assert(span.len > 0);
             const n = try gpa.create(Node);
@@ -310,6 +333,25 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
         fn concatNodes(gpa: Allocator, l: *Node, r: *Node) Error!Pair {
             if (l.height == r.height) {
                 if (l.isLeaf()) {
+                    // Adjacent holes coalesce (keeps sparse trees tiny).
+                    if (l.data.leaf == .hole and r.data.leaf == .hole) {
+                        if (isUnique(l)) {
+                            l.summary.bytes += r.summary.bytes;
+                            release(gpa, r);
+                            return .{ .first = l, .second = null };
+                        }
+                        const m = newLeafHole(gpa, l.summary.bytes + r.summary.bytes) catch |e| {
+                            release(gpa, l);
+                            release(gpa, r);
+                            return e;
+                        };
+                        release(gpa, l);
+                        release(gpa, r);
+                        return .{ .first = m, .second = null };
+                    }
+                    if (l.data.leaf == .hole or r.data.leaf == .hole) {
+                        return .{ .first = l, .second = r };
+                    }
                     const lb = l.data.leaf.bytes();
                     const rb = r.data.leaf.bytes();
                     const both_owned = l.data.leaf == .owned and r.data.leaf == .owned;
@@ -481,12 +523,28 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             if (offset == n.summary.bytes) return .{ .left = n, .right = null };
 
             if (n.isLeaf()) {
+                if (n.data.leaf == .hole) {
+                    // Splitting a hole is pure arithmetic.
+                    const total = n.summary.bytes;
+                    const left = newLeafHole(gpa, offset) catch |e| {
+                        release(gpa, n);
+                        return e;
+                    };
+                    const right = newLeafHole(gpa, total - offset) catch |e| {
+                        release(gpa, left);
+                        release(gpa, n);
+                        return e;
+                    };
+                    release(gpa, n);
+                    return .{ .left = left, .right = right };
+                }
                 const b = n.data.leaf.bytes();
                 const mk = struct {
                     fn mk(g: Allocator, leaf: *const Leaf, part: []const u8) Error!*Node {
                         return switch (leaf.*) {
                             .owned => newLeafOwned(g, part),
                             .borrowed => newLeafBorrowed(g, part),
+                            .hole => unreachable, // handled above
                         };
                     }
                 }.mk;
@@ -726,6 +784,136 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
         /// Release this handle's share of the tree. Nodes still referenced by
         /// a live snapshot survive; only the last handle frees. Must use the
         /// same allocator that built/edited the rope.
+        // ── Lazy / unrealized content ────────────────────────────────────
+        // The rope does no I/O. A rope over remote or not-yet-fetched data
+        // starts as an unrealized "hole" of known byte length; the CALLER
+        // fetches windows (its transport, its cache policy) and `realize`s
+        // them. Byte-domain operations (seek arithmetic, split, delete,
+        // insert around/into holes) work on unrealized content; content
+        // access (chunks, cursors, search, conversions *inside* a hole)
+        // panics deterministically — use `isRealized`/`unrealized` to
+        // sequence fetches. Content metrics (lines/scalars/UTF-16) count
+        // realized content only and converge as realization proceeds.
+        // `realize` does not change offsets: anchors and versions are
+        // unaffected (it is not an edit).
+
+        /// A rope of `len` unrealized bytes. O(1); no content is read.
+        pub fn fromUnrealized(gpa: Allocator, len: usize) Error!RopeT {
+            if (len == 0) return .empty;
+            return .{ .root = try newLeafHole(gpa, len), .may_have_holes = true };
+        }
+
+        /// Fill `[byte_offset, byte_offset + content.len)` — which must be
+        /// entirely unrealized — with fetched bytes (copied; the caller may
+        /// free `content` afterwards). Preconditions: the range is in
+        /// bounds and fully unrealized; `content` is valid UTF-8 whose
+        /// edges coincide with scalar boundaries of the true underlying
+        /// data (the caller vouches — neighbors may be unfetched). On
+        /// allocation failure the rope is unchanged.
+        pub fn realize(self: *RopeT, gpa: Allocator, byte_offset: usize, content: []const u8) Error!void {
+            return self.realizeImpl(gpa, byte_offset, content, .owned);
+        }
+
+        /// As `realize`, but zero-copy: leaves borrow `backing`, which the
+        /// caller must keep alive and unchanged for the lifetime of this
+        /// rope and everything derived from it.
+        pub fn realizeBacking(self: *RopeT, gpa: Allocator, byte_offset: usize, backing: []const u8) Error!void {
+            return self.realizeImpl(gpa, byte_offset, backing, .borrowed);
+        }
+
+        fn realizeImpl(self: *RopeT, gpa: Allocator, byte_offset: usize, content: []const u8, comptime kind: LeafKind) Error!void {
+            if (content.len == 0) return;
+            assert(byte_offset + content.len <= self.byteLen());
+            // Checked in all build modes: silently overwriting realized
+            // content would corrupt the document.
+            const target: Range = .{ .start = byte_offset, .end = byte_offset + content.len };
+            if (self.holeSpanBytes(target) != content.len) {
+                @panic("stemma.Rope.realize: target range is not entirely unrealized");
+            }
+            if (runtime_safety) assert(std.unicode.utf8ValidateSlice(content));
+
+            const mid = try treeFromBytes(gpa, content, kind);
+            const saved = if (self.root) |r| retain(r) else null;
+            errdefer self.root = saved;
+            const halves = splitRoot(gpa, self.root, byte_offset) catch |e| {
+                releaseOpt(gpa, mid);
+                return e;
+            };
+            const tail = splitRoot(gpa, halves.right, content.len) catch |e| {
+                releaseOpt(gpa, mid);
+                releaseOpt(gpa, halves.left);
+                return e;
+            };
+            releaseOpt(gpa, tail.left); // the hole span being replaced
+            const left = concatRoots(gpa, halves.left, mid) catch |e| {
+                releaseOpt(gpa, tail.right);
+                return e;
+            };
+            self.root = try concatRoots(gpa, left, tail.right);
+            releaseOpt(gpa, saved);
+        }
+
+        /// Whether every byte of `range` is realized (readable).
+        pub fn isRealized(self: RopeT, range: Range) bool {
+            var it = self.unrealized(range);
+            return it.next() == null;
+        }
+
+        /// Total unrealized bytes within `range`.
+        fn holeSpanBytes(self: RopeT, range: Range) usize {
+            var n: usize = 0;
+            var it = self.unrealized(range);
+            while (it.next()) |r| n += r.len();
+            return n;
+        }
+
+        /// Iterate the unrealized runs intersecting `range` — the fetch
+        /// list. Same invalidation rule as `Cursor`.
+        pub fn unrealized(self: RopeT, range: Range) UnrealizedIterator {
+            assert(range.end <= self.byteLen());
+            return .{ .rope = self, .pos = range.start, .end = range.end };
+        }
+
+        pub const UnrealizedIterator = struct {
+            rope: RopeT,
+            pos: usize,
+            end: usize,
+
+            /// Next unrealized run (clipped to the query range), or null.
+            pub fn next(self: *UnrealizedIterator) ?Range {
+                while (self.pos < self.end) {
+                    const span = self.rope.leafSpanAt(self.pos);
+                    const span_end = @min(span.end, self.end);
+                    if (span.hole) {
+                        const r: Range = .{ .start = self.pos, .end = span_end };
+                        self.pos = span.end;
+                        return r;
+                    }
+                    self.pos = span.end;
+                }
+                return null;
+            }
+        };
+
+        /// The leaf span containing byte `offset` (its absolute extent and
+        /// whether it is a hole). O(log n) descent; never touches content.
+        fn leafSpanAt(self: RopeT, offset: usize) struct { start: usize, end: usize, hole: bool } {
+            var n = self.root.?;
+            var local = offset;
+            var abs: usize = 0;
+            while (!n.isLeaf()) {
+                for (n.data.internal.slice()) |c| {
+                    if (local < c.summary.bytes) {
+                        n = c;
+                        break;
+                    }
+                    local -= c.summary.bytes;
+                    abs += c.summary.bytes;
+                } else unreachable;
+            }
+            return .{ .start = abs, .end = abs + n.summary.bytes, .hole = n.data.leaf == .hole };
+        }
+
         pub fn deinit(self: *RopeT, gpa: Allocator) void {
             releaseOpt(gpa, self.root);
             self.root = null;
@@ -741,7 +929,10 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
         /// this call. The caller owns the result and must `deinit` it (same
         /// allocator).
         pub fn snapshot(self: RopeT) RopeT {
-            return .{ .root = if (self.root) |r| retain(r) else null };
+            return .{
+                .root = if (self.root) |r| retain(r) else null,
+                .may_have_holes = self.may_have_holes,
+            };
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -783,6 +974,9 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             const len = self.byteLen();
             assert(offset <= len);
             if (offset == 0 or offset == len) return;
+            // Inside unrealized content the boundary is unverifiable — the
+            // caller vouches for offsets into holes.
+            if (self.may_have_holes and self.leafSpanAt(offset).hole) return;
             assert(self.byteAt(offset) & 0xC0 != 0x80);
         }
 
@@ -793,7 +987,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             if (!isUnique(n)) return false;
             if (n.isLeaf()) {
                 switch (n.data.leaf) {
-                    .borrowed => return false,
+                    .borrowed, .hole => return false,
                     .owned => |*o| {
                         if (o.len + text.len > opts.chunk_capacity) return false;
                         std.mem.copyBackwards(u8, o.buf[offset + text.len ..][0 .. o.len - offset], o.buf[offset..o.len]);
@@ -822,7 +1016,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             if (!isUnique(n)) return false;
             if (n.isLeaf()) {
                 switch (n.data.leaf) {
-                    .borrowed => return false,
+                    .borrowed, .hole => return false,
                     .owned => |*o| {
                         if (count >= o.len) return false; // don't empty a leaf in place
                         std.mem.copyForwards(u8, o.buf[start .. o.len - count], o.buf[start + count .. o.len]);
@@ -895,7 +1089,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             if (self.root) |r| fast: {
                 if (range.len() >= r.summary.bytes) break :fast;
                 var scratch: [scratch_len]u8 = undefined;
-                if (range.len() <= scratch.len) {
+                if (range.len() <= scratch.len and (!self.may_have_holes or self.isRealized(range))) {
                     self.copyRange(scratch[0..range.len()], range);
                     const delta = Summary.of(scratch[0..range.len()]);
                     if (tryFastDelete(r, range.start, range.len(), delta)) return edit;
@@ -921,7 +1115,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             if (!isUnique(n)) return false;
             if (n.isLeaf()) {
                 switch (n.data.leaf) {
-                    .borrowed => return false,
+                    .borrowed, .hole => return false,
                     .owned => |*o| {
                         const new_len = o.len - count + text.len;
                         if (new_len == 0 or new_len > opts.chunk_capacity) return false;
@@ -972,7 +1166,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             if (self.root) |r| fast: {
                 if (range.len() >= r.summary.bytes) break :fast;
                 var scratch: [scratch_len]u8 = undefined;
-                if (range.len() <= scratch.len) {
+                if (range.len() <= scratch.len and (!self.may_have_holes or self.isRealized(range))) {
                     self.copyRange(scratch[0..range.len()], range);
                     const delta_sub = Summary.of(scratch[0..range.len()]);
                     const delta_add = Summary.of(text);
@@ -1009,7 +1203,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             const halves = try splitRoot(gpa, self.root, byte_offset);
             self.root = halves.left;
             releaseOpt(gpa, saved);
-            return .{ .root = halves.right };
+            return .{ .root = halves.right, .may_have_holes = self.may_have_holes };
         }
 
         /// Append `other`'s contents to `self`. O(log n). On success `other`
@@ -1023,6 +1217,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             releaseOpt(gpa, other.root);
             other.root = null;
             self.root = merged;
+            self.may_have_holes = self.may_have_holes or other.may_have_holes;
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -1306,6 +1501,12 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
             const live_refs = if (opts.thread_safe) n.refs.load(.acquire) else n.refs;
             assert(live_refs >= 1);
             if (n.isLeaf()) {
+                if (n.data.leaf == .hole) {
+                    // Holes: length-only summary, no content invariants.
+                    assert(n.summary.bytes > 0);
+                    assert(std.meta.eql(Summary{ .bytes = n.summary.bytes }, n.summary));
+                    return n.summary;
+                }
                 const b = n.data.leaf.bytes();
                 assert(b.len > 0);
                 if (n.data.leaf == .owned) assert(b.len <= opts.chunk_capacity);
@@ -1348,6 +1549,7 @@ pub fn RopeWith(comptime opts: RopeOptions) type {
                     }
                 } else return acc; // local == 0 exactly at end
             }
+            if (n.data.leaf == .hole) return acc; // unrealized content contributes 0
             const partial = Summary.of(n.data.leaf.bytes()[0..local]);
             return acc + @field(partial, @tagName(dim));
         }
