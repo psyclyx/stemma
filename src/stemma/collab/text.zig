@@ -44,7 +44,8 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
-const walker_mod = @import("walker.zig");
+const core = @import("core.zig");
+const sequence = @import("sequence.zig");
 const rope_mod = @import("../rope.zig");
 const geometry = @import("../geometry.zig");
 const wire = @import("wire.zig");
@@ -54,18 +55,126 @@ const getUv = wire.getUv;
 pub const AgentId = causal.AgentId;
 pub const EventId = causal.EventId;
 const Lv = causal.Lv;
-const TextOp = walker_mod.TextOp;
-const Graph = walker_mod.Graph;
-const Walker = walker_mod.Walker;
-const ScalarEdit = walker_mod.ScalarEdit;
-const base_lv = walker_mod.base_lv;
+const Sequence = sequence.Sequence;
 const Rope = rope_mod.Rope;
 const Range = geometry.Range;
 const Edit = geometry.Edit;
 
+/// Text operation payload, in **scalar** (Unicode codepoint) coordinates —
+/// portable across replicas regardless of their byte encodings.
+pub const TextOp = union(enum) {
+    /// Insert scalar `ch` at scalar position `pos` (as seen by the author).
+    ins: struct { pos: u64, ch: u21 },
+    /// Delete the scalar at position `pos` (as seen by the author).
+    del: u64,
+};
+
+pub const Graph = causal.EventGraph(TextOp);
+
+/// A transformed operation in scalar space, valid against the document
+/// state produced by all previously emitted edits.
+const ScalarEdit = union(enum) {
+    ins: struct { pos: u64, ch: u21 },
+    del: u64,
+};
+
+/// Sentinel `lv` for compacted base placeholder items.
+const base_lv: Lv = std.math.maxInt(Lv);
+
 const wire_magic_v1 = "stg\x01";
 const wire_magic_v2 = "stg\x02";
-const version_magic = "stv\x01";
+const version_magic = core.version_magic;
+
+/// Replay of the whole history against one shared `Sequence`: the
+/// eg-walker prepare/effect discipline (see sequence.zig for the ordering,
+/// causal.zig for the graph). Events before `first_new` replay silently;
+/// newer (untrusted) events emit transformed scalar edits and get
+/// error-checked positions instead of asserts.
+const Replay = struct {
+    history: *const Graph,
+    s: Sequence = .empty,
+    /// lv → arena of the item it inserted / deleted (retreat/advance).
+    item_of: std.ArrayList(i32) = .empty,
+    target_of: std.ArrayList(i32) = .empty,
+    prep_frontier: std.ArrayList(Lv) = .empty,
+
+    const Names = struct {
+        g: *const Graph,
+        pub fn agentNameOf(self: @This(), lv: Lv) []const u8 {
+            // Base placeholders sort as the empty name: causally before
+            // everything live; the rule only needs cross-replica determinism.
+            if (lv == base_lv) return "";
+            return self.g.agentName(self.g.idOf(lv).agent);
+        }
+    };
+
+    fn init(history: *const Graph) Replay {
+        return .{ .history = history };
+    }
+
+    fn deinit(self: *Replay, gpa: Allocator) void {
+        self.s.deinit(gpa);
+        self.item_of.deinit(gpa);
+        self.target_of.deinit(gpa);
+        self.prep_frontier.deinit(gpa);
+    }
+
+    fn initBase(self: *Replay, gpa: Allocator, count: usize) Allocator.Error!void {
+        try self.s.initBase(gpa, count, base_lv);
+    }
+
+    const ReplayError = Allocator.Error || error{Corrupt};
+
+    fn replayAll(self: *Replay, gpa: Allocator, first_new: Lv, include: ?[]const bool, out: *std.ArrayList(ScalarEdit)) ReplayError!void {
+        const n = self.history.eventCount();
+        try self.item_of.appendNTimes(gpa, sequence.none, n);
+        try self.target_of.appendNTimes(gpa, sequence.none, n);
+        for (0..n) |lv_usize| {
+            const lv: Lv = @intCast(lv_usize);
+            if (include) |inc| if (!inc[lv_usize]) continue;
+            try self.movePrepareTo(gpa, self.history.parentsOf(lv));
+            const emit = lv >= first_new;
+            switch (self.history.opOf(lv)) {
+                .ins => |ins| {
+                    const res = try self.s.applyInsert(gpa, Names{ .g = self.history }, lv, ins.pos, emit);
+                    self.item_of.items[lv] = res.arena;
+                    if (emit) try out.append(gpa, .{ .ins = .{ .pos = res.effect_pos, .ch = ins.ch } });
+                },
+                .del => |pos| {
+                    const res = try self.s.applyDelete(pos, emit);
+                    self.target_of.items[lv] = res.arena;
+                    if (emit) {
+                        if (res.effect_pos) |p| try out.append(gpa, .{ .del = p });
+                    }
+                },
+            }
+            self.prep_frontier.clearRetainingCapacity();
+            try self.prep_frontier.append(gpa, lv);
+        }
+    }
+
+    fn movePrepareTo(self: *Replay, gpa: Allocator, target: []const Lv) Allocator.Error!void {
+        if (std.mem.eql(Lv, self.prep_frontier.items, target)) return;
+        var d = try self.history.diff(gpa, self.prep_frontier.items, target);
+        defer d.deinit(gpa);
+        // Retreat newest-first, advance oldest-first.
+        var i = d.a_only.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.toggle(d.a_only.items[i], false);
+        }
+        for (d.b_only.items) |lv| self.toggle(lv, true);
+        self.prep_frontier.clearRetainingCapacity();
+        try self.prep_frontier.appendSlice(gpa, target);
+    }
+
+    fn toggle(self: *Replay, lv: Lv, on: bool) void {
+        switch (self.history.opOf(lv)) {
+            .ins => self.s.toggleInsert(self.item_of.items[lv], on),
+            .del => self.s.toggleDelete(self.target_of.items[lv], on),
+        }
+    }
+};
 
 pub const TextDoc = struct {
     rope: Rope = .empty,
@@ -152,22 +261,9 @@ pub const TextDoc = struct {
     /// with peers (`eventsSince`) or persist it; treat the bytes as opaque.
     /// Caller owns.
     pub fn version(self: *const TextDoc, gpa: Allocator) Allocator.Error![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        try out.appendSlice(gpa, version_magic);
-        try putUv(gpa, &out, self.history.frontier.items.len);
-        for (self.history.frontier.items) |lv| {
-            const id = self.history.idOf(lv);
-            const name = self.history.agentName(id.agent);
-            try putUv(gpa, &out, name.len);
-            try out.appendSlice(gpa, name);
-            try putUv(gpa, &out, id.seq);
-        }
-        return out.toOwnedSlice(gpa);
+        return core.encodeVersion(gpa, &self.history);
     }
 
-    /// Decode a version token to known Lvs. `strict` errors on entries we
-    /// have not stored (`MissingDependency`); lenient mode skips them.
     fn decodeVersion(
         self: *const TextDoc,
         gpa: Allocator,
@@ -175,27 +271,7 @@ pub const TextDoc = struct {
         strict: bool,
         out: *std.ArrayList(Lv),
     ) MergeError!void {
-        var cur = token;
-        if (!std.mem.startsWith(u8, cur, version_magic)) return error.Corrupt;
-        cur = cur[version_magic.len..];
-        const count = try getUv(&cur);
-        if (count > 1 << 20) return error.Corrupt;
-        for (0..count) |_| {
-            const nlen = try getUv(&cur);
-            if (nlen == 0 or nlen > 4096 or nlen > cur.len) return error.Corrupt;
-            const name = cur[0..nlen];
-            cur = cur[nlen..];
-            const seq = try getUv(&cur);
-            const lv: ?Lv = if (self.history.findAgent(name)) |agent|
-                self.history.lvOf(.{ .agent = agent, .seq = seq })
-            else
-                null;
-            if (lv) |v| {
-                try out.append(gpa, v);
-            } else if (strict) {
-                return error.MissingDependency;
-            }
-        }
+        return core.decodeVersion(&self.history, gpa, token, strict, out);
     }
 
     pub const VersionOrder = causal.VersionOrder;
@@ -212,27 +288,10 @@ pub const TextDoc = struct {
         a_token: []const u8,
         b_token: []const u8,
     ) MergeError!VersionOrder {
-        var a: std.ArrayList(Lv) = .empty;
-        defer a.deinit(gpa);
-        try self.decodeVersion(gpa, a_token, true, &a);
-        var b: std.ArrayList(Lv) = .empty;
-        defer b.deinit(gpa);
-        try self.decodeVersion(gpa, b_token, true, &b);
-        return self.history.compareFrontiers(gpa, a.items, b.items);
+        return core.compareVersions(gpa, &self.history, a_token, b_token);
     }
 
-    /// Parse the single (name, seq) entry of a version token.
-    fn versionSingleEntry(token: []const u8) error{Corrupt}!struct { name: []const u8, seq: u64 } {
-        var cur = token;
-        if (!std.mem.startsWith(u8, cur, version_magic)) return error.Corrupt;
-        cur = cur[version_magic.len..];
-        if (try getUv(&cur) != 1) return error.Corrupt;
-        const nlen = try getUv(&cur);
-        if (nlen == 0 or nlen > cur.len) return error.Corrupt;
-        const name = cur[0..nlen];
-        cur = cur[nlen..];
-        return .{ .name = name, .seq = try getUv(&cur) };
-    }
+    const versionSingleEntry = core.versionSingleEntry;
 
     /// Wire-encode every event the holder of `remote_version` (an opaque
     /// token from their `version()`) lacks, in causally valid order. Version
@@ -289,7 +348,7 @@ pub const TextDoc = struct {
         defer d.deinit(gpa);
         for (d.a_only.items) |lv| include[lv] = true;
 
-        var w = Walker.init(&self.history);
+        var w = Replay.init(&self.history);
         defer w.deinit(gpa);
         if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
         var sink: std.ArrayList(ScalarEdit) = .empty;
@@ -304,7 +363,7 @@ pub const TextDoc = struct {
         defer gpa.free(base_chars);
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(gpa);
-        var it = w.aliveIterator();
+        var it = w.s.aliveIterator();
         var buf: [4]u8 = undefined;
         while (it.next()) |alive| {
             const ch = if (alive.lv == base_lv)
@@ -369,7 +428,7 @@ pub const TextDoc = struct {
 
         var w = try self.silentReplay(gpa);
         defer w.deinit(gpa);
-        var it = w.aliveIterator();
+        var it = w.s.aliveIterator();
         var i: usize = 0;
         while (it.next()) |alive| : (i += 1) {
             if (i == target_index) {
@@ -399,12 +458,12 @@ pub const TextDoc = struct {
         defer w.deinit(gpa);
 
         // One pass: per-arena count of alive items strictly before it.
-        const alive_before = try gpa.alloc(u64, w.items.items.len);
+        const alive_before = try gpa.alloc(u64, w.s.items.items.len);
         defer gpa.free(alive_before);
         var count: u64 = 0;
-        for (w.seq.items) |arena| {
+        for (w.s.seq.items) |arena| {
             alive_before[arena] = count;
-            if (w.items.items[arena].effect_visible) count += 1;
+            if (w.s.items.items[arena].effect_visible) count += 1;
         }
 
         for (anchors, out) |a, *o| {
@@ -423,7 +482,7 @@ pub const TextDoc = struct {
             if (self.history.opOf(lv) != .ins) return error.Corrupt;
             const arena = w.item_of.items[lv];
             assert(arena != -1);
-            const item = &w.items.items[@intCast(arena)];
+            const item = &w.s.items.items[@intCast(arena)];
             var scalar = alive_before[@intCast(arena)];
             if (item.effect_visible and a.side == .after) scalar += 1;
             o.* = self.rope.scalarToOffset(scalar);
@@ -431,8 +490,8 @@ pub const TextDoc = struct {
     }
 
     /// Full silent replay of the whole graph (current state).
-    fn silentReplay(self: *const TextDoc, gpa: Allocator) Allocator.Error!Walker {
-        var w = Walker.init(&self.history);
+    fn silentReplay(self: *const TextDoc, gpa: Allocator) Allocator.Error!Replay {
+        var w = Replay.init(&self.history);
         errdefer w.deinit(gpa);
         if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
         var sink: std.ArrayList(ScalarEdit) = .empty;
@@ -685,7 +744,7 @@ pub const TextDoc = struct {
         }
         if (!any_new) return false;
 
-        var w = Walker.init(&self.history);
+        var w = Replay.init(&self.history);
         defer w.deinit(gpa);
         if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
         try w.replayAll(gpa, first_new, null, scalar_edits);
@@ -798,15 +857,8 @@ pub const TextDoc = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    fn tableAdd(gpa: Allocator, table: *std.ArrayList(AgentId), aid: AgentId) Allocator.Error!void {
-        for (table.items) |x| if (x == aid) return;
-        try table.append(gpa, aid);
-    }
-
-    fn tableIndexOf(table: []const AgentId, aid: AgentId) usize {
-        for (table, 0..) |x, i| if (x == aid) return i;
-        unreachable;
-    }
+    const tableAdd = core.tableAdd;
+    const tableIndexOf = core.tableIndexOf;
 
     const ParentRef = struct { agent_idx: u32, seq: u64 };
 

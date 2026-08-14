@@ -26,7 +26,7 @@
 const std = @import("std");
 
 pub const causal = @import("collab/causal.zig");
-const walker = @import("collab/walker.zig");
+const core = @import("collab/core.zig");
 const text = @import("collab/text.zig");
 const objects = @import("collab/objects.zig");
 
@@ -34,14 +34,16 @@ pub const AgentId = causal.AgentId;
 pub const EventId = causal.EventId;
 pub const EventGraph = causal.EventGraph;
 pub const VersionOrder = causal.VersionOrder;
-pub const TextOp = walker.TextOp;
+pub const TextOp = text.TextOp;
 pub const TextDoc = text.TextDoc;
 pub const ObjectDoc = objects.ObjectDoc;
 pub const ObjId = objects.ObjId;
 
 test {
     _ = causal;
-    _ = walker;
+    _ = core;
+    _ = @import("collab/sequence.zig");
+    _ = @import("collab/objects_state.zig");
     _ = text;
     _ = objects;
     _ = @import("collab/wire.zig");

@@ -30,6 +30,7 @@ const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
 const jw = @import("objects_state.zig");
+const core = @import("core.zig");
 const wire = @import("wire.zig");
 const rope_mod = @import("../rope.zig");
 const geometry = @import("../geometry.zig");
@@ -52,7 +53,7 @@ const getUv = wire.getUv;
 const getBytes = wire.getBytes;
 
 const object_magic = "stj\x01";
-const version_magic = "stv\x01";
+const version_magic = core.version_magic;
 const no_node: u32 = std.math.maxInt(u32);
 const root_key = Walker.root_key;
 
@@ -533,18 +534,7 @@ pub const ObjectDoc = struct {
     // ── Versions & sync (same token model as TextDoc) ───────────────────
 
     pub fn version(self: *const ObjectDoc, gpa: Allocator) Allocator.Error![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        try out.appendSlice(gpa, version_magic);
-        try putUv(gpa, &out, self.history.frontier.items.len);
-        for (self.history.frontier.items) |lv| {
-            const id = self.history.idOf(lv);
-            const name = self.history.agentName(id.agent);
-            try putUv(gpa, &out, name.len);
-            try out.appendSlice(gpa, name);
-            try putUv(gpa, &out, id.seq);
-        }
-        return out.toOwnedSlice(gpa);
+        return core.encodeVersion(gpa, &self.history);
     }
 
     fn decodeVersion(
@@ -554,35 +544,11 @@ pub const ObjectDoc = struct {
         strict: bool,
         out: *std.ArrayList(Lv),
     ) MergeError!void {
-        var cur = token;
-        if (!std.mem.startsWith(u8, cur, version_magic)) return error.Corrupt;
-        cur = cur[version_magic.len..];
-        const count = try getUv(&cur);
-        if (count > 1 << 20) return error.Corrupt;
-        for (0..count) |_| {
-            const name = try getBytes(&cur, 4096);
-            if (name.len == 0) return error.Corrupt;
-            const seq = try getUv(&cur);
-            const lv: ?Lv = if (self.history.findAgent(name)) |agent|
-                self.history.lvOf(.{ .agent = agent, .seq = seq })
-            else
-                null;
-            if (lv) |v| {
-                try out.append(gpa, v);
-            } else if (strict) {
-                return error.MissingDependency;
-            }
-        }
+        return core.decodeVersion(&self.history, gpa, token, strict, out);
     }
 
     pub fn compareVersions(self: *const ObjectDoc, gpa: Allocator, a_token: []const u8, b_token: []const u8) MergeError!VersionOrder {
-        var a: std.ArrayList(Lv) = .empty;
-        defer a.deinit(gpa);
-        try self.decodeVersion(gpa, a_token, true, &a);
-        var b: std.ArrayList(Lv) = .empty;
-        defer b.deinit(gpa);
-        try self.decodeVersion(gpa, b_token, true, &b);
-        return self.history.compareFrontiers(gpa, a.items, b.items);
+        return core.compareVersions(gpa, &self.history, a_token, b_token);
     }
 
     pub fn eventsSince(self: *const ObjectDoc, gpa: Allocator, remote_version: []const u8) (Allocator.Error || error{Corrupt})![]u8 {
@@ -911,15 +877,8 @@ pub const ObjectDoc = struct {
         }
     }
 
-    fn tableAdd(gpa: Allocator, table: *std.ArrayList(AgentId), aid: AgentId) Allocator.Error!void {
-        for (table.items) |x| if (x == aid) return;
-        try table.append(gpa, aid);
-    }
-
-    fn tableIndexOf(table: []const AgentId, aid: AgentId) usize {
-        for (table, 0..) |x, i| if (x == aid) return i;
-        unreachable;
-    }
+    const tableAdd = core.tableAdd;
+    const tableIndexOf = core.tableIndexOf;
 
     fn zigzag(x: i64) u64 {
         return @bitCast((x << 1) ^ (x >> 63));

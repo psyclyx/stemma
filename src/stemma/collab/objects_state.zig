@@ -1,8 +1,9 @@
-//! Replay engine for JSON documents: the same eg-walker prepare/effect
-//! discipline as the text walker, generalized to a *tree* of objects —
-//! multi-value map registers plus per-object FugueMax sequences (lists and
-//! text share the sequence machinery; a list element is just an item whose
-//! payload is a value instead of a scalar).
+//! Transient replay state for ObjectDoc: the eg-walker prepare/effect
+//! discipline generalized to a *tree* of objects — multi-value map
+//! registers plus per-object sequences. All sequence ordering comes from
+//! the shared FugueMax engine in sequence.zig; this file owns only what is
+//! object-specific: per-object dispatch, the MV register semantics, and
+//! kill-list bookkeeping for map writes.
 //!
 //! Map semantics are multi-value ("MV"): a set overwrites exactly the
 //! values its author could see (prepare-visible); concurrent sets to the
@@ -14,13 +15,18 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
+const sequence = @import("sequence.zig");
 const Lv = causal.Lv;
 const EventId = causal.EventId;
+const Sequence = sequence.Sequence;
+const none = sequence.none;
 
-/// String reference into the owning JsonDoc's append-only arena.
+/// String reference into the owning ObjectDoc's append-only arena.
 pub const Str = struct { start: u32, len: u32 };
 
-/// Object identity: the event that created it. `null` obj refs = the root map.
+/// Object identity: the event that created it. `null` obj refs = the root
+/// map. DOC-LOCAL (embeds replica-local agent numbering); see
+/// ObjectDoc.exportId for portable references.
 pub const ObjId = EventId;
 
 pub const ValPayload = union(enum) {
@@ -57,35 +63,6 @@ pub const Effect = union(enum) {
     text_del: struct { obj: Lv, pos: u64 },
 };
 
-const none: i32 = -1;
-
-// ── Per-object sequence state (lists and text) ──────────────────────────
-
-const SeqItem = struct {
-    lv: Lv,
-    origin_left: i32,
-    origin_right: i32,
-    prep_inserted: bool,
-    prep_deleted: u32,
-    effect_visible: bool,
-
-    fn prepVisible(it: *const SeqItem) bool {
-        return it.prep_inserted and it.prep_deleted == 0;
-    }
-};
-
-const Sequence = struct {
-    items: std.ArrayList(SeqItem) = .empty,
-    seq: std.ArrayList(u32) = .empty,
-    pos_of: std.ArrayList(u32) = .empty,
-
-    fn deinit(self: *Sequence, gpa: Allocator) void {
-        self.items.deinit(gpa);
-        self.seq.deinit(gpa);
-        self.pos_of.deinit(gpa);
-    }
-};
-
 // ── Per-(object, key) register state ────────────────────────────────────
 
 const RegItem = struct {
@@ -113,18 +90,17 @@ const MapReg = struct {
     }
 };
 
-// ── The walker ──────────────────────────────────────────────────────────
+// ── The replay state ────────────────────────────────────────────────────
 
 pub const Walker = struct {
     graph: *const Graph,
     strings: []const u8,
 
-    /// Object-lv (or root sentinel) → state. Root map uses key `root_key`.
+    /// Object-lv (or `root_key`) → sequence / register state.
     seqs: std.AutoHashMapUnmanaged(Lv, Sequence) = .empty,
     maps: std.AutoHashMapUnmanaged(Lv, MapReg) = .empty,
-    /// Per-event bookkeeping for retreat/advance.
-    /// Inserts (seq): item arena index. Deletes (seq): target arena index.
-    /// map_set: own RegItem index (hi 32) unused; see reg_pos.
+    /// Sequence events (ins/del): arena index within their object's
+    /// sequence, for retreat/advance.
     seq_slot_of: std.ArrayList(i32) = .empty,
     /// map_set events: index of their own RegItem within the key slot.
     reg_pos_of: std.ArrayList(i32) = .empty,
@@ -138,6 +114,13 @@ pub const Walker = struct {
     pub const root_key: Lv = std.math.maxInt(Lv);
 
     pub const ReplayError = Allocator.Error || error{Corrupt};
+
+    const Names = struct {
+        g: *const Graph,
+        pub fn agentNameOf(self: @This(), lv: Lv) []const u8 {
+            return self.g.agentName(self.g.idOf(lv).agent);
+        }
+    };
 
     pub fn init(graph: *const Graph, strings: []const u8) Walker {
         return .{ .graph = graph, .strings = strings };
@@ -200,7 +183,7 @@ pub const Walker = struct {
     }
 
     /// Replay the whole graph in Lv order; events at `lv >= first_new`
-    /// emit effects. See the text walker for the shared discipline.
+    /// emit effects.
     pub fn replayAll(self: *Walker, gpa: Allocator, first_new: Lv, out: *std.ArrayList(Effect)) ReplayError!void {
         const n = self.graph.eventCount();
         try self.seq_slot_of.appendNTimes(gpa, none, n);
@@ -235,19 +218,12 @@ pub const Walker = struct {
     fn toggle(self: *Walker, lv: Lv, on: bool) void {
         switch (self.graph.opOf(lv)) {
             .list_ins, .text_ins => {
-                const obj = self.appliedSeqObj(lv);
-                const s = self.seqs.getPtr(obj).?;
-                const idx = self.seq_slot_of.items[lv];
-                assert(idx != none);
-                s.items.items[@intCast(idx)].prep_inserted = on;
+                const s = self.seqs.getPtr(self.appliedSeqObj(lv)).?;
+                s.toggleInsert(self.seq_slot_of.items[lv], on);
             },
             .list_del, .text_del => {
-                const obj = self.appliedSeqObj(lv);
-                const s = self.seqs.getPtr(obj).?;
-                const idx = self.seq_slot_of.items[lv];
-                assert(idx != none);
-                const it = &s.items.items[@intCast(idx)];
-                if (on) it.prep_deleted += 1 else it.prep_deleted -= 1;
+                const s = self.seqs.getPtr(self.appliedSeqObj(lv)).?;
+                s.toggleDelete(self.seq_slot_of.items[lv], on);
             },
             .map_set, .map_del => {
                 const info = self.appliedMapSlot(lv);
@@ -268,8 +244,6 @@ pub const Walker = struct {
     }
 
     fn appliedSeqObj(self: *const Walker, lv: Lv) Lv {
-        // Reconstructed cheaply: the op's object ref resolves without checks
-        // for already-applied (trusted) events.
         const ref: ?ObjId = switch (self.graph.opOf(lv)) {
             .list_ins => |o| o.obj,
             .list_del => |o| o.obj,
@@ -302,7 +276,7 @@ pub const Walker = struct {
 
     fn getSeq(self: *Walker, gpa: Allocator, obj: Lv) Allocator.Error!*Sequence {
         const gop = try self.seqs.getOrPut(gpa, obj);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         return gop.value_ptr;
     }
 
@@ -318,12 +292,12 @@ pub const Walker = struct {
     }
 
     fn apply(self: *Walker, gpa: Allocator, lv: Lv, emit: bool, out: *std.ArrayList(Effect)) ReplayError!void {
+        const names: Names = .{ .g = self.graph };
         switch (self.graph.opOf(lv)) {
             .map_set => |m| {
                 const obj = try self.resolveObj(m.obj, lv, 0, emit);
                 const slot = try self.getSlot(gpa, obj, m.key);
                 try self.registerWrite(gpa, lv, obj, slot, m.key, emit, out);
-                // Add our own value item.
                 self.reg_pos_of.items[lv] = @intCast(slot.items.items.len);
                 try slot.items.append(gpa, .{
                     .lv = lv,
@@ -344,42 +318,37 @@ pub const Walker = struct {
             .list_ins => |l| {
                 const obj = try self.resolveObj(l.obj, lv, 1, emit);
                 const s = try self.getSeq(gpa, obj);
-                const idx = try seqInsert(self, gpa, s, lv, l.pos, emit);
+                const res = try s.applyInsert(gpa, names, lv, l.pos, emit);
+                self.seq_slot_of.items[lv] = res.arena;
                 if (emit) {
-                    try out.append(gpa, .{ .list_ins = .{
-                        .obj = obj,
-                        .index = effectPosOf(s, idx),
-                        .lv = lv,
-                        .val = l.val,
-                    } });
+                    try out.append(gpa, .{ .list_ins = .{ .obj = obj, .index = res.effect_pos, .lv = lv, .val = l.val } });
                 }
-                s.items.items[@intCast(idx)].effect_visible = true;
             },
             .list_del => |l| {
                 const obj = try self.resolveObj(l.obj, lv, 1, emit);
                 const s = try self.getSeq(gpa, obj);
-                if (try self.seqDelete(s, lv, l.pos, emit)) |index| {
-                    if (emit) try out.append(gpa, .{ .list_del = .{ .obj = obj, .index = index } });
+                const res = try s.applyDelete(l.pos, emit);
+                self.seq_slot_of.items[lv] = res.arena;
+                if (emit) {
+                    if (res.effect_pos) |index| try out.append(gpa, .{ .list_del = .{ .obj = obj, .index = index } });
                 }
             },
             .text_ins => |x| {
                 const obj = try self.resolveObj(x.obj, lv, 2, emit);
                 const s = try self.getSeq(gpa, obj);
-                const idx = try seqInsert(self, gpa, s, lv, x.pos, emit);
+                const res = try s.applyInsert(gpa, names, lv, x.pos, emit);
+                self.seq_slot_of.items[lv] = res.arena;
                 if (emit) {
-                    try out.append(gpa, .{ .text_ins = .{
-                        .obj = obj,
-                        .pos = effectPosOf(s, idx),
-                        .ch = x.ch,
-                    } });
+                    try out.append(gpa, .{ .text_ins = .{ .obj = obj, .pos = res.effect_pos, .ch = x.ch } });
                 }
-                s.items.items[@intCast(idx)].effect_visible = true;
             },
             .text_del => |x| {
                 const obj = try self.resolveObj(x.obj, lv, 2, emit);
                 const s = try self.getSeq(gpa, obj);
-                if (try self.seqDelete(s, lv, x.pos, emit)) |pos| {
-                    if (emit) try out.append(gpa, .{ .text_del = .{ .obj = obj, .pos = pos } });
+                const res = try s.applyDelete(x.pos, emit);
+                self.seq_slot_of.items[lv] = res.arena;
+                if (emit) {
+                    if (res.effect_pos) |pos| try out.append(gpa, .{ .text_del = .{ .obj = obj, .pos = pos } });
                 }
             },
         }
@@ -413,115 +382,6 @@ pub const Walker = struct {
             }
         }
         self.kills_len.items[lv] = killed;
-    }
-
-    fn seqInsert(self: *Walker, gpa: Allocator, s: *Sequence, lv: Lv, pos: u64, untrusted: bool) ReplayError!i32 {
-        // Anchors.
-        var left: i32 = none;
-        var right: i32 = none;
-        {
-            var seen: u64 = 0;
-            var found = false;
-            for (s.seq.items) |arena| {
-                const it = &s.items.items[arena];
-                if (it.prepVisible()) {
-                    if (seen == pos) {
-                        right = @intCast(arena);
-                        found = true;
-                        break;
-                    }
-                    seen += 1;
-                    left = @intCast(arena);
-                }
-            }
-            if (!found and seen != pos) {
-                if (untrusted) return error.Corrupt;
-                unreachable;
-            }
-        }
-        return integrate(self, gpa, s, lv, left, right);
-    }
-
-    fn seqDelete(self: *Walker, s: *Sequence, lv: Lv, pos: u64, untrusted: bool) error{Corrupt}!?u64 {
-        var seen: u64 = 0;
-        for (s.seq.items) |arena| {
-            const it = &s.items.items[arena];
-            if (it.prepVisible()) {
-                if (seen == pos) {
-                    self.seq_slot_of.items[lv] = @intCast(arena);
-                    it.prep_deleted += 1;
-                    if (!it.effect_visible) return null; // concurrently deleted
-                    const index = effectPosOf(s, @intCast(arena));
-                    it.effect_visible = false;
-                    return index;
-                }
-                seen += 1;
-            }
-        }
-        if (untrusted) return error.Corrupt;
-        unreachable;
-    }
-
-    fn effectPosOf(s: *const Sequence, idx: i32) u64 {
-        const end = s.pos_of.items[@intCast(idx)];
-        var n: u64 = 0;
-        for (s.seq.items[0..end]) |arena| {
-            if (s.items.items[arena].effect_visible) n += 1;
-        }
-        return n;
-    }
-
-    fn agentNameOf(self: *const Walker, lv: Lv) []const u8 {
-        return self.graph.agentName(self.graph.idOf(lv).agent);
-    }
-
-    /// The YjsMod / FugueMax integration loop — identical discipline to the
-    /// text walker's (see walker.zig; unification is a ledgered cleanup).
-    fn integrate(self: *Walker, gpa: Allocator, s: *Sequence, lv: Lv, origin_left: i32, origin_right: i32) Allocator.Error!i32 {
-        const left_pos: i64 = if (origin_left == none) -1 else s.pos_of.items[@intCast(origin_left)];
-        const right_pos: i64 = if (origin_right == none) @intCast(s.seq.items.len) else s.pos_of.items[@intCast(origin_right)];
-        const seq_len: i64 = @intCast(s.seq.items.len);
-
-        var dest: i64 = left_pos + 1;
-        var scanning = false;
-        var i: i64 = left_pos + 1;
-        while (true) : (i += 1) {
-            if (!scanning) dest = i;
-            if (i == seq_len or i == right_pos) break;
-            const o = &s.items.items[s.seq.items[@intCast(i)]];
-            const o_left: i64 = if (o.origin_left == none) -1 else s.pos_of.items[@intCast(o.origin_left)];
-            const o_right: i64 = if (o.origin_right == none) @intCast(s.seq.items.len) else s.pos_of.items[@intCast(o.origin_right)];
-            if (o_left < left_pos) break;
-            if (o_left == left_pos) {
-                if (o_right < right_pos) {
-                    scanning = true;
-                } else if (o_right == right_pos) {
-                    if (std.mem.order(u8, self.agentNameOf(lv), self.agentNameOf(o.lv)) == .lt) break;
-                    scanning = false;
-                } else {
-                    scanning = false;
-                }
-            }
-        }
-
-        const arena: u32 = @intCast(s.items.items.len);
-        try s.items.append(gpa, .{
-            .lv = lv,
-            .origin_left = origin_left,
-            .origin_right = origin_right,
-            .prep_inserted = true,
-            .prep_deleted = 0,
-            .effect_visible = false,
-        });
-        errdefer _ = s.items.pop();
-        const at: usize = @intCast(dest);
-        try s.seq.insert(gpa, at, arena);
-        try s.pos_of.append(gpa, @intCast(at));
-        for (s.seq.items[at + 1 ..]) |shifted| {
-            s.pos_of.items[shifted] += 1;
-        }
-        self.seq_slot_of.items[lv] = @intCast(arena);
-        return @intCast(arena);
     }
 };
 
