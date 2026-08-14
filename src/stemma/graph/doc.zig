@@ -131,6 +131,38 @@ pub const TextDoc = struct {
         return out.toOwnedSlice(gpa);
     }
 
+    /// Decode a version token to known Lvs. `strict` errors on entries we
+    /// have not seen (`MissingDependency`); lenient mode skips them.
+    fn decodeVersion(
+        self: *const TextDoc,
+        gpa: Allocator,
+        token: []const u8,
+        strict: bool,
+        out: *std.ArrayList(Lv),
+    ) MergeError!void {
+        var cur = token;
+        if (!std.mem.startsWith(u8, cur, version_magic)) return error.Corrupt;
+        cur = cur[version_magic.len..];
+        const count = try getUv(&cur);
+        if (count > 1 << 20) return error.Corrupt;
+        for (0..count) |_| {
+            const nlen = try getUv(&cur);
+            if (nlen == 0 or nlen > 4096 or nlen > cur.len) return error.Corrupt;
+            const name = cur[0..nlen];
+            cur = cur[nlen..];
+            const seq = try getUv(&cur);
+            const lv: ?Lv = if (self.graph.findAgent(name)) |agent|
+                self.graph.lvOf(.{ .agent = agent, .seq = seq })
+            else
+                null;
+            if (lv) |v| {
+                try out.append(gpa, v);
+            } else if (strict) {
+                return error.MissingDependency;
+            }
+        }
+    }
+
     /// Wire-encode every event the holder of `remote_version` (an opaque
     /// token from their `version()`) lacks, in causally valid order. Version
     /// entries we don't know are ignored (the remote is ahead of us there;
@@ -142,25 +174,164 @@ pub const TextDoc = struct {
     ) (Allocator.Error || error{Corrupt})![]u8 {
         var known: std.ArrayList(Lv) = .empty;
         defer known.deinit(gpa);
-        var cur = remote_version;
-        if (!std.mem.startsWith(u8, cur, version_magic)) return error.Corrupt;
-        cur = cur[version_magic.len..];
-        const count = try getUv(&cur);
-        if (count > 1 << 20) return error.Corrupt;
-        for (0..count) |_| {
-            const nlen = try getUv(&cur);
-            if (nlen == 0 or nlen > 4096 or nlen > cur.len) return error.Corrupt;
-            const name = cur[0..nlen];
-            cur = cur[nlen..];
-            const seq = try getUv(&cur);
-            const agent = self.graph.findAgent(name) orelse continue;
-            if (self.graph.lvOf(.{ .agent = agent, .seq = seq })) |lv| {
-                try known.append(gpa, lv);
-            }
-        }
+        self.decodeVersion(gpa, remote_version, false, &known) catch |e| switch (e) {
+            error.MissingDependency => unreachable, // lenient mode
+            else => |err| return err,
+        };
         var missing = try self.graph.missingFrom(gpa, known.items);
         defer missing.deinit(gpa);
         return self.encodeEvents(gpa, missing.items);
+    }
+
+    // ── Time travel ─────────────────────────────────────────────────────
+
+    /// Materialize the document as it was at `version` (a token from
+    /// `version()`, ours or a peer's — every entry must be known to us).
+    /// Returns a fresh Rope the caller owns. O(history) replay.
+    pub fn materializeAt(self: *const TextDoc, gpa: Allocator, version_token: []const u8) MergeError!Rope {
+        var heads: std.ArrayList(Lv) = .empty;
+        defer heads.deinit(gpa);
+        try self.decodeVersion(gpa, version_token, true, &heads);
+
+        const n = self.graph.eventCount();
+        const include = try gpa.alloc(bool, n);
+        defer gpa.free(include);
+        @memset(include, false);
+        var d = try self.graph.diff(gpa, heads.items, &.{});
+        defer d.deinit(gpa);
+        for (d.a_only.items) |lv| include[lv] = true;
+
+        var w = Walker.init(&self.graph);
+        defer w.deinit(gpa);
+        var sink: std.ArrayList(ScalarEdit) = .empty;
+        defer sink.deinit(gpa);
+        try w.replayAll(gpa, @intCast(n), include, &sink);
+        assert(sink.items.len == 0); // fully silent
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        var it = w.aliveIterator();
+        var buf: [4]u8 = undefined;
+        while (it.next()) |alive| {
+            const ch = self.graph.opOf(alive.lv).ins.ch;
+            const len = std.unicode.utf8Encode(ch, &buf) catch unreachable;
+            try bytes.appendSlice(gpa, buf[0..len]);
+        }
+        return Rope.fromSlice(gpa, bytes.items);
+    }
+
+    // ── Identity anchors ────────────────────────────────────────────────
+    // Portable positions that survive *concurrent* edits: an anchor names
+    // the inserting event of a character (agent name + seq — globally
+    // stable, never a replica-local id) plus a side. Send them to peers as
+    // presence/remote-cursor positions; resolve against any replica that
+    // has seen the event. Resolution is O(history) — batch with
+    // `resolveAnchors` (one replay for the whole set).
+
+    pub const AnchorSide = enum { before, after };
+
+    pub const EventAnchor = struct {
+        /// Inserting agent's name; empty = document boundary. Owned by the
+        /// caller (`anchorAt` allocates it; free with `gpa.free`).
+        agent: []const u8 = "",
+        seq: u64 = 0,
+        side: AnchorSide = .before,
+    };
+
+    pub const AnchorError = Allocator.Error || error{ Corrupt, MissingDependency };
+
+    /// An identity anchor for the position `byte_offset`. `stickiness`
+    /// chooses the attachment: `.before` attaches to the character at the
+    /// offset (anchor rides in front of it), `.after` to the character
+    /// preceding it. The returned `agent` slice is gpa-owned.
+    pub fn anchorAt(
+        self: *const TextDoc,
+        gpa: Allocator,
+        byte_offset: usize,
+        stickiness: AnchorSide,
+    ) AnchorError!EventAnchor {
+        const scalar = self.rope.offsetToScalar(byte_offset);
+        const total = self.rope.scalarLen();
+        switch (stickiness) {
+            .before => if (scalar == total) return .{ .agent = "", .side = .after },
+            .after => if (scalar == 0) return .{ .agent = "", .side = .before },
+        }
+        const target_index = switch (stickiness) {
+            .before => scalar,
+            .after => scalar - 1,
+        };
+
+        var w = try self.silentReplay(gpa);
+        defer w.deinit(gpa);
+        var it = w.aliveIterator();
+        var i: usize = 0;
+        while (it.next()) |alive| : (i += 1) {
+            if (i == target_index) {
+                const id = self.graph.idOf(alive.lv);
+                return .{
+                    .agent = try gpa.dupe(u8, self.graph.agentName(id.agent)),
+                    .seq = id.seq,
+                    .side = stickiness,
+                };
+            }
+        }
+        unreachable; // target_index < alive count by construction
+    }
+
+    /// Resolve identity anchors to current byte offsets. Deleted targets
+    /// collapse to their deletion point. One O(history) replay amortized
+    /// over the whole batch.
+    pub fn resolveAnchors(
+        self: *const TextDoc,
+        gpa: Allocator,
+        anchors: []const EventAnchor,
+        out: []usize,
+    ) AnchorError!void {
+        assert(anchors.len == out.len);
+        var w = try self.silentReplay(gpa);
+        defer w.deinit(gpa);
+
+        // One pass: per-arena count of alive items strictly before it.
+        const alive_before = try gpa.alloc(u64, w.items.items.len);
+        defer gpa.free(alive_before);
+        var count: u64 = 0;
+        for (w.seq.items) |arena| {
+            alive_before[arena] = count;
+            if (w.items.items[arena].effect_visible) count += 1;
+        }
+
+        for (anchors, out) |a, *o| {
+            if (a.agent.len == 0) {
+                o.* = switch (a.side) {
+                    .before => 0,
+                    .after => self.rope.byteLen(),
+                };
+                continue;
+            }
+            const agent = self.graph.findAgent(a.agent) orelse return error.MissingDependency;
+            const lv = self.graph.lvOf(.{ .agent = agent, .seq = a.seq }) orelse return error.MissingDependency;
+            if (self.graph.opOf(lv) != .ins) return error.Corrupt;
+            const arena = w.item_of.items[lv];
+            assert(arena != -1);
+            const item = &w.items.items[@intCast(arena)];
+            var scalar = alive_before[@intCast(arena)];
+            if (item.effect_visible and a.side == .after) scalar += 1;
+            o.* = self.rope.scalarToOffset(scalar);
+        }
+    }
+
+    /// Full silent replay of the whole graph (current state).
+    fn silentReplay(self: *const TextDoc, gpa: Allocator) Allocator.Error!Walker {
+        var w = Walker.init(&self.graph);
+        errdefer w.deinit(gpa);
+        var sink: std.ArrayList(ScalarEdit) = .empty;
+        defer sink.deinit(gpa);
+        w.replayAll(gpa, @intCast(self.graph.eventCount()), null, &sink) catch |e| switch (e) {
+            error.Corrupt => unreachable, // trusted local history
+            else => |err| return err,
+        };
+        assert(sink.items.len == 0);
+        return w;
     }
 
     /// The whole document as its event graph (the durable form).

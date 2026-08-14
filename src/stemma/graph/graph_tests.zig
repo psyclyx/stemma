@@ -456,6 +456,94 @@ test "three peers, seeded random gossip, full convergence" {
     }
 }
 
+test "materializeAt: time travel to any known version" {
+    const gpa = t.allocator;
+    var d: TextDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+
+    // Empty version → empty document.
+    const v_empty = try d.version(gpa);
+    defer gpa.free(v_empty);
+    var at_empty = try d.materializeAt(gpa, v_empty);
+    defer at_empty.deinit(gpa);
+    try t.expect(at_empty.isEmpty());
+
+    _ = try d.insert(gpa, 0, "first draft 𝄞");
+    const v1 = try d.version(gpa);
+    defer gpa.free(v1);
+    const text_v1 = try docText(gpa, &d);
+    defer gpa.free(text_v1);
+
+    _ = try d.delete(gpa, .{ .start = 0, .end = 6 });
+    _ = try d.insert(gpa, 0, "FINAL");
+    const v2 = try d.version(gpa);
+    defer gpa.free(v2);
+
+    var at_v1 = try d.materializeAt(gpa, v1);
+    defer at_v1.deinit(gpa);
+    const got_v1 = try at_v1.toOwnedSlice(gpa);
+    defer gpa.free(got_v1);
+    try t.expectEqualStrings(text_v1, got_v1);
+
+    var at_v2 = try d.materializeAt(gpa, v2);
+    defer at_v2.deinit(gpa);
+    try t.expect(at_v2.eql(d.rope));
+
+    // A version we've never seen is a missing dependency.
+    const unknown = "stv\x01" ++ [_]u8{ 1, 5 } ++ "ghost" ++ [_]u8{9};
+    try t.expectError(error.MissingDependency, d.materializeAt(gpa, unknown));
+}
+
+test "identity anchors: survive concurrent merges across replicas" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.insert(gpa, 0, "hello World");
+    try syncBoth(gpa, &alice, &bob);
+
+    // Alice anchors her cursor before the 'W'.
+    const a = try alice.anchorAt(gpa, 6, .before);
+    defer gpa.free(a.agent);
+
+    // Divergent concurrent edits on both sides.
+    _ = try alice.insert(gpa, 0, ">>> ");
+    _ = try bob.insert(gpa, 5, ", cruel");
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+
+    // Both replicas resolve the SAME anchor (portable: name+seq) and land
+    // on the 'W', wherever it now lives in each doc.
+    for ([_]*TextDoc{ &alice, &bob }) |d| {
+        var off: [1]usize = undefined;
+        try d.resolveAnchors(gpa, &.{a}, &off);
+        const txt = try docText(gpa, d);
+        defer gpa.free(txt);
+        try t.expectEqual(@as(u8, 'W'), txt[off[0]]);
+    }
+
+    // Deleting the target collapses the anchor to the deletion point.
+    var off_before: [1]usize = undefined;
+    try bob.resolveAnchors(gpa, &.{a}, &off_before);
+    _ = try bob.delete(gpa, .{ .start = off_before[0], .end = off_before[0] + 5 });
+    var off_after: [1]usize = undefined;
+    try bob.resolveAnchors(gpa, &.{a}, &off_after);
+    try t.expectEqual(off_before[0], off_after[0]);
+
+    // Boundary anchors.
+    const start = try bob.anchorAt(gpa, 0, .after);
+    const end = try bob.anchorAt(gpa, bob.text().byteLen(), .before);
+    var offs: [2]usize = undefined;
+    try bob.resolveAnchors(gpa, &.{ start, end }, &offs);
+    try t.expectEqual(@as(usize, 0), offs[0]);
+    try t.expectEqual(bob.text().byteLen(), offs[1]);
+}
+
 fn oomScript(gpa: std.mem.Allocator) !void {
     var alice: TextDoc = .empty;
     defer alice.deinit(gpa);
