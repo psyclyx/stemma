@@ -185,33 +185,28 @@ pub const TextDoc = struct {
     /// transformed effects to the rope, and returns the byte-space edit
     /// stream (caller owns; shift your anchors through it in order).
     /// Duplicate events are skipped; causally incomplete batches are
-    /// rejected whole with `error.MissingDependency`.
+    /// rejected whole with `error.MissingDependency`; malformed or
+    /// malicious batches (including out-of-range positions) are rejected
+    /// with `error.Corrupt` and the document is left untouched.
+    ///
+    /// Trust boundary: byte-level and semantic validation is complete, but
+    /// *equivocation* (a peer signing two different events with the same
+    /// id) is undetectable at this layer, as in any unauthenticated CRDT —
+    /// authenticate peers in the transport if your threat model needs it.
     pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edit {
         var dec = try Decoder.init(gpa, self, bytes);
         defer dec.deinit(gpa);
 
         // Validate the whole batch before mutating the graph.
         try dec.validate(self);
-        const first_new: Lv = @intCast(self.graph.eventCount());
-        var any_new = false;
-        for (dec.events.items) |ev| {
-            if (self.graph.lvOf(ev.id) != null) continue; // duplicate
-            var parent_lvs: std.ArrayList(Lv) = .empty;
-            defer parent_lvs.deinit(gpa);
-            for (dec.parentsOf(ev)) |pid| {
-                try parent_lvs.append(gpa, self.graph.lvOf(pid).?);
-            }
-            _ = try self.graph.add(gpa, ev.id, parent_lvs.items, ev.op);
-            any_new = true;
-        }
-        if (!any_new) return try gpa.alloc(Edit, 0);
 
-        // Replay from genesis; events before first_new are silent.
-        var w = Walker.init(&self.graph);
-        defer w.deinit(gpa);
+        // Graph phase: add events + replay, atomically — on any failure the
+        // graph rolls back wholesale and the rope was never touched. Only a
+        // successful replay proceeds to rope application.
         var scalar_edits: std.ArrayList(ScalarEdit) = .empty;
         defer scalar_edits.deinit(gpa);
-        try w.replayAll(gpa, first_new, &scalar_edits);
+        const any_new = try self.graphPhase(gpa, &dec, &scalar_edits);
+        if (!any_new) return try gpa.alloc(Edit, 0);
 
         // Apply to the rope, converting scalar → byte space, coalescing runs.
         var edits: std.ArrayList(Edit) = .empty;
@@ -248,6 +243,64 @@ pub const TextDoc = struct {
             }
         }
         return edits.toOwnedSlice(gpa);
+    }
+
+    /// Add the batch to the graph and replay. Atomic: on any error the graph
+    /// reverts to its pre-batch state. (Agents registered while decoding
+    /// persist — registration is idempotent and harmless.) Returns whether
+    /// any new events were integrated.
+    fn graphPhase(
+        self: *TextDoc,
+        gpa: Allocator,
+        dec: *const Decoder,
+        scalar_edits: *std.ArrayList(ScalarEdit),
+    ) MergeError!bool {
+        const pre_events = self.graph.events.items.len;
+        const pre_pool = self.graph.parents_pool.items.len;
+        const pre_frontier = try gpa.dupe(Lv, self.graph.frontier.items);
+        defer gpa.free(pre_frontier);
+        const pre_seq_lens = try gpa.alloc(usize, self.graph.agents.items.len);
+        defer gpa.free(pre_seq_lens);
+        for (self.graph.agents.items, pre_seq_lens) |a, *len| len.* = a.lv_by_seq.items.len;
+        errdefer self.rollbackGraph(pre_events, pre_pool, pre_frontier, pre_seq_lens);
+
+        const first_new: Lv = @intCast(self.graph.eventCount());
+        var any_new = false;
+        for (dec.events.items) |ev| {
+            if (self.graph.lvOf(ev.id) != null) continue; // duplicate
+            var parent_lvs: std.ArrayList(Lv) = .empty;
+            defer parent_lvs.deinit(gpa);
+            for (dec.parentsOf(ev)) |pid| {
+                try parent_lvs.append(gpa, self.graph.lvOf(pid).?);
+            }
+            _ = try self.graph.add(gpa, ev.id, parent_lvs.items, ev.op);
+            any_new = true;
+        }
+        if (!any_new) return false;
+
+        var w = Walker.init(&self.graph);
+        defer w.deinit(gpa);
+        try w.replayAll(gpa, first_new, scalar_edits);
+        return true;
+    }
+
+    fn rollbackGraph(
+        self: *TextDoc,
+        pre_events: usize,
+        pre_pool: usize,
+        pre_frontier: []const Lv,
+        pre_seq_lens: []const usize,
+    ) void {
+        self.graph.events.items.len = pre_events;
+        self.graph.parents_pool.items.len = pre_pool;
+        // Agents registered during decode may outnumber pre_seq_lens; their
+        // seq lists were empty before the batch.
+        for (self.graph.agents.items, 0..) |*a, i| {
+            a.lv_by_seq.items.len = if (i < pre_seq_lens.len) pre_seq_lens[i] else 0;
+        }
+        self.graph.frontier.clearRetainingCapacity();
+        // Capacity never shrinks, so this cannot fail.
+        self.graph.frontier.appendSliceAssumeCapacity(pre_frontier);
     }
 
     // ── Wire format ─────────────────────────────────────────────────────

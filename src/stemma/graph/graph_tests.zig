@@ -283,6 +283,75 @@ test "corrupt and causally-incomplete input is rejected without damage" {
     try expectDocText(&alice, before);
 }
 
+test "malicious batch: out-of-range position is rejected atomically" {
+    const gpa = t.allocator;
+    var victim: TextDoc = .empty;
+    defer victim.deinit(gpa);
+    try victim.setAgent(gpa, "victim");
+    _ = try victim.insert(gpa, 0, "stable");
+    const before_events = victim.graph.eventCount();
+
+    // Hand-crafted batch: agent "evil", one event, seq 0, no parents,
+    // insert at position 999 (LEB128: 0xE7 0x07) — far out of range.
+    const evil = "stg\x01" ++ [_]u8{ 1, 4 } ++ "evil" ++
+        [_]u8{ 1, 0, 0, 0, 0 } ++ [_]u8{ 0xE7, 0x07 } ++ [_]u8{'x'};
+    try t.expectError(error.Corrupt, victim.merge(gpa, evil));
+
+    // Fully atomic: no events retained, document intact, still functional.
+    try t.expectEqual(before_events, victim.graph.eventCount());
+    try expectDocText(&victim, "stable");
+    _ = try victim.insert(gpa, 6, "!");
+    try expectDocText(&victim, "stable!");
+}
+
+test "malicious batch: out-of-range delete is rejected atomically" {
+    const gpa = t.allocator;
+    var victim: TextDoc = .empty;
+    defer victim.deinit(gpa);
+    try victim.setAgent(gpa, "victim");
+    _ = try victim.insert(gpa, 0, "ab");
+    // Delete at position 7 in a 2-scalar doc.
+    const evil = "stg\x01" ++ [_]u8{ 1, 4 } ++ "evil" ++
+        [_]u8{ 1, 0, 0, 0, 1, 7 };
+    try t.expectError(error.Corrupt, victim.merge(gpa, evil));
+    try expectDocText(&victim, "ab");
+}
+
+fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
+    const gpa = t.allocator;
+    var author: TextDoc = .empty;
+    defer author.deinit(gpa);
+    try author.setAgent(gpa, "author");
+    _ = try author.insert(gpa, 0, "wire fuzz корпус 𝄞\n");
+    _ = try author.delete(gpa, .{ .start = 2, .end = 6 });
+    const valid = try author.serialize(gpa);
+    defer gpa.free(valid);
+
+    // Mutate a few bytes of a valid batch; merge must never crash or leak —
+    // any outcome in {success, Corrupt, MissingDependency} is acceptable.
+    const mutated = try gpa.dupe(u8, valid);
+    defer gpa.free(mutated);
+    for (0..1 + smith.indexWithHash(4, 0x0f11)) |_| {
+        const at = smith.indexWithHash(mutated.len, 0x0a7e);
+        mutated[at] = smith.valueWithHash(u8, 0xb17e);
+    }
+    var victim: TextDoc = .empty;
+    defer victim.deinit(gpa);
+    if (victim.merge(gpa, mutated)) |edits| {
+        gpa.free(edits);
+    } else |err| switch (err) {
+        error.Corrupt, error.MissingDependency => {
+            // Rejected batches must leave the graph untouched.
+            try t.expectEqual(@as(usize, 0), victim.graph.eventCount());
+        },
+        else => |e| return e,
+    }
+}
+
+test "fuzz: mutated wire bytes never crash, rejects are atomic" {
+    try std.testing.fuzz({}, fuzzWire, .{});
+}
+
 test "three peers, seeded random gossip, full convergence" {
     const gpa = t.allocator;
     const names = [_][]const u8{ "alice", "bob", "carol" };

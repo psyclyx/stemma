@@ -90,10 +90,15 @@ pub const Walker = struct {
         self.prep_frontier.deinit(gpa);
     }
 
+    pub const ReplayError = Allocator.Error || error{Corrupt};
+
     /// Replay the whole graph in Lv order. Events with `lv < first_new`
     /// update state silently (their effects are already in the document);
     /// events at `lv >= first_new` append their transformed edits to `out`.
-    pub fn replayAll(self: *Walker, gpa: Allocator, first_new: Lv, out: *std.ArrayList(ScalarEdit)) Allocator.Error!void {
+    /// Remote events with out-of-range positions (malicious or corrupt
+    /// peers) yield `error.Corrupt` — never a crash. Trusted local history
+    /// (`lv < first_new`) is asserted instead.
+    pub fn replayAll(self: *Walker, gpa: Allocator, first_new: Lv, out: *std.ArrayList(ScalarEdit)) ReplayError!void {
         const n = self.graph.eventCount();
         try self.item_of.appendNTimes(gpa, none, n);
         try self.target_of.appendNTimes(gpa, none, n);
@@ -154,10 +159,12 @@ pub const Walker = struct {
     }
 
     /// First application of event `lv` (prepare version == its parents).
-    fn apply(self: *Walker, gpa: Allocator, lv: Lv, emit: bool) Allocator.Error!?ScalarEdit {
+    /// `emit` is true exactly for untrusted (new remote) events, so it also
+    /// selects error-instead-of-assert on bad positions.
+    fn apply(self: *Walker, gpa: Allocator, lv: Lv, emit: bool) ReplayError!?ScalarEdit {
         switch (self.graph.opOf(lv)) {
             .ins => |ins| {
-                const anchors = self.findInsertAnchors(ins.pos);
+                const anchors = try self.findInsertAnchors(ins.pos, emit);
                 const idx = try self.integrate(gpa, lv, anchors.left, anchors.right);
                 self.item_of.items[lv] = idx;
                 const it = &self.items.items[@intCast(idx)];
@@ -167,7 +174,7 @@ pub const Walker = struct {
                 return .{ .ins = .{ .pos = self.effectPositionOf(idx), .ch = ins.ch } };
             },
             .del => |pos| {
-                const idx = self.findPrepVisibleAt(pos);
+                const idx = try self.findPrepVisibleAt(pos, emit);
                 self.target_of.items[lv] = idx;
                 const it = &self.items.items[@intCast(idx)];
                 it.prep_deleted += 1;
@@ -182,8 +189,9 @@ pub const Walker = struct {
 
     /// (origin_left, origin_right) for an insert at prepare position `pos`:
     /// the prepare-visible item before the position, and the first
-    /// prepare-visible item at/after it.
-    fn findInsertAnchors(self: *const Walker, pos: u64) struct { left: i32, right: i32 } {
+    /// prepare-visible item at/after it. An out-of-range position from an
+    /// untrusted event is `error.Corrupt`; from local history it is a bug.
+    fn findInsertAnchors(self: *const Walker, pos: u64, untrusted: bool) error{Corrupt}!struct { left: i32, right: i32 } {
         var left: i32 = none;
         var seen: u64 = 0;
         var cur = self.head;
@@ -196,12 +204,15 @@ pub const Walker = struct {
             }
             cur = it.next;
         }
-        assert(seen == pos); // author's position must exist at their version
+        if (seen != pos) {
+            if (untrusted) return error.Corrupt;
+            unreachable; // local history references a position that must exist
+        }
         return .{ .left = left, .right = none };
     }
 
     /// Arena index of the `pos`-th prepare-visible item.
-    fn findPrepVisibleAt(self: *const Walker, pos: u64) i32 {
+    fn findPrepVisibleAt(self: *const Walker, pos: u64, untrusted: bool) error{Corrupt}!i32 {
         var seen: u64 = 0;
         var cur = self.head;
         while (cur != none) {
@@ -212,7 +223,8 @@ pub const Walker = struct {
             }
             cur = it.next;
         }
-        unreachable; // author deleted a position that must exist
+        if (untrusted) return error.Corrupt;
+        unreachable; // local history deleted a position that must exist
     }
 
     /// Count of effect-visible items strictly before arena index `idx`.
