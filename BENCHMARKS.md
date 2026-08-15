@@ -86,6 +86,15 @@ collab merge concurrent 1k+1k    1707 ns/op  (best     1678)  n=5
   while chasing an apparent +13% from the v3 decoder that was actually
   layout sensitivity of the quadratic loop.
 
+## Partial bases — 2026-08-15
+
+`openPartial`/`realizeBase` (hole-bearing compacted bases for partial
+checkout) added hole-awareness to local edits and merge application. All
+hole paths gate on `holes.len != 0` (the same "does this doc even need
+it" pattern as the rope's `may_have_holes`): doc-typing 61 ns, merge
+linear 1.92 µs/unit, concurrent 1.74 — all within noise of the pre-hole
+numbers.
+
 ## Tuning ledger
 
 - **2026-08-10 — chunk 256→512, branch 8→16** (sweep over c128/c256/c512/

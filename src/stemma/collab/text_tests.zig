@@ -933,3 +933,160 @@ test "rle: hostile run frames are rejected, document untouched" {
     try t.expectError(error.Corrupt, victim.merge(gpa, evil.items));
     try t.expectEqual(@as(usize, 0), victim.history.eventCount());
 }
+
+// ── Partial bases (holes) ───────────────────────────────────────────────
+
+/// Compact `host` at its current single head and build a partial replica:
+/// the base split in three, the middle span left unrealized.
+fn partialPair(gpa: std.mem.Allocator, host: *TextDoc, cut1: usize, cut2: usize) !TextDoc {
+    const stable = try host.version(gpa);
+    defer gpa.free(stable);
+    try host.compact(gpa, stable);
+    const wm = try host.agentWatermarks(gpa);
+    defer gpa.free(wm);
+    const base = host.base_bytes;
+    const mid_scalars = try std.unicode.utf8CountCodepoints(base[cut1..cut2]);
+    return TextDoc.openPartial(gpa, host.base_version, wm, &.{
+        .{ .content = base[0..cut1] },
+        .{ .hole = .{ .bytes = cut2 - cut1, .scalars = mid_scalars } },
+        .{ .content = base[cut2..] },
+    });
+}
+
+test "partial: sync both ways around the hole; realize completes the doc" {
+    const gpa = t.allocator;
+    var host: TextDoc = .empty;
+    defer host.deinit(gpa);
+    try host.setAgent(gpa, "host");
+    _ = try host.insert(gpa, 0, "prefix MIDDLE-UNFETCHED suffix");
+
+    var part = try partialPair(gpa, &host, 7, 23);
+    defer part.deinit(gpa);
+    try t.expect(!part.baseRealized());
+    try t.expectEqual(host.text().byteLen(), part.text().byteLen());
+
+    // Versions agree at the base point; sync is a no-op both ways.
+    try syncBoth(gpa, &host, &part);
+
+    // Edits in realized regions flow both ways.
+    try part.setAgent(gpa, "part");
+    _ = try host.insert(gpa, 0, "H:");
+    _ = try part.insert(gpa, part.text().byteLen(), ":P");
+    try syncBoth(gpa, &host, &part);
+    try t.expectEqual(host.text().byteLen(), part.text().byteLen());
+
+    // Partial ops that need base content refuse honestly.
+    try t.expectError(error.Unrealized, part.serialize(gpa));
+    const ver = try part.version(gpa);
+    defer gpa.free(ver);
+    try t.expectError(error.Unrealized, part.materializeAt(gpa, ver));
+
+    // Realize the hole (fetch keyed by pristine-base offset) — not an edit.
+    const fetch = part.unrealizedBase();
+    try t.expectEqual(@as(usize, 1), fetch.len);
+    const len_before = part.text().byteLen();
+    try part.realizeBase(gpa, fetch[0].base_offset, host.base_bytes[7..23]);
+    try t.expect(part.baseRealized());
+    try t.expectEqual(len_before, part.text().byteLen());
+    try expectConverged(&[_]*TextDoc{ &host, &part });
+
+    // Fully realized: persistence works and round-trips.
+    const bytes = try part.serialize(gpa);
+    defer gpa.free(bytes);
+    var reopened = try TextDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try expectConverged(&[_]*TextDoc{ &part, &reopened });
+}
+
+test "partial: edits at hole boundaries stay legal and convergent" {
+    const gpa = t.allocator;
+    var host: TextDoc = .empty;
+    defer host.deinit(gpa);
+    try host.setAgent(gpa, "host");
+    _ = try host.insert(gpa, 0, "aaaHHHHbbb");
+    var part = try partialPair(gpa, &host, 3, 7);
+    defer part.deinit(gpa);
+    try part.setAgent(gpa, "part");
+
+    // Host edits right at both edges of the region the partial lacks.
+    _ = try host.insert(gpa, 3, "[");
+    _ = try host.insert(gpa, 8, "]");
+    // Partial edits at its own hole edges.
+    const h = part.unrealizedBase()[0];
+    _ = try part.insert(gpa, h.cur_offset, "(");
+    _ = try part.insert(gpa, part.unrealizedBase()[0].cur_offset + part.unrealizedBase()[0].bytes, ")");
+    try syncBoth(gpa, &host, &part);
+    try t.expectEqual(host.text().byteLen(), part.text().byteLen());
+
+    // Realize and check full convergence (fetch pristine base content).
+    const cur = part.unrealizedBase()[0];
+    try part.realizeBase(gpa, cur.base_offset, host.base_bytes[3..7]);
+    try expectConverged(&[_]*TextDoc{ &host, &part });
+}
+
+test "partial: remote edit into the hole rejects whole, realize-then-merge succeeds" {
+    const gpa = t.allocator;
+    var host: TextDoc = .empty;
+    defer host.deinit(gpa);
+    try host.setAgent(gpa, "host");
+    _ = try host.insert(gpa, 0, "aaaHHHHbbb");
+    var part = try partialPair(gpa, &host, 3, 7);
+    defer part.deinit(gpa);
+
+    // Host edits INSIDE the region the partial has not fetched.
+    _ = try host.insert(gpa, 5, "xx");
+    _ = try host.delete(gpa, .{ .start = 4, .end = 5 });
+
+    const pv = try part.version(gpa);
+    defer gpa.free(pv);
+    const batch = try host.eventsSince(gpa, pv);
+    defer gpa.free(batch);
+
+    const ver_before = try part.version(gpa);
+    defer gpa.free(ver_before);
+    const len_before = part.text().byteLen();
+    try t.expectError(error.Unrealized, part.merge(gpa, batch));
+    // Whole-batch rollback: version and text untouched.
+    const ver_after = try part.version(gpa);
+    defer gpa.free(ver_after);
+    try t.expectEqualSlices(u8, ver_before, ver_after);
+    try t.expectEqual(len_before, part.text().byteLen());
+
+    // Realize the hole, merge the same batch, converge.
+    const h = part.unrealizedBase()[0];
+    try part.realizeBase(gpa, h.base_offset, host.base_bytes[3..7]);
+    gpa.free(try part.merge(gpa, batch));
+    try expectConverged(&[_]*TextDoc{ &host, &part });
+}
+
+test "partial: realizeBase validates content; version-only batches cannot bootstrap" {
+    const gpa = t.allocator;
+    var host: TextDoc = .empty;
+    defer host.deinit(gpa);
+    try host.setAgent(gpa, "host");
+    _ = try host.insert(gpa, 0, "aaaHHHHbbb");
+    var part = try partialPair(gpa, &host, 3, 7);
+    defer part.deinit(gpa);
+    try part.setAgent(gpa, "part");
+    _ = try part.insert(gpa, 0, "x"); // so eventsSince has an event to ship
+
+    const h = part.unrealizedBase()[0];
+    // Wrong length / bad UTF-8 / wrong scalar count / wrong key.
+    try t.expectError(error.Corrupt, part.realizeBase(gpa, h.base_offset, "toolong content"));
+    try t.expectError(error.Corrupt, part.realizeBase(gpa, h.base_offset, "\xff\xff\xff\xff"));
+    try t.expectError(error.Corrupt, part.realizeBase(gpa, h.base_offset + 1, "HHHH"));
+    try t.expect(!part.baseRealized());
+
+    // A batch from the partial carries a version-only base: same-base
+    // peers merge it, an empty doc cannot bootstrap from it.
+    const hv = try host.version(gpa);
+    defer gpa.free(hv);
+    const batch = try part.eventsSince(gpa, hv);
+    defer gpa.free(batch);
+    gpa.free(try host.merge(gpa, batch)); // same base: fine
+    var blank: TextDoc = .empty;
+    defer blank.deinit(gpa);
+    try t.expectError(error.MissingDependency, blank.merge(gpa, batch));
+    // And .unit cannot be served from a partial doc at all.
+    try t.expectError(error.Unrealized, part.eventsSinceFormat(gpa, hv, .unit));
+}

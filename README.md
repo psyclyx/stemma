@@ -84,8 +84,12 @@ shipped); **`materializeAt`** (time travel to any known version);
 **identity anchors** (portable name+seq positions for remote cursors that
 survive concurrent edits, batch-resolvable on any replica); **`compact`**
 (collapse all-peers-stable history into a frozen base — graph growth
-bounded by post-base activity, not document lifetime); and a **wasm32
-target** (`zig build wasm`) so browser peers can speak the protocol.
+bounded by post-base activity, not document lifetime); **partial bases**
+(`openPartial`/`realizeBase` — a replica of a huge document fetches only
+the base spans it looks at, syncing and editing around the rest; merges
+into unfetched spans reject whole with `error.Unrealized`, realize-then-
+retry); and a **wasm32 target** (`zig build wasm`) so browser peers can
+speak the protocol.
 
 Hostile input cannot crash a replica: malformed and malicious batches
 (including out-of-range positions) are rejected atomically, fuzz-gated.

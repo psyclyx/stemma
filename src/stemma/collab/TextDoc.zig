@@ -191,7 +191,9 @@ rope: Rope = .empty,
 history: Graph = .empty,
 agent: ?AgentId = null,
 
-/// Frozen compacted pre-history (UTF-8), or empty.
+/// Frozen compacted pre-history (UTF-8), or empty. For a partially
+/// realized base (`openPartial`) the unfetched spans are zero-filled
+/// until `realizeBase` supplies them; `holes` says which.
 base_bytes: []u8 = &.{},
 base_scalars: usize = 0,
 /// The opaque version token identifying the base; docs can only sync
@@ -199,10 +201,24 @@ base_scalars: usize = 0,
 base_version: []u8 = &.{},
 /// The single stable head the base was compacted at.
 base_head: ?EventId = null,
+/// Unrealized spans of the base, ascending by `cur_offset`. Empty =
+/// fully realized (the only state most documents ever see).
+holes: std.ArrayList(BaseHole) = .empty,
+
+/// An unrealized span of the compacted base. `base_offset` is the fetch
+/// key (byte offset in the pristine base — immutable); `cur_offset` is
+/// where the span currently sits in the rope (shifts under edits; hole
+/// interiors themselves are never edited).
+pub const BaseHole = struct {
+    base_offset: usize,
+    cur_offset: usize,
+    bytes: usize,
+    scalars: usize,
+};
 
 pub const empty: TextDoc = .{};
 
-pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency };
+pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency, Unrealized };
 pub const CompactError = MergeError || error{NotCompactable};
 pub const AnchorError = Allocator.Error || error{ Corrupt, MissingDependency, Compacted };
 
@@ -211,6 +227,7 @@ pub fn deinit(self: *TextDoc, gpa: Allocator) void {
     self.history.deinit(gpa);
     gpa.free(self.base_bytes);
     gpa.free(self.base_version);
+    self.holes.deinit(gpa);
     self.* = .{};
 }
 
@@ -229,12 +246,15 @@ pub fn text(self: *const TextDoc) *const Rope {
 // ── Local editing ───────────────────────────────────────────────────
 
 /// Record and apply a local insert. Same contract as `Rope.insert`
-/// (byte offset on a scalar boundary, valid UTF-8).
+/// (byte offset on a scalar boundary, valid UTF-8). Precondition: the
+/// offset is not interior to an unrealized base span (deterministic
+/// panic, all build modes — `realizeBase` first).
 pub fn insert(self: *TextDoc, gpa: Allocator, byte_offset: usize, content: []const u8) Allocator.Error!Edit {
     const agent = self.agent.?; // setAgent first
     const edit: Edit = .{ .offset = byte_offset, .removed = 0, .inserted = content.len };
     if (content.len == 0) return edit;
-    const scalar_pos = self.rope.offsetToScalar(byte_offset);
+    self.assertOutsideHoles(byte_offset, byte_offset);
+    const scalar_pos = self.rope.offsetToScalar(byte_offset) + self.holeScalarsThrough(byte_offset);
 
     var i: u64 = 0;
     var it = (std.unicode.Utf8View.init(content) catch unreachable).iterator();
@@ -242,16 +262,20 @@ pub fn insert(self: *TextDoc, gpa: Allocator, byte_offset: usize, content: []con
         _ = try self.history.addLocal(gpa, agent, .{ .ins = .{ .pos = scalar_pos + i, .ch = ch } });
     }
     _ = try self.rope.insert(gpa, byte_offset, content);
+    self.shiftHoles(byte_offset, content.len, 0);
     return edit;
 }
 
 /// Record and apply a local delete. Same contract as `Rope.delete`.
+/// Precondition: the range does not intersect an unrealized base span
+/// (deterministic panic, all build modes — `realizeBase` first).
 pub fn delete(self: *TextDoc, gpa: Allocator, range: Range) Allocator.Error!Edit {
     const agent = self.agent.?;
     const edit: Edit = .{ .offset = range.start, .removed = range.len(), .inserted = 0 };
     if (range.isEmpty()) return edit;
-    const scalar_start = self.rope.offsetToScalar(range.start);
-    const scalar_count = self.rope.offsetToScalar(range.end) - scalar_start;
+    self.assertOutsideHoles(range.start, range.end);
+    const scalar_start = self.rope.offsetToScalar(range.start) + self.holeScalarsThrough(range.start);
+    const scalar_count = self.rope.offsetToScalar(range.end) - self.rope.offsetToScalar(range.start);
 
     for (0..scalar_count) |_| {
         // Each unit deletes at the same position: the next scalar slides
@@ -259,7 +283,37 @@ pub fn delete(self: *TextDoc, gpa: Allocator, range: Range) Allocator.Error!Edit
         _ = try self.history.addLocal(gpa, agent, .{ .del = scalar_start });
     }
     _ = try self.rope.delete(gpa, range);
+    self.shiftHoles(range.start, 0, range.len());
     return edit;
+}
+
+/// Panic if `[start, end]` touches the interior of an unrealized base
+/// span (or covers one). Single choke point, all build modes — mirrors
+/// `Rope`'s hole-content panic.
+fn assertOutsideHoles(self: *const TextDoc, start: usize, end: usize) void {
+    for (self.holes.items) |h| {
+        if (end > h.cur_offset and start < h.cur_offset + h.bytes) {
+            @panic("stemma.TextDoc: edit touches an unrealized base span — realizeBase() first");
+        }
+    }
+}
+
+/// Scalars of unrealized base spans at or before `byte_offset` (spans
+/// ending exactly at the offset count; spans starting there do not).
+fn holeScalarsThrough(self: *const TextDoc, byte_offset: usize) u64 {
+    var acc: u64 = 0;
+    for (self.holes.items) |h| {
+        if (h.cur_offset + h.bytes <= byte_offset) acc += h.scalars;
+    }
+    return acc;
+}
+
+/// Shift hole positions through a byte edit at `at`. Holes never
+/// intersect edits (checked by callers), so a whole-span shift is exact.
+fn shiftHoles(self: *TextDoc, at: usize, inserted: usize, removed: usize) void {
+    for (self.holes.items) |*h| {
+        if (h.cur_offset >= at) h.cur_offset = h.cur_offset + inserted - removed;
+    }
 }
 
 // ── Versions & sync ─────────────────────────────────────────────────
@@ -312,17 +366,23 @@ pub fn eventsSince(
     gpa: Allocator,
     remote_version: []const u8,
 ) (Allocator.Error || error{Corrupt})![]u8 {
-    return self.eventsSinceFormat(gpa, remote_version, .rle);
+    return self.eventsSinceFormat(gpa, remote_version, .rle) catch |e| switch (e) {
+        error.Unrealized => unreachable, // rle syncs never need base bytes
+        else => |err| return err,
+    };
 }
 
 /// `eventsSince` with an explicit batch encoding — serve `.unit` to
-/// peers that predate run-RLE.
+/// peers that predate run-RLE. A partially realized document cannot
+/// emit `.unit` (that format always carries base bytes):
+/// `error.Unrealized`.
 pub fn eventsSinceFormat(
     self: *const TextDoc,
     gpa: Allocator,
     remote_version: []const u8,
     format: WireFormat,
-) (Allocator.Error || error{Corrupt})![]u8 {
+) (Allocator.Error || error{ Corrupt, Unrealized })![]u8 {
+    if (format == .unit and self.holes.items.len != 0) return error.Unrealized;
     var known: std.ArrayList(Lv) = .empty;
     defer known.deinit(gpa);
     self.decodeVersion(gpa, remote_version, false, &known) catch |e| switch (e) {
@@ -335,8 +395,10 @@ pub fn eventsSinceFormat(
 }
 
 /// The whole document as its event graph (plus the base snapshot when
-/// compacted) — the durable form.
-pub fn serialize(self: *const TextDoc, gpa: Allocator) Allocator.Error![]u8 {
+/// compacted) — the durable form. A partially realized base cannot be
+/// persisted (`error.Unrealized`): realize it first.
+pub fn serialize(self: *const TextDoc, gpa: Allocator) (Allocator.Error || error{Unrealized})![]u8 {
+    if (self.holes.items.len != 0) return error.Unrealized;
     var missing = try self.history.missingFrom(gpa, &.{});
     defer missing.deinit(gpa);
     return self.encodeEvents(gpa, missing.items, .rle);
@@ -351,12 +413,157 @@ pub fn open(gpa: Allocator, bytes: []const u8) MergeError!TextDoc {
     return doc;
 }
 
+// ── Partial checkout ────────────────────────────────────────────────
+// A document whose compacted base is only partially fetched: realized
+// chunks carry content, holes carry (bytes, scalars) metadata — exactly
+// what a host's chunk table supplies. The event graph is complete from
+// the start (versions, sync, and merges all work); only *content* is
+// lazy. Hole interiors are protected regions: local edits there are a
+// precondition violation, remote merges into them roll back whole with
+// `error.Unrealized` (realize, then merge again). `realizeBase` is not
+// an edit — offsets, anchors, and versions are unaffected.
+
+/// One span of a partial base, in pristine-base order.
+pub const BaseChunk = union(enum) {
+    /// Fetched content (UTF-8, copied).
+    content: []const u8,
+    /// Unfetched span of known size.
+    hole: struct { bytes: usize, scalars: usize },
+};
+
+/// Per-agent compaction watermark — what a host sends alongside its
+/// `base_version` and chunk table so a partial replica can join.
+pub const AgentWatermark = struct { name: []const u8, seq_base: u64 };
+
+/// This document's watermarks for serving `openPartial` peers. Names
+/// borrow from the document (valid until deinit); caller frees the
+/// slice only.
+pub fn agentWatermarks(self: *const TextDoc, gpa: Allocator) Allocator.Error![]AgentWatermark {
+    const out = try gpa.alloc(AgentWatermark, self.history.agents.items.len);
+    for (out, self.history.agents.items, 0..) |*w, a, i| {
+        w.* = .{
+            .name = self.history.agentName(@enumFromInt(i)),
+            .seq_base = a.seq_base,
+        };
+    }
+    return out;
+}
+
+/// Bootstrap a partially realized replica of a compacted document:
+/// `base_version` (a single-head token) plus `agents` watermarks come
+/// from the host (`agentWatermarks`), `chunks` describe the base in
+/// order — fetched content or holes. Sync works immediately; content
+/// inside holes waits for `realizeBase`.
+pub fn openPartial(
+    gpa: Allocator,
+    base_version: []const u8,
+    agents: []const AgentWatermark,
+    chunks: []const BaseChunk,
+) (Allocator.Error || error{Corrupt})!TextDoc {
+    var doc: TextDoc = .empty;
+    errdefer doc.deinit(gpa);
+
+    for (agents) |w| {
+        const aid = try doc.history.registerAgent(gpa, w.name);
+        doc.history.agents.items[@intFromEnum(aid)].seq_base = w.seq_base;
+    }
+    if (doc.history.agents.items.len != agents.len) return error.Corrupt; // duplicate names
+    const head = try versionSingleEntry(base_version);
+    const head_agent = doc.history.findAgent(head.name) orelse return error.Corrupt;
+    if (head.seq >= doc.history.agents.items[@intFromEnum(head_agent)].seq_base) {
+        return error.Corrupt; // the base head must itself be compacted
+    }
+    doc.base_head = .{ .agent = head_agent, .seq = head.seq };
+    doc.base_version = try gpa.dupe(u8, base_version);
+
+    var total_bytes: usize = 0;
+    var total_scalars: usize = 0;
+    for (chunks) |c| switch (c) {
+        .content => |bytes| {
+            const scalars = std.unicode.utf8CountCodepoints(bytes) catch return error.Corrupt;
+            total_bytes += bytes.len;
+            total_scalars += scalars;
+        },
+        .hole => |h| {
+            if (h.bytes == 0 or h.scalars == 0 or h.scalars > h.bytes) return error.Corrupt;
+            total_bytes += h.bytes;
+            total_scalars += h.scalars;
+        },
+    };
+    doc.base_scalars = total_scalars;
+    const base = try gpa.alloc(u8, total_bytes);
+    doc.base_bytes = base;
+    @memset(base, 0);
+
+    var offset: usize = 0;
+    for (chunks) |c| switch (c) {
+        .content => |bytes| {
+            if (bytes.len > 0) {
+                @memcpy(base[offset..][0..bytes.len], bytes);
+                var piece = try Rope.fromSlice(gpa, bytes);
+                defer piece.deinit(gpa);
+                try doc.rope.append(gpa, &piece);
+            }
+            offset += bytes.len;
+        },
+        .hole => |h| {
+            try doc.holes.append(gpa, .{
+                .base_offset = offset,
+                .cur_offset = offset,
+                .bytes = h.bytes,
+                .scalars = h.scalars,
+            });
+            var piece = try Rope.fromUnrealized(gpa, h.bytes);
+            defer piece.deinit(gpa);
+            try doc.rope.append(gpa, &piece);
+            offset += h.bytes;
+        },
+    };
+    return doc;
+}
+
+/// Whether every byte of the base is realized. Always true for
+/// documents that never went through `openPartial`.
+pub fn baseRealized(self: *const TextDoc) bool {
+    return self.holes.items.len == 0;
+}
+
+/// The fetch list: unrealized base spans, `base_offset` being the byte
+/// range key in the pristine base. Borrows from the document.
+pub fn unrealizedBase(self: *const TextDoc) []const BaseHole {
+    return self.holes.items;
+}
+
+/// Supply the pristine content of one unrealized span (whole-span; the
+/// span is identified by its `base_offset`). Verified against the
+/// recorded byte and scalar counts (`error.Corrupt` on mismatch —
+/// nothing changes). Not an edit: offsets, anchors, versions are all
+/// unaffected.
+pub fn realizeBase(
+    self: *TextDoc,
+    gpa: Allocator,
+    base_offset: usize,
+    content: []const u8,
+) (Allocator.Error || error{Corrupt})!void {
+    const idx = for (self.holes.items, 0..) |h, i| {
+        if (h.base_offset == base_offset) break i;
+    } else return error.Corrupt;
+    const h = self.holes.items[idx];
+    if (content.len != h.bytes) return error.Corrupt;
+    if (!std.unicode.utf8ValidateSlice(content)) return error.Corrupt;
+    if ((std.unicode.utf8CountCodepoints(content) catch unreachable) != h.scalars) return error.Corrupt;
+    try self.rope.realize(gpa, h.cur_offset, content);
+    @memcpy(self.base_bytes[h.base_offset..][0..h.bytes], content);
+    _ = self.holes.orderedRemove(idx);
+}
+
 // ── Time travel ─────────────────────────────────────────────────────
 
 /// Materialize the document as it was at `version` (a token from
 /// `version()`, ours or a peer's — every entry must be stored by us).
 /// Returns a fresh Rope the caller owns. O(history) replay.
 pub fn materializeAt(self: *const TextDoc, gpa: Allocator, version_token: []const u8) MergeError!Rope {
+    if (self.holes.items.len != 0) return error.Unrealized; // needs base content
     var heads: std.ArrayList(Lv) = .empty;
     defer heads.deinit(gpa);
     try self.decodeVersion(gpa, version_token, true, &heads);
@@ -628,8 +835,10 @@ pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edi
     var dec = try Decoder.init(gpa, bytes);
     defer dec.deinit(gpa);
 
-    // Base compatibility (before any mutation).
-    const bootstrap = dec.base != null and self.base_version.len == 0 and
+    // Base compatibility (before any mutation). Version-only base
+    // sections (bytes == null) can never seed a bootstrap.
+    const bootstrap = dec.base != null and dec.base.?.bytes != null and
+        self.base_version.len == 0 and
         self.history.eventCount() == 0 and self.rope.isEmpty();
     if (dec.base) |b| {
         if (!bootstrap and !std.mem.eql(u8, self.base_version, b.version)) {
@@ -669,17 +878,18 @@ pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edi
     // Commit the bootstrap: adopt base fields, watermarks, and the rope.
     if (bootstrap) {
         const b = dec.base.?;
-        if (std.unicode.utf8CountCodepoints(b.bytes) catch null) |c| {
+        const btext = b.bytes.?;
+        if (std.unicode.utf8CountCodepoints(btext) catch null) |c| {
             if (c != b.scalars) return error.Corrupt;
         } else return error.Corrupt;
-        self.base_bytes = try gpa.dupe(u8, b.bytes);
+        self.base_bytes = try gpa.dupe(u8, btext);
         self.base_version = try gpa.dupe(u8, b.version);
         self.base_scalars = b.scalars;
         self.base_head = batch_head;
         for (aids, eff_base) |aid, eff| {
             self.history.agents.items[@intFromEnum(aid)].seq_base = eff;
         }
-        self.rope = try Rope.fromSlice(gpa, b.bytes);
+        self.rope = try Rope.fromSlice(gpa, btext);
     }
 
     // Graph phase: add events + replay, atomically — on any failure the
@@ -694,12 +904,14 @@ pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edi
     var edits: std.ArrayList(Edit) = .empty;
     errdefer edits.deinit(gpa);
     var buf: [4]u8 = undefined;
+    const holey = self.holes.items.len != 0;
     for (scalar_edits.items) |se| {
         switch (se) {
             .ins => |ins| {
-                const off = self.rope.scalarToOffset(ins.pos);
+                const off = if (holey) self.insByteOffset(ins.pos) else self.rope.scalarToOffset(ins.pos);
                 const len = std.unicode.utf8Encode(ins.ch, &buf) catch unreachable;
                 _ = try self.rope.insert(gpa, off, buf[0..len]);
+                if (holey) self.shiftHoles(off, len, 0);
                 if (edits.items.len > 0) {
                     const last = &edits.items[edits.items.len - 1];
                     if (last.removed == 0 and off == last.offset + last.inserted) {
@@ -710,9 +922,14 @@ pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edi
                 try edits.append(gpa, .{ .offset = off, .removed = 0, .inserted = len });
             },
             .del => |pos| {
-                const start = self.rope.scalarToOffset(pos);
-                const end = self.rope.scalarToOffset(pos + 1);
-                _ = try self.rope.delete(gpa, .{ .start = start, .end = end });
+                const range = if (holey) self.delByteRange(pos) else Range{
+                    .start = self.rope.scalarToOffset(pos),
+                    .end = self.rope.scalarToOffset(pos + 1),
+                };
+                const start = range.start;
+                const end = range.end;
+                _ = try self.rope.delete(gpa, range);
+                if (holey) self.shiftHoles(start, 0, end - start);
                 if (edits.items.len > 0) {
                     const last = &edits.items[edits.items.len - 1];
                     if (last.inserted == 0 and start == last.offset) {
@@ -725,6 +942,70 @@ pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edi
         }
     }
     return edits.toOwnedSlice(gpa);
+}
+
+// ── Hole-aware scalar ⇄ byte mapping (merge application) ────────────
+// Global scalar positions count unrealized base scalars; the rope's
+// scalar metric counts realized content only. Positions interior to a
+// hole are excluded beforehand (`checkHoleConflicts`), so mapping only
+// has to subtract hole scalars and pin boundary cases to the hole edge.
+
+/// Byte offset for inserting at global scalar position `pos`.
+fn insByteOffset(self: *const TextDoc, pos: u64) usize {
+    var acc: u64 = 0; // hole scalars strictly before pos
+    for (self.holes.items) |h| {
+        const start = @as(u64, self.rope.offsetToScalar(h.cur_offset)) + acc;
+        if (pos <= start) {
+            if (pos == start) return h.cur_offset; // insert before the hole
+            break;
+        }
+        acc += h.scalars; // non-interior ⇒ pos ≥ start + scalars
+    }
+    return self.rope.scalarToOffset(@intCast(pos - acc));
+}
+
+/// Byte range of the (realized) scalar at global position `pos`,
+/// clipped so it never swallows a neighboring hole's bytes.
+fn delByteRange(self: *const TextDoc, pos: u64) Range {
+    var acc: u64 = 0;
+    var clamp: ?usize = null; // first hole after the target
+    for (self.holes.items) |h| {
+        const start = @as(u64, self.rope.offsetToScalar(h.cur_offset)) + acc;
+        if (pos < start) {
+            clamp = h.cur_offset;
+            break;
+        }
+        acc += h.scalars;
+    }
+    const rs: usize = @intCast(pos - acc);
+    const start = self.rope.scalarToOffset(rs);
+    var end = self.rope.scalarToOffset(rs + 1);
+    if (clamp) |c| end = @min(end, c);
+    return .{ .start = start, .end = end };
+}
+
+/// Reject (whole-batch) any transformed edit that lands interior to an
+/// unrealized base span: the caller realizes the span and merges again.
+fn checkHoleConflicts(self: *const TextDoc, gpa: Allocator, scalar_edits: []const ScalarEdit) MergeError!void {
+    if (self.holes.items.len == 0) return;
+    // Global scalar start of each hole, tracked through the edit stream.
+    const starts = try gpa.alloc(u64, self.holes.items.len);
+    defer gpa.free(starts);
+    var acc: u64 = 0;
+    for (self.holes.items, starts) |h, *s| {
+        s.* = @as(u64, self.rope.offsetToScalar(h.cur_offset)) + acc;
+        acc += h.scalars;
+    }
+    for (scalar_edits) |se| switch (se) {
+        .ins => |ins| for (self.holes.items, starts) |h, *s| {
+            if (ins.pos > s.* and ins.pos < s.* + h.scalars) return error.Unrealized;
+            if (ins.pos <= s.*) s.* += 1;
+        },
+        .del => |pos| for (self.holes.items, starts) |h, *s| {
+            if (pos >= s.* and pos < s.* + h.scalars) return error.Unrealized;
+            if (pos < s.*) s.* -= 1;
+        },
+    };
 }
 
 /// Add the batch to the graph and replay. Atomic: on any error the graph
@@ -769,6 +1050,9 @@ fn historyPhase(
     defer w.deinit(gpa);
     if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
     try w.replayAll(gpa, first_new, null, scalar_edits);
+    // Edits landing inside unrealized base spans reject the whole batch
+    // (graph rolls back): realize, then merge again.
+    try self.checkHoleConflicts(gpa, scalar_edits.items);
     return true;
 }
 
@@ -804,8 +1088,10 @@ fn rollbackHistory(
 //   agents as v1 but each entry appends: uv seq_base
 //   events as v1 (parent lists may be empty = based on the base)
 // v3 (run-RLE, `WireFormat.rle`): "stg" 0x03, then
-//   u8 flags (bit 0: base section present)
-//   [base section as v2 when flagged]
+//   u8 flags (0: no base, 1: full base section, 2: version-only base —
+//     partial peers sync same-base but cannot seed bootstraps)
+//   [base section: uv version_len, token; full adds uv scalars,
+//     uv bytes_len, bytes]
 //   agents as v2 (seq_base always present; 0 when uncompacted)
 //   uv frame_count, per frame: u8 tag, then
 //     uv agent_idx, uv seq (of the frame's FIRST unit),
@@ -834,21 +1120,28 @@ fn encodeEvents(
     format: WireFormat,
 ) Allocator.Error![]u8 {
     const compacted = self.base_version.len > 0;
+    const partial = self.holes.items.len != 0;
     const rle = format == .rle;
+    assert(rle or !partial); // .unit + partial guarded by callers
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     if (rle) {
         try out.appendSlice(gpa, wire_magic_v3);
-        try out.append(gpa, if (compacted) 1 else 0);
+        const flags: u8 = if (!compacted) 0 else if (partial) 2 else 1;
+        try out.append(gpa, flags);
     } else {
         try out.appendSlice(gpa, if (compacted) wire_magic_v2 else wire_magic_v1);
     }
     if (compacted) {
         try putUv(gpa, &out, self.base_version.len);
         try out.appendSlice(gpa, self.base_version);
-        try putUv(gpa, &out, self.base_scalars);
-        try putUv(gpa, &out, self.base_bytes.len);
-        try out.appendSlice(gpa, self.base_bytes);
+        if (!partial) {
+            // A partial base ships its version only: enough to sync with
+            // same-base peers, never enough to bootstrap from.
+            try putUv(gpa, &out, self.base_scalars);
+            try putUv(gpa, &out, self.base_bytes.len);
+            try out.appendSlice(gpa, self.base_bytes);
+        }
     }
 
     // Batch agent table: every agent appearing as author or parent.
@@ -1039,7 +1332,9 @@ const DecodedEvent = struct {
 const BaseSection = struct {
     version: []const u8, // borrowed from the input batch
     scalars: usize,
-    bytes: []const u8, // borrowed from the input batch
+    /// Null for version-only sections (from partially realized peers) —
+    /// enough to sync same-base, never enough to bootstrap from.
+    bytes: ?[]const u8, // borrowed from the input batch
 };
 
 /// Pure parser: no document mutation. Names and base slices borrow from
@@ -1077,29 +1372,37 @@ const Decoder = struct {
         if (wire_version < 1 or wire_version > 3) return error.Corrupt;
         cur = cur[wire_magic_v1.len..];
 
-        var has_base = wire_version == 2;
+        var base_kind: enum { none, full, version_only } = if (wire_version == 2) .full else .none;
         if (wire_version == 3) {
             if (cur.len == 0) return error.Corrupt;
-            if (cur[0] > 1) return error.Corrupt;
-            has_base = cur[0] == 1;
+            base_kind = switch (cur[0]) {
+                0 => .none,
+                1 => .full,
+                2 => .version_only,
+                else => return error.Corrupt,
+            };
             cur = cur[1..];
         }
         const has_seq_base = wire_version >= 2;
 
-        if (has_base) {
+        if (base_kind != .none) {
             const vlen = try getUv(&cur);
             if (vlen == 0 or vlen > cur.len) return error.Corrupt;
             const vtoken = cur[0..vlen];
             cur = cur[vlen..];
-            const scalars = try getUv(&cur);
-            const blen = try getUv(&cur);
-            if (blen > cur.len) return error.Corrupt;
-            if (scalars > blen) return error.Corrupt;
-            const btext = cur[0..blen];
-            cur = cur[blen..];
-            if (!std.unicode.utf8ValidateSlice(btext)) return error.Corrupt;
             _ = try versionSingleEntry(vtoken); // must be a single head
-            self.base = .{ .version = vtoken, .scalars = @intCast(scalars), .bytes = btext };
+            if (base_kind == .full) {
+                const scalars = try getUv(&cur);
+                const blen = try getUv(&cur);
+                if (blen > cur.len) return error.Corrupt;
+                if (scalars > blen) return error.Corrupt;
+                const btext = cur[0..blen];
+                cur = cur[blen..];
+                if (!std.unicode.utf8ValidateSlice(btext)) return error.Corrupt;
+                self.base = .{ .version = vtoken, .scalars = @intCast(scalars), .bytes = btext };
+            } else {
+                self.base = .{ .version = vtoken, .scalars = 0, .bytes = null };
+            }
         }
 
         const agent_count = try getUv(&cur);
