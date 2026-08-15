@@ -1090,3 +1090,41 @@ test "partial: realizeBase validates content; version-only batches cannot bootst
     // And .unit cannot be served from a partial doc at all.
     try t.expectError(error.Unrealized, part.eventsSinceFormat(gpa, hv, .unit));
 }
+
+test "eventsBetween: bounded slice syncs a mirror to a past version" {
+    const gpa = t.allocator;
+    var d: TextDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+    _ = try d.insert(gpa, 0, "saved state");
+    const saved = try d.version(gpa);
+    defer gpa.free(saved);
+    _ = try d.insert(gpa, d.text().byteLen(), " and unsaved typing");
+
+    // Mirror follows to the saved point only.
+    var mirror: TextDoc = .empty;
+    defer mirror.deinit(gpa);
+    const mv = try mirror.version(gpa);
+    defer gpa.free(mv);
+    const slice = try d.eventsBetween(gpa, mv, saved);
+    defer gpa.free(slice);
+    gpa.free(try mirror.merge(gpa, slice));
+    try expectDocText(&mirror, "saved state");
+
+    // Later: catch the mirror up from the saved point to head.
+    const mv2 = try mirror.version(gpa);
+    defer gpa.free(mv2);
+    const rest = try d.eventsSince(gpa, mv2);
+    defer gpa.free(rest);
+    gpa.free(try mirror.merge(gpa, rest));
+    try expectConverged(&[_]*TextDoc{ &d, &mirror });
+
+    // Unknown `to` entries are a hard error, not a guess.
+    var stranger: TextDoc = .empty;
+    defer stranger.deinit(gpa);
+    try stranger.setAgent(gpa, "stranger");
+    _ = try stranger.insert(gpa, 0, "x");
+    const sv = try stranger.version(gpa);
+    defer gpa.free(sv);
+    try t.expectError(error.MissingDependency, d.eventsBetween(gpa, mv, sv));
+}

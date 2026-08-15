@@ -394,6 +394,32 @@ pub fn eventsSinceFormat(
     return self.encodeEvents(gpa, missing.items, format);
 }
 
+/// Wire-encode the events in `to_version`'s causal past that the holder
+/// of `from_version` lacks — `eventsSince` bounded above by `to` instead
+/// of the current head. The incremental-sync primitive for consumers
+/// tracking a past state (persistence deltas, a saved-file mirror).
+/// Every entry of `to_version` must be stored here
+/// (`error.MissingDependency`); unknown `from` entries are ignored.
+pub fn eventsBetween(
+    self: *const TextDoc,
+    gpa: Allocator,
+    from_version: []const u8,
+    to_version: []const u8,
+) MergeError![]u8 {
+    var known: std.ArrayList(Lv) = .empty;
+    defer known.deinit(gpa);
+    self.decodeVersion(gpa, from_version, false, &known) catch |e| switch (e) {
+        error.MissingDependency => unreachable, // lenient mode
+        else => |err| return err,
+    };
+    var to_heads: std.ArrayList(Lv) = .empty;
+    defer to_heads.deinit(gpa);
+    try self.decodeVersion(gpa, to_version, true, &to_heads);
+    var d = try self.history.diff(gpa, to_heads.items, known.items);
+    defer d.deinit(gpa);
+    return self.encodeEvents(gpa, d.a_only.items, .rle);
+}
+
 /// The whole document as its event graph (plus the base snapshot when
 /// compacted) — the durable form. A partially realized base cannot be
 /// persisted (`error.Unrealized`): realize it first.
