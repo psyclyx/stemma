@@ -810,3 +810,126 @@ fn fuzzGossip(_: void, smith: *std.testing.Smith) !void {
 test "fuzz: smith-driven two-peer gossip always converges" {
     try std.testing.fuzz({}, fuzzGossip, .{});
 }
+
+// ── Run-RLE wire (v3) ───────────────────────────────────────────────────
+
+test "rle: typing burst is one frame — batch shrinks vs unit encoding" {
+    const gpa = t.allocator;
+    var author: TextDoc = .empty;
+    defer author.deinit(gpa);
+    try author.setAgent(gpa, "author");
+    _ = try author.insert(gpa, 0, "x" ** 200);
+    _ = try author.delete(gpa, .{ .start = 50, .end = 150 });
+
+    const empty_ver = blk: {
+        var fresh: TextDoc = .empty;
+        defer fresh.deinit(gpa);
+        break :blk try fresh.version(gpa);
+    };
+    defer gpa.free(empty_ver);
+    const rle = try author.eventsSinceFormat(gpa, empty_ver, .rle);
+    defer gpa.free(rle);
+    const unit = try author.eventsSinceFormat(gpa, empty_ver, .unit);
+    defer gpa.free(unit);
+    // 300 events: two run frames vs 300 unit events. The precise sizes
+    // move with the format; the order-of-magnitude win must not.
+    try t.expect(rle.len * 4 < unit.len);
+
+    // Both decode to the same document.
+    var via_rle = try TextDoc.open(gpa, rle);
+    defer via_rle.deinit(gpa);
+    var via_unit = try TextDoc.open(gpa, unit);
+    defer via_unit.deinit(gpa);
+    try expectConverged(&[_]*TextDoc{ &via_rle, &via_unit, &author });
+    // Same graph, unit for unit: identical versions and future syncs.
+    const va = try via_rle.version(gpa);
+    defer gpa.free(va);
+    const vb = try via_unit.version(gpa);
+    defer gpa.free(vb);
+    try t.expectEqualSlices(u8, va, vb);
+}
+
+test "rle: mixed runs, singletons, and concurrency converge" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.insert(gpa, 0, "shared base ");
+    try syncBoth(gpa, &alice, &bob);
+    // Concurrent bursts (runs on both sides) + point edits (singletons).
+    _ = try alice.insert(gpa, 12, "alice typed this");
+    _ = try alice.delete(gpa, .{ .start = 0, .end = 3 });
+    _ = try bob.insert(gpa, 0, "bob's turn: ");
+    _ = try bob.insert(gpa, 3, "!");
+    _ = try bob.delete(gpa, .{ .start = 1, .end = 2 });
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+
+    // Multi-codepoint content in runs survives.
+    _ = try alice.insert(gpa, 0, "日本語テキスト");
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*TextDoc{ &alice, &bob });
+}
+
+test "rle: compacted batch carries base and runs together" {
+    const gpa = t.allocator;
+    var d: TextDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+    _ = try d.insert(gpa, 0, "stable prefix");
+    const stable = try d.version(gpa);
+    defer gpa.free(stable);
+    _ = try d.insert(gpa, d.text().byteLen(), " and a long typed suffix after compaction");
+    try d.compact(gpa, stable);
+
+    const bytes = try d.serialize(gpa);
+    defer gpa.free(bytes);
+    try t.expect(std.mem.startsWith(u8, bytes, "stg\x03"));
+    var reopened = try TextDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try expectConverged(&[_]*TextDoc{ &d, &reopened });
+    // The reopened doc keeps syncing with the original.
+    try reopened.setAgent(gpa, "peer");
+    _ = try reopened.insert(gpa, 0, "hi ");
+    try syncBoth(gpa, &reopened, &d);
+    try expectConverged(&[_]*TextDoc{ &d, &reopened });
+}
+
+test "rle: hostile run frames are rejected, document untouched" {
+    const gpa = t.allocator;
+    var author: TextDoc = .empty;
+    defer author.deinit(gpa);
+    try author.setAgent(gpa, "author");
+    _ = try author.insert(gpa, 0, "abcdefgh");
+
+    var victim: TextDoc = .empty;
+    defer victim.deinit(gpa);
+    const valid = try author.serialize(gpa);
+    defer gpa.free(valid);
+
+    // Truncations anywhere must reject cleanly.
+    var cut: usize = 4;
+    while (cut < valid.len) : (cut += 3) {
+        try t.expectError(error.Corrupt, victim.merge(gpa, valid[0..cut]));
+    }
+    try t.expectEqual(@as(usize, 0), victim.history.eventCount());
+
+    // A delete-run frame claiming an absurd count: tiny input must not
+    // expand into memory. count > max_batch_units → Corrupt.
+    var evil: std.ArrayList(u8) = .empty;
+    defer evil.deinit(gpa);
+    try evil.appendSlice(gpa, "stg\x03");
+    try evil.append(gpa, 0); // no base
+    try evil.appendSlice(gpa, &.{ 1, 1, 'a', 0 }); // one agent "a", seq_base 0
+    try evil.append(gpa, 1); // one frame
+    try evil.append(gpa, 3); // del run
+    try evil.appendSlice(gpa, &.{ 0, 0, 0 }); // agent 0, seq 0, no parents
+    // count = 2^40 (LEB128), pos = 0
+    try evil.appendSlice(gpa, &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x20, 0 });
+    try t.expectError(error.Corrupt, victim.merge(gpa, evil.items));
+    try t.expectEqual(@as(usize, 0), victim.history.eventCount());
+}

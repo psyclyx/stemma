@@ -82,7 +82,18 @@ const base_lv: Lv = std.math.maxInt(Lv);
 
 const wire_magic_v1 = "stg\x01";
 const wire_magic_v2 = "stg\x02";
+const wire_magic_v3 = "stg\x03";
 const version_magic = core.version_magic;
+
+/// Batch encoding produced by `eventsSince`/`serialize`. Decoding always
+/// accepts every version.
+pub const WireFormat = enum {
+    /// Run-RLE frames ("stg" 0x03): a monotone typing or deletion burst
+    /// costs one frame instead of one event per character. The default.
+    rle,
+    /// Per-unit events ("stg" 0x01 / 0x02) for pre-RLE decoders.
+    unit,
+};
 
 /// Replay of the whole history against one shared `Sequence`: the
 /// eg-walker prepare/effect discipline (see sequence.zig for the ordering,
@@ -301,6 +312,17 @@ pub fn eventsSince(
     gpa: Allocator,
     remote_version: []const u8,
 ) (Allocator.Error || error{Corrupt})![]u8 {
+    return self.eventsSinceFormat(gpa, remote_version, .rle);
+}
+
+/// `eventsSince` with an explicit batch encoding — serve `.unit` to
+/// peers that predate run-RLE.
+pub fn eventsSinceFormat(
+    self: *const TextDoc,
+    gpa: Allocator,
+    remote_version: []const u8,
+    format: WireFormat,
+) (Allocator.Error || error{Corrupt})![]u8 {
     var known: std.ArrayList(Lv) = .empty;
     defer known.deinit(gpa);
     self.decodeVersion(gpa, remote_version, false, &known) catch |e| switch (e) {
@@ -309,7 +331,7 @@ pub fn eventsSince(
     };
     var missing = try self.history.missingFrom(gpa, known.items);
     defer missing.deinit(gpa);
-    return self.encodeEvents(gpa, missing.items);
+    return self.encodeEvents(gpa, missing.items, format);
 }
 
 /// The whole document as its event graph (plus the base snapshot when
@@ -317,7 +339,7 @@ pub fn eventsSince(
 pub fn serialize(self: *const TextDoc, gpa: Allocator) Allocator.Error![]u8 {
     var missing = try self.history.missingFrom(gpa, &.{});
     defer missing.deinit(gpa);
-    return self.encodeEvents(gpa, missing.items);
+    return self.encodeEvents(gpa, missing.items, .rle);
 }
 
 /// Materialize a document from `serialize`d (or any complete) bytes.
@@ -642,7 +664,7 @@ pub fn merge(self: *TextDoc, gpa: Allocator, bytes: []const u8) MergeError![]Edi
         batch_head = .{ .agent = agent, .seq = entry.seq };
     }
 
-    try dec.validate(self, aids, eff_base, batch_head);
+    try dec.validate(gpa, self, aids, eff_base, batch_head);
 
     // Commit the bootstrap: adopt base fields, watermarks, and the rope.
     if (bootstrap) {
@@ -781,13 +803,46 @@ fn rollbackHistory(
 //   uv base_scalars, uv base_bytes_len, bytes (UTF-8)
 //   agents as v1 but each entry appends: uv seq_base
 //   events as v1 (parent lists may be empty = based on the base)
+// v3 (run-RLE, `WireFormat.rle`): "stg" 0x03, then
+//   u8 flags (bit 0: base section present)
+//   [base section as v2 when flagged]
+//   agents as v2 (seq_base always present; 0 when uncompacted)
+//   uv frame_count, per frame: u8 tag, then
+//     uv agent_idx, uv seq (of the frame's FIRST unit),
+//     uv parent_count, per parent: uv agent_idx, uv seq
+//       (parents of the first unit; run interiors chain implicitly)
+//     tag 0 unit ins: uv pos, uv ch
+//     tag 1 unit del: uv pos
+//     tag 2 ins run:  uv count (≥2), uv base_pos,
+//                     u8 dir (0: pos ascends +1/unit, 1: pos constant),
+//                     uv ch × count
+//     tag 3 del run:  uv count (≥2), uv pos (constant — each unit
+//                     deletes at the same position, the next scalar
+//                     sliding into place)
+//   Runs decode back to unit events: unit i has seq+i, single parent
+//   (agent, seq+i-1). The graph model never sees a run.
 // All integers unsigned LEB128; versioned by the magic's trailing byte.
 
-fn encodeEvents(self: *const TextDoc, gpa: Allocator, lvs: []const Lv) Allocator.Error![]u8 {
+/// An encodable insert run: `len` events starting at `lvs[i]`, positions
+/// following `dir`.
+const InsRun = struct { len: usize, dir: u8 };
+
+fn encodeEvents(
+    self: *const TextDoc,
+    gpa: Allocator,
+    lvs: []const Lv,
+    format: WireFormat,
+) Allocator.Error![]u8 {
     const compacted = self.base_version.len > 0;
+    const rle = format == .rle;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, if (compacted) wire_magic_v2 else wire_magic_v1);
+    if (rle) {
+        try out.appendSlice(gpa, wire_magic_v3);
+        try out.append(gpa, if (compacted) 1 else 0);
+    } else {
+        try out.appendSlice(gpa, if (compacted) wire_magic_v2 else wire_magic_v1);
+    }
     if (compacted) {
         try putUv(gpa, &out, self.base_version.len);
         try out.appendSlice(gpa, self.base_version);
@@ -813,47 +868,159 @@ fn encodeEvents(self: *const TextDoc, gpa: Allocator, lvs: []const Lv) Allocator
         const name = self.history.agentName(aid);
         try putUv(gpa, &out, name.len);
         try out.appendSlice(gpa, name);
-        if (compacted) {
+        if (compacted or rle) {
             try putUv(gpa, &out, self.history.agents.items[@intFromEnum(aid)].seq_base);
         }
     }
 
-    try putUv(gpa, &out, lvs.len);
-    for (lvs) |lv| {
-        const id = self.history.idOf(lv);
-        try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
-        try putUv(gpa, &out, id.seq);
-        const parents = self.history.parentsOf(lv);
-        const implicit_base = parents.len == 0 and self.base_head != null and lv < self.history.eventCount();
-        if (implicit_base and self.history.parentsOf(lv).len == 0) {
-            // Events based directly on the base re-encode their implicit
-            // parent as the base head, so uncompacted-era decoders (and
-            // validation) see an explicit dependency.
-            const h = self.base_head.?;
-            try putUv(gpa, &out, 1);
-            try putUv(gpa, &out, tableIndexOf(table.items, h.agent));
-            try putUv(gpa, &out, h.seq);
-        } else {
-            try putUv(gpa, &out, parents.len);
-            for (parents) |p| {
-                const pid = self.history.idOf(p);
-                try putUv(gpa, &out, tableIndexOf(table.items, pid.agent));
-                try putUv(gpa, &out, pid.seq);
+    if (!rle) {
+        try putUv(gpa, &out, lvs.len);
+        for (lvs) |lv| {
+            const id = self.history.idOf(lv);
+            try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
+            try putUv(gpa, &out, id.seq);
+            try self.writeParents(gpa, &out, table.items, lv);
+            switch (self.history.opOf(lv)) {
+                .ins => |ins| {
+                    try out.append(gpa, 0);
+                    try putUv(gpa, &out, ins.pos);
+                    try putUv(gpa, &out, ins.ch);
+                },
+                .del => |pos| {
+                    try out.append(gpa, 1);
+                    try putUv(gpa, &out, pos);
+                },
             }
         }
-        switch (self.history.opOf(lv)) {
+        return out.toOwnedSlice(gpa);
+    }
+
+    // RLE: count frames first (greedy run detection is deterministic),
+    // then emit.
+    var frame_count: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < lvs.len) : (frame_count += 1) {
+            i += switch (self.history.opOf(lvs[i])) {
+                .ins => self.insRunAt(lvs, i).len,
+                .del => self.delRunAt(lvs, i),
+            };
+        }
+    }
+    try putUv(gpa, &out, frame_count);
+    var i: usize = 0;
+    while (i < lvs.len) {
+        const first = lvs[i];
+        const id = self.history.idOf(first);
+        switch (self.history.opOf(first)) {
             .ins => |ins| {
-                try out.append(gpa, 0);
-                try putUv(gpa, &out, ins.pos);
-                try putUv(gpa, &out, ins.ch);
+                const run = self.insRunAt(lvs, i);
+                try out.append(gpa, if (run.len >= 2) 2 else 0);
+                try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
+                try putUv(gpa, &out, id.seq);
+                try self.writeParents(gpa, &out, table.items, first);
+                if (run.len >= 2) {
+                    try putUv(gpa, &out, run.len);
+                    try putUv(gpa, &out, ins.pos);
+                    try out.append(gpa, run.dir);
+                    for (lvs[i..][0..run.len]) |lv| {
+                        try putUv(gpa, &out, self.history.opOf(lv).ins.ch);
+                    }
+                } else {
+                    try putUv(gpa, &out, ins.pos);
+                    try putUv(gpa, &out, ins.ch);
+                }
+                i += run.len;
             },
             .del => |pos| {
-                try out.append(gpa, 1);
+                const len = self.delRunAt(lvs, i);
+                try out.append(gpa, if (len >= 2) 3 else 1);
+                try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
+                try putUv(gpa, &out, id.seq);
+                try self.writeParents(gpa, &out, table.items, first);
+                if (len >= 2) try putUv(gpa, &out, len);
                 try putUv(gpa, &out, pos);
+                i += len;
             },
         }
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// Parent list of the first unit of a frame. Events based directly on
+/// the base re-encode their implicit parent as the base head, so
+/// uncompacted-era decoders (and validation) see an explicit dependency.
+fn writeParents(
+    self: *const TextDoc,
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    table: []const AgentId,
+    lv: Lv,
+) Allocator.Error!void {
+    const parents = self.history.parentsOf(lv);
+    if (parents.len == 0 and self.base_head != null) {
+        const h = self.base_head.?;
+        try putUv(gpa, out, 1);
+        try putUv(gpa, out, tableIndexOf(table, h.agent));
+        try putUv(gpa, out, h.seq);
+        return;
+    }
+    try putUv(gpa, out, parents.len);
+    for (parents) |p| {
+        const pid = self.history.idOf(p);
+        try putUv(gpa, out, tableIndexOf(table, pid.agent));
+        try putUv(gpa, out, pid.seq);
+    }
+}
+
+/// Whether `lvs[j]` extends a run whose previous member is `lvs[j-1]`:
+/// same agent, next seq, and its sole parent is that previous event.
+fn chains(self: *const TextDoc, lvs: []const Lv, j: usize) bool {
+    const prev = lvs[j - 1];
+    const cur = lvs[j];
+    const prev_id = self.history.idOf(prev);
+    const cur_id = self.history.idOf(cur);
+    if (cur_id.agent != prev_id.agent or cur_id.seq != prev_id.seq + 1) return false;
+    const parents = self.history.parentsOf(cur);
+    return parents.len == 1 and parents[0] == prev;
+}
+
+/// Maximal insert run starting at `lvs[i]`. Direction is fixed by the
+/// second member: ascending (typing forward) or constant position.
+fn insRunAt(self: *const TextDoc, lvs: []const Lv, i: usize) InsRun {
+    const first_pos = self.history.opOf(lvs[i]).ins.pos;
+    var dir: u8 = 0;
+    var j = i + 1;
+    while (j < lvs.len) : (j += 1) {
+        if (!self.chains(lvs, j)) break;
+        const op = self.history.opOf(lvs[j]);
+        if (op != .ins) break;
+        const expect_asc = first_pos + (j - i);
+        if (j == i + 1) {
+            if (op.ins.pos == expect_asc) {
+                dir = 0;
+            } else if (op.ins.pos == first_pos) {
+                dir = 1;
+            } else break;
+        } else {
+            const expect = if (dir == 0) expect_asc else first_pos;
+            if (op.ins.pos != expect) break;
+        }
+    }
+    return .{ .len = j - i, .dir = dir };
+}
+
+/// Maximal delete run starting at `lvs[i]`: constant position (each
+/// unit deletes at the same offset — the local `delete` pattern).
+fn delRunAt(self: *const TextDoc, lvs: []const Lv, i: usize) usize {
+    const pos = self.history.opOf(lvs[i]).del;
+    var j = i + 1;
+    while (j < lvs.len) : (j += 1) {
+        if (!self.chains(lvs, j)) break;
+        const op = self.history.opOf(lvs[j]);
+        if (op != .del or op.del != pos) break;
+    }
+    return j - i;
 }
 
 const tableAdd = core.tableAdd;
@@ -895,16 +1062,31 @@ const Decoder = struct {
         self.parents_pool.deinit(gpa);
     }
 
+    /// Decoded-unit ceiling per batch. Run frames expand without
+    /// consuming input bytes, so a hostile batch could otherwise claim
+    /// unbounded counts from a handful of bytes.
+    const max_batch_units = 1 << 26;
+
     fn init(gpa: Allocator, bytes: []const u8) MergeError!Decoder {
         var self: Decoder = .{};
         errdefer self.deinit(gpa);
         var cur: []const u8 = bytes;
 
-        const v2 = std.mem.startsWith(u8, cur, wire_magic_v2);
-        if (!v2 and !std.mem.startsWith(u8, cur, wire_magic_v1)) return error.Corrupt;
+        if (cur.len < wire_magic_v1.len or !std.mem.startsWith(u8, cur, "stg")) return error.Corrupt;
+        const wire_version = cur[3];
+        if (wire_version < 1 or wire_version > 3) return error.Corrupt;
         cur = cur[wire_magic_v1.len..];
 
-        if (v2) {
+        var has_base = wire_version == 2;
+        if (wire_version == 3) {
+            if (cur.len == 0) return error.Corrupt;
+            if (cur[0] > 1) return error.Corrupt;
+            has_base = cur[0] == 1;
+            cur = cur[1..];
+        }
+        const has_seq_base = wire_version >= 2;
+
+        if (has_base) {
             const vlen = try getUv(&cur);
             if (vlen == 0 or vlen > cur.len) return error.Corrupt;
             const vtoken = cur[0..vlen];
@@ -927,85 +1109,212 @@ const Decoder = struct {
             if (nlen == 0 or nlen > 4096 or nlen > cur.len) return error.Corrupt;
             try self.names.append(gpa, cur[0..nlen]);
             cur = cur[nlen..];
-            try self.seq_bases.append(gpa, if (v2) try getUv(&cur) else 0);
+            try self.seq_bases.append(gpa, if (has_seq_base) try getUv(&cur) else 0);
         }
 
-        const event_count = try getUv(&cur);
-        for (0..event_count) |_| {
-            const aidx = try getUv(&cur);
-            if (aidx >= self.names.items.len) return error.Corrupt;
-            const seq = try getUv(&cur);
-            const pcount = try getUv(&cur);
-            if (pcount > 1 << 16) return error.Corrupt;
-            const pstart: u32 = @intCast(self.parents_pool.items.len);
-            for (0..pcount) |_| {
-                const paidx = try getUv(&cur);
-                if (paidx >= self.names.items.len) return error.Corrupt;
-                const pseq = try getUv(&cur);
-                try self.parents_pool.append(gpa, .{ .agent_idx = @intCast(paidx), .seq = pseq });
+        if (wire_version < 3) {
+            const event_count = try getUv(&cur);
+            for (0..event_count) |_| {
+                const aidx = try getUv(&cur);
+                if (aidx >= self.names.items.len) return error.Corrupt;
+                const seq = try getUv(&cur);
+                const pcount = try getUv(&cur);
+                if (pcount > 1 << 16) return error.Corrupt;
+                const pstart: u32 = @intCast(self.parents_pool.items.len);
+                for (0..pcount) |_| {
+                    const paidx = try getUv(&cur);
+                    if (paidx >= self.names.items.len) return error.Corrupt;
+                    const pseq = try getUv(&cur);
+                    try self.parents_pool.append(gpa, .{ .agent_idx = @intCast(paidx), .seq = pseq });
+                }
+                if (cur.len == 0) return error.Corrupt;
+                const tag = cur[0];
+                cur = cur[1..];
+                const op: TextOp = switch (tag) {
+                    0 => blk: {
+                        const pos = try getUv(&cur);
+                        const ch = try getUv(&cur);
+                        if (ch > std.math.maxInt(u21) or !std.unicode.utf8ValidCodepoint(@intCast(ch)))
+                            return error.Corrupt;
+                        break :blk .{ .ins = .{ .pos = pos, .ch = @intCast(ch) } };
+                    },
+                    1 => .{ .del = try getUv(&cur) },
+                    else => return error.Corrupt,
+                };
+                try self.events.append(gpa, .{
+                    .agent_idx = @intCast(aidx),
+                    .seq = seq,
+                    .parents_start = pstart,
+                    .parents_len = @intCast(pcount),
+                    .op = op,
+                });
             }
+            return self;
+        }
+
+        try self.initV3(gpa, &cur);
+        return self;
+    }
+
+    /// v3 body: frames, runs expanded back to unit events. Split from
+    /// `init` to keep the hot v1/v2 loop compact.
+    fn initV3(self: *Decoder, gpa: Allocator, cur_: *[]const u8) MergeError!void {
+        var cur = cur_.*;
+        defer cur_.* = cur;
+        const frame_count = try getUv(&cur);
+        for (0..frame_count) |_| {
             if (cur.len == 0) return error.Corrupt;
             const tag = cur[0];
             cur = cur[1..];
-            const op: TextOp = switch (tag) {
-                0 => blk: {
-                    const pos = try getUv(&cur);
-                    const ch = try getUv(&cur);
-                    if (ch > std.math.maxInt(u21) or !std.unicode.utf8ValidCodepoint(@intCast(ch)))
-                        return error.Corrupt;
-                    break :blk .{ .ins = .{ .pos = pos, .ch = @intCast(ch) } };
+            const aidx_u = try getUv(&cur);
+            if (aidx_u >= self.names.items.len) return error.Corrupt;
+            const aidx: u32 = @intCast(aidx_u);
+            const seq = try getUv(&cur);
+            const pstart = try self.readParents(gpa, &cur);
+            const pcount: u32 = @intCast(self.parents_pool.items.len - pstart);
+            switch (tag) {
+                0, 1 => {
+                    const op: TextOp = if (tag == 0)
+                        .{ .ins = .{ .pos = try getUv(&cur), .ch = try getCodepoint(&cur) } }
+                    else
+                        .{ .del = try getUv(&cur) };
+                    try self.appendUnit(gpa, aidx, seq, pstart, pcount, op);
                 },
-                1 => .{ .del = try getUv(&cur) },
+                2 => {
+                    const count = try getUv(&cur);
+                    if (count < 2 or count > max_batch_units) return error.Corrupt;
+                    const base_pos = try getUv(&cur);
+                    _ = std.math.add(u64, seq, count) catch return error.Corrupt;
+                    _ = std.math.add(u64, base_pos, count) catch return error.Corrupt;
+                    if (cur.len == 0) return error.Corrupt;
+                    const dir = cur[0];
+                    cur = cur[1..];
+                    if (dir > 1) return error.Corrupt;
+                    for (0..@intCast(count)) |k| {
+                        const ch = try getCodepoint(&cur);
+                        const pos = if (dir == 0) base_pos + k else base_pos;
+                        if (k == 0) {
+                            try self.appendUnit(gpa, aidx, seq, pstart, pcount, .{ .ins = .{ .pos = pos, .ch = ch } });
+                        } else {
+                            try self.appendChained(gpa, aidx, seq + k, .{ .ins = .{ .pos = pos, .ch = ch } });
+                        }
+                    }
+                },
+                3 => {
+                    const count = try getUv(&cur);
+                    if (count < 2 or count > max_batch_units) return error.Corrupt;
+                    _ = std.math.add(u64, seq, count) catch return error.Corrupt;
+                    const pos = try getUv(&cur);
+                    try self.appendUnit(gpa, aidx, seq, pstart, pcount, .{ .del = pos });
+                    for (1..@intCast(count)) |k| {
+                        try self.appendChained(gpa, aidx, seq + k, .{ .del = pos });
+                    }
+                },
                 else => return error.Corrupt,
-            };
-            try self.events.append(gpa, .{
-                .agent_idx = @intCast(aidx),
-                .seq = seq,
-                .parents_start = pstart,
-                .parents_len = @intCast(pcount),
-                .op = op,
-            });
+            }
+            if (self.events.items.len > max_batch_units) return error.Corrupt;
         }
-        return self;
+    }
+
+    /// Parse a parent list into the pool; returns its start index.
+    fn readParents(self: *Decoder, gpa: Allocator, cur: *[]const u8) MergeError!u32 {
+        const pcount = try getUv(cur);
+        if (pcount > 1 << 16) return error.Corrupt;
+        const pstart: u32 = @intCast(self.parents_pool.items.len);
+        for (0..pcount) |_| {
+            const paidx = try getUv(cur);
+            if (paidx >= self.names.items.len) return error.Corrupt;
+            const pseq = try getUv(cur);
+            try self.parents_pool.append(gpa, .{ .agent_idx = @intCast(paidx), .seq = pseq });
+        }
+        return pstart;
+    }
+
+    fn getCodepoint(cur: *[]const u8) error{Corrupt}!u21 {
+        const ch = try getUv(cur);
+        if (ch > std.math.maxInt(u21) or !std.unicode.utf8ValidCodepoint(@intCast(ch)))
+            return error.Corrupt;
+        return @intCast(ch);
+    }
+
+    fn appendUnit(
+        self: *Decoder,
+        gpa: Allocator,
+        aidx: u32,
+        seq: u64,
+        pstart: u32,
+        pcount: u32,
+        op: TextOp,
+    ) Allocator.Error!void {
+        try self.events.append(gpa, .{
+            .agent_idx = aidx,
+            .seq = seq,
+            .parents_start = pstart,
+            .parents_len = pcount,
+            .op = op,
+        });
+    }
+
+    /// A run-interior unit: sole parent is its predecessor in the run.
+    fn appendChained(self: *Decoder, gpa: Allocator, aidx: u32, seq: u64, op: TextOp) Allocator.Error!void {
+        const pstart: u32 = @intCast(self.parents_pool.items.len);
+        try self.parents_pool.append(gpa, .{ .agent_idx = aidx, .seq = seq - 1 });
+        try self.appendUnit(gpa, aidx, seq, pstart, 1, op);
     }
 
     /// Whole-batch causal validation before any graph mutation:
     /// per-agent contiguity against effective watermarks, and parent
     /// resolvability (stored, earlier-in-batch, or the base head —
     /// references into compacted interior are missing dependencies).
+    ///
+    /// "Earlier in batch" is one contiguous seen-range per agent: a
+    /// causally closed batch has per-agent ascending contiguous seqs, so
+    /// the range is exact for honest encoders; adversarial orderings
+    /// merely fail to extend it and get rejected. O(events + parents).
     fn validate(
         self: *const Decoder,
+        gpa: Allocator,
         doc: *const TextDoc,
         aids: []const AgentId,
         eff_base: []const u64,
         batch_head: ?EventId,
-    ) error{MissingDependency}!void {
-        for (self.events.items, 0..) |ev, i| {
+    ) (Allocator.Error || error{MissingDependency})!void {
+        // Per agent, the batch-seen range [first, next); empty when equal.
+        const Seen = struct { first: u64 = 0, next: u64 = 0 };
+        const seen = try gpa.alloc(Seen, self.names.items.len);
+        defer gpa.free(seen);
+        @memset(seen, .{});
+        const inRange = struct {
+            fn inRange(s: Seen, seq: u64) bool {
+                return seq >= s.first and seq < s.next;
+            }
+        }.inRange;
+
+        for (self.events.items) |ev| {
+            defer {
+                const s = &seen[ev.agent_idx];
+                if (s.first == s.next) {
+                    s.* = .{ .first = ev.seq, .next = ev.seq + 1 };
+                } else if (ev.seq == s.next) s.next += 1;
+            }
             const agent = aids[ev.agent_idx];
             const stored = doc.history.agents.items[@intFromEnum(agent)].lv_by_seq.items.len;
             const next = eff_base[ev.agent_idx] + stored;
             if (ev.seq < next) continue; // duplicate or compacted
             const contiguous = ev.seq == next or
-                (ev.seq > 0 and self.seenEarlier(i, ev.agent_idx, ev.seq - 1));
+                (ev.seq > 0 and inRange(seen[ev.agent_idx], ev.seq - 1));
             if (!contiguous) return error.MissingDependency;
             for (self.parentsOf(ev)) |pref| {
                 const pagent = aids[pref.agent_idx];
                 const pid: EventId = .{ .agent = pagent, .seq = pref.seq };
                 if (doc.history.lvOf(pid) != null) continue;
-                if (self.seenEarlier(i, pref.agent_idx, pref.seq)) continue;
+                if (inRange(seen[pref.agent_idx], pref.seq)) continue;
                 if (batch_head) |h| {
                     if (h.agent == pagent and h.seq == pref.seq) continue;
                 }
                 return error.MissingDependency;
             }
         }
-    }
-
-    fn seenEarlier(self: *const Decoder, before: usize, agent_idx: u32, seq: u64) bool {
-        for (self.events.items[0..before]) |ev| {
-            if (ev.agent_idx == agent_idx and ev.seq == seq) return true;
-        }
-        return false;
     }
 };
 

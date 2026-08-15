@@ -73,8 +73,10 @@ graph that explains it. Local edits record causally-stamped events (no CRDT
 metadata on the document — the eg-walker model); `merge` integrates remote
 batches and returns the same byte-space `[]Edit` stream local edits produce,
 so `AnchorSet`s and cursors survive remote edits with zero extra machinery.
-Versions are opaque portable tokens; `eventsSince` is wire-ready;
-`serialize`/`open` persist the graph (the document of record).
+Versions are opaque portable tokens; `eventsSince` is wire-ready and
+run-RLE encoded (a typing burst is one frame; `WireFormat.unit` serves
+pre-RLE decoders); `serialize`/`open` persist the graph (the document of
+record).
 
 Beyond the basics: **FugueMax ordering** (maximally non-interleaving in both
 directions — locked by block-contiguity tests before any replica ever

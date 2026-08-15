@@ -56,13 +56,35 @@ graph merge concurrent 1k+1k     2140 ns/op  (best     2079)  n=5
   over unit events, O(n·m)-ish by design (correctness first). The
   optimization ladder, each rung to be landed against these numbers with
   convergence tests green:
-  1. run-RLE event storage (typing runs collapse ~64×);
+  1. run-RLE event storage (typing runs collapse ~64×; the wire half —
+     run frames in batches — landed 2026-08-15, see below);
   2. LCA-bounded replay with placeholder runs (eg-walker's actual
      contribution — merge cost proportional to divergence, not history;
      the placeholder machinery already exists for compaction bases);
   3. B-tree walker state (positional scans O(log n)).
   `compact()` is the fourth lever in practice: a compacted document's
   replay cost is proportional to post-base history, not lifetime history.
+
+## Run-RLE wire + O(n) batch validation — 2026-08-15
+
+```
+collab doc-typing ascii            67 ns/op  (best       64)  n=11
+collab merge linear 4k units     1982 ns/op  (best     1960)  n=5
+collab wire 4k units             4119 B rle vs    44683 B unit (10x)
+collab merge concurrent 1k+1k    1707 ns/op  (best     1678)  n=5
+```
+
+- **Wire v3 (run-RLE frames)**: a monotone typing or deletion burst is one
+  frame — 10× smaller batches on the 4k-unit typing history (per-unit
+  encoding stays available via `WireFormat.unit` for old decoders; ladder
+  rung 1's wire half). Runs decode back to unit events, so the graph model
+  and replay are untouched.
+- **Batch validation was the hidden O(n²)**: `seenEarlier` linearly scanned
+  the batch per event. Replaced with per-agent contiguous seen-ranges
+  (exact for causally closed batches): merge linear 3.6 → 2.0 µs/unit,
+  concurrent 2.1 → 1.7 — a bigger win than the encoding itself. Found
+  while chasing an apparent +13% from the v3 decoder that was actually
+  layout sensitivity of the quadratic loop.
 
 ## Tuning ledger
 

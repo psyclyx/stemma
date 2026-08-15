@@ -269,6 +269,22 @@ fn benchCollab(io: Io, w: *Io.Writer) !void {
             d.deinit(gpa);
         }
         try report(w, "collab merge linear 4k units", &samples, 4096, "ns");
+        // Wire size, RLE vs per-unit encoding, same 4k-unit history.
+        {
+            var fresh: TextDoc = .empty;
+            defer fresh.deinit(gpa);
+            const empty_ver = try fresh.version(gpa);
+            defer gpa.free(empty_ver);
+            const unit_bytes = try author.eventsSinceFormat(gpa, empty_ver, .unit);
+            defer gpa.free(unit_bytes);
+            try w.print("{s:<28} {d:>8} B rle vs {d:>8} B unit ({d}x)\n", .{
+                "collab wire 4k units",
+                bytes.len,
+                unit_bytes.len,
+                unit_bytes.len / bytes.len,
+            });
+            try w.flush();
+        }
     }
     // Cross-merge two concurrent 1k-unit branches.
     {
