@@ -1128,3 +1128,33 @@ test "eventsBetween: bounded slice syncs a mirror to a past version" {
     defer gpa.free(sv);
     try t.expectError(error.MissingDependency, d.eventsBetween(gpa, mv, sv));
 }
+
+test "openFromContent: bulk load, shared root across independent loads" {
+    const gpa = t.allocator;
+    var a = try TextDoc.openFromContent(gpa, "the same big file contents\n");
+    defer a.deinit(gpa);
+    var b = try TextDoc.openFromContent(gpa, "the same big file contents\n");
+    defer b.deinit(gpa);
+    try t.expectEqual(@as(usize, 0), a.history.eventCount());
+    try expectDocText(&a, "the same big file contents\n");
+
+    // Independent loads of identical bytes share the history root: they
+    // sync as replicas of one document.
+    try a.setAgent(gpa, "alice");
+    try b.setAgent(gpa, "bob");
+    _ = try a.insert(gpa, 0, "A");
+    _ = try b.insert(gpa, b.text().byteLen(), "B");
+    try syncBoth(gpa, &a, &b);
+    try expectConverged(&[_]*TextDoc{ &a, &b });
+
+    // Different contents produce different bases: never confusable.
+    var c = try TextDoc.openFromContent(gpa, "entirely different\n");
+    defer c.deinit(gpa);
+    try c.setAgent(gpa, "carol");
+    _ = try c.insert(gpa, 0, "C");
+    const av = try a.version(gpa);
+    defer gpa.free(av);
+    const batch = try c.eventsSince(gpa, av);
+    defer gpa.free(batch);
+    try t.expectError(error.MissingDependency, a.merge(gpa, batch));
+}

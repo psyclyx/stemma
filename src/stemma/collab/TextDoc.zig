@@ -548,6 +548,40 @@ pub fn openPartial(
     return doc;
 }
 
+/// Open a document whose entire initial content is a compacted base —
+/// the bulk-load path: O(content) with ZERO events, where recording a
+/// load as insert events costs one event per scalar. The synthetic
+/// base head is derived from the content hash, so replicas that load
+/// identical bytes independently share a history root (they can sync,
+/// and divergent checkouts of the same file adopt the same root by
+/// construction), while different contents can never be confused for
+/// the same base. Identity anchors into the base resolve as
+/// `error.Compacted`, like any compacted content.
+pub fn openFromContent(gpa: Allocator, content: []const u8) (Allocator.Error || error{Corrupt})!TextDoc {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    var name_buf: [5 + 32]u8 = undefined;
+    @memcpy(name_buf[0..5], "base-");
+    for (digest[0..16], 0..) |b, i| {
+        _ = std.fmt.bufPrint(name_buf[5 + i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    }
+    const name = name_buf[0..];
+
+    var token: std.ArrayList(u8) = .empty;
+    defer token.deinit(gpa);
+    try token.appendSlice(gpa, version_magic);
+    try putUv(gpa, &token, 1);
+    try putUv(gpa, &token, name.len);
+    try token.appendSlice(gpa, name);
+    try putUv(gpa, &token, 0); // the synthetic head: (name, seq 0)
+
+    return openPartial(gpa, token.items, &.{
+        .{ .name = name, .seq_base = 1 },
+    }, &.{
+        .{ .content = content },
+    });
+}
+
 /// Whether every byte of the base is realized. Always true for
 /// documents that never went through `openPartial`.
 pub fn baseRealized(self: *const TextDoc) bool {
