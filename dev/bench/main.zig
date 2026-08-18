@@ -317,6 +317,41 @@ fn benchCollab(io: Io, w: *Io.Writer) !void {
         }
         try report(w, "collab merge concurrent 1k+1k", &samples, 1024, "ns");
     }
+    // Sequential single-event merges into a doc that keeps growing —
+    // unlike the two blocks above (one cold merge into an empty/short
+    // doc), this is the shape a long-lived session actually sees: many
+    // small merges over a lifetime. The persisted walker cache (merge_walk)
+    // means each merge only replays events since the *previous* merge, not
+    // since genesis, so ns/op should stay flat as `growth` grows rather
+    // than climbing with document lifetime.
+    inline for (.{ 256, 2048 }) |growth| {
+        const merge_blocks = 3;
+        var samples: [merge_blocks]u64 = undefined;
+        var batches: [growth][]u8 = undefined;
+        {
+            var remote: TextDoc = .empty;
+            defer remote.deinit(gpa);
+            try remote.setAgent(gpa, "remote");
+            var prev_ver = try remote.version(gpa);
+            for (0..growth) |i| {
+                _ = try remote.insert(gpa, remote.text().byteLen(), if (i % 64 == 63) "\n" else "x");
+                batches[i] = try remote.eventsSince(gpa, prev_ver);
+                gpa.free(prev_ver);
+                prev_ver = try remote.version(gpa);
+            }
+            gpa.free(prev_ver);
+        }
+        defer for (batches) |b| gpa.free(b);
+        for (&samples) |*s| {
+            var host: TextDoc = .empty;
+            defer host.deinit(gpa);
+            var timer = Timer.start_(io);
+            for (batches) |b| gpa.free(try host.merge(gpa, b));
+            s.* = timer.lap();
+            std.mem.doNotOptimizeAway(host.text().byteLen());
+        }
+        try report(w, std.fmt.comptimePrint("collab merge growing x{d}", .{growth}), &samples, growth, "ns");
+    }
 }
 
 fn runSuite(comptime RopeT: type, io: Io, w: *Io.Writer, comptime prefix: []const u8, filter: ?[]const u8) !void {

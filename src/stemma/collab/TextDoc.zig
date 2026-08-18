@@ -97,16 +97,26 @@ pub const WireFormat = enum {
 
 /// Replay of the whole history against one shared `Sequence`: the
 /// eg-walker prepare/effect discipline (see sequence.zig for the ordering,
-/// causal.zig for the graph). Events before `first_new` replay silently;
+/// causal.zig for the graph). Events before `emit_from` replay silently;
 /// newer (untrusted) events emit transformed scalar edits and get
 /// error-checked positions instead of asserts.
+///
+/// Holds no reference to a `Graph` — every method takes `history`
+/// explicitly — so a `Replay` can be parked as a long-lived cache (see
+/// `TextDoc.merge_walk`) across calls without risking a dangling pointer
+/// if the owning `TextDoc` is copied or `history` is rebuilt by
+/// `compact`. `walked` is the exclusive upper bound of what's already
+/// folded into `s`/`item_of`/`target_of`: a resumed `replayAll` only
+/// walks `[walked, target)`, not from genesis every time.
 const Replay = struct {
-    history: *const Graph,
     s: Sequence = .empty,
     /// lv → arena of the item it inserted / deleted (retreat/advance).
     item_of: std.ArrayList(i32) = .empty,
     target_of: std.ArrayList(i32) = .empty,
     prep_frontier: std.ArrayList(Lv) = .empty,
+    walked: Lv = 0,
+
+    const empty: Replay = .{};
 
     const Names = struct {
         g: *const Graph,
@@ -118,10 +128,6 @@ const Replay = struct {
         }
     };
 
-    fn init(history: *const Graph) Replay {
-        return .{ .history = history };
-    }
-
     fn deinit(self: *Replay, gpa: Allocator) void {
         self.s.deinit(gpa);
         self.item_of.deinit(gpa);
@@ -129,24 +135,50 @@ const Replay = struct {
         self.prep_frontier.deinit(gpa);
     }
 
+    /// Discard all cached state (a resumed `replayAll` starts from
+    /// genesis again). Called wherever the `lv` space it was built
+    /// against stops being valid: a rejected merge (partial walk against
+    /// events `rollbackHistory` is about to erase) or `compact`
+    /// (renumbers everything).
+    fn reset(self: *Replay, gpa: Allocator) void {
+        self.deinit(gpa);
+        self.* = .empty;
+    }
+
+    /// Must precede any live item; only valid when the cache is fresh
+    /// (`walked == 0`), since the placeholders must sit first in `s`.
     fn initBase(self: *Replay, gpa: Allocator, count: usize) Allocator.Error!void {
         try self.s.initBase(gpa, count, base_lv);
     }
 
     const ReplayError = Allocator.Error || error{Corrupt};
 
-    fn replayAll(self: *Replay, gpa: Allocator, first_new: Lv, include: ?[]const bool, out: *std.ArrayList(ScalarEdit)) ReplayError!void {
-        const n = self.history.eventCount();
-        try self.item_of.appendNTimes(gpa, Sequence.none, n);
-        try self.target_of.appendNTimes(gpa, Sequence.none, n);
-        for (0..n) |lv_usize| {
-            const lv: Lv = @intCast(lv_usize);
-            if (include) |inc| if (!inc[lv_usize]) continue;
-            try self.movePrepareTo(gpa, self.history.parentsOf(lv));
-            const emit = lv >= first_new;
-            switch (self.history.opOf(lv)) {
+    /// Walk `[self.walked, target)` against `history`, advancing the
+    /// cache to `target`. `emit_from` (>= self.walked) gates which of
+    /// those events surface a `ScalarEdit` — events before it (already
+    /// applied to the document some other way, e.g. a local edit that
+    /// touched the rope directly, or a prior `replayAll` call) replay
+    /// for bookkeeping only.
+    fn replayAll(
+        self: *Replay,
+        gpa: Allocator,
+        history: *const Graph,
+        target: Lv,
+        emit_from: Lv,
+        include: ?[]const bool,
+        out: *std.ArrayList(ScalarEdit),
+    ) ReplayError!void {
+        const from = self.walked;
+        try self.item_of.appendNTimes(gpa, Sequence.none, target - from);
+        try self.target_of.appendNTimes(gpa, Sequence.none, target - from);
+        var lv = from;
+        while (lv < target) : (lv += 1) {
+            if (include) |inc| if (!inc[lv]) continue;
+            try self.movePrepareTo(gpa, history, history.parentsOf(lv));
+            const emit = lv >= emit_from;
+            switch (history.opOf(lv)) {
                 .ins => |ins| {
-                    const res = try self.s.applyInsert(gpa, Names{ .g = self.history }, lv, ins.pos, emit);
+                    const res = try self.s.applyInsert(gpa, Names{ .g = history }, lv, ins.pos, emit);
                     self.item_of.items[lv] = res.arena;
                     if (emit) try out.append(gpa, .{ .ins = .{ .pos = res.effect_pos, .ch = ins.ch } });
                 },
@@ -161,25 +193,26 @@ const Replay = struct {
             self.prep_frontier.clearRetainingCapacity();
             try self.prep_frontier.append(gpa, lv);
         }
+        self.walked = target;
     }
 
-    fn movePrepareTo(self: *Replay, gpa: Allocator, target: []const Lv) Allocator.Error!void {
+    fn movePrepareTo(self: *Replay, gpa: Allocator, history: *const Graph, target: []const Lv) Allocator.Error!void {
         if (std.mem.eql(Lv, self.prep_frontier.items, target)) return;
-        var d = try self.history.diff(gpa, self.prep_frontier.items, target);
+        var d = try history.diff(gpa, self.prep_frontier.items, target);
         defer d.deinit(gpa);
         // Retreat newest-first, advance oldest-first.
         var i = d.a_only.items.len;
         while (i > 0) {
             i -= 1;
-            self.toggle(d.a_only.items[i], false);
+            self.toggle(history, d.a_only.items[i], false);
         }
-        for (d.b_only.items) |lv| self.toggle(lv, true);
+        for (d.b_only.items) |lv| self.toggle(history, lv, true);
         self.prep_frontier.clearRetainingCapacity();
         try self.prep_frontier.appendSlice(gpa, target);
     }
 
-    fn toggle(self: *Replay, lv: Lv, on: bool) void {
-        switch (self.history.opOf(lv)) {
+    fn toggle(self: *Replay, history: *const Graph, lv: Lv, on: bool) void {
+        switch (history.opOf(lv)) {
             .ins => self.s.toggleInsert(self.item_of.items[lv], on),
             .del => self.s.toggleDelete(self.target_of.items[lv], on),
         }
@@ -205,6 +238,14 @@ base_head: ?EventId = null,
 /// fully realized (the only state most documents ever see).
 holes: std.ArrayList(BaseHole) = .empty,
 
+/// Persistent eg-walker cache for the live head: `merge` resumes it
+/// instead of replaying `history` from genesis every call, so cost
+/// tracks events since the last merge, not document lifetime. Reset
+/// (not incrementally repaired) whenever the `lv` space it was built
+/// against stops being valid: a rejected merge, or `compact` (which
+/// renumbers every retained event).
+merge_walk: Replay = .empty,
+
 /// An unrealized span of the compacted base. `base_offset` is the fetch
 /// key (byte offset in the pristine base — immutable); `cur_offset` is
 /// where the span currently sits in the rope (shifts under edits; hole
@@ -228,6 +269,7 @@ pub fn deinit(self: *TextDoc, gpa: Allocator) void {
     gpa.free(self.base_bytes);
     gpa.free(self.base_version);
     self.holes.deinit(gpa);
+    self.merge_walk.deinit(gpa);
     self.* = .{};
 }
 
@@ -636,12 +678,14 @@ pub fn materializeAt(self: *const TextDoc, gpa: Allocator, version_token: []cons
     defer d.deinit(gpa);
     for (d.a_only.items) |lv| include[lv] = true;
 
-    var w = Replay.init(&self.history);
+    var w: Replay = .empty;
     defer w.deinit(gpa);
     if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
     var sink: std.ArrayList(ScalarEdit) = .empty;
     defer sink.deinit(gpa);
-    w.replayAll(gpa, @intCast(n), include, &sink) catch |e| switch (e) {
+    // Its own scratch walker (not `merge_walk`): an arbitrary historical
+    // version has no relation to how much of the live head is cached.
+    w.replayAll(gpa, &self.history, @intCast(n), @intCast(n), include, &sink) catch |e| switch (e) {
         error.Corrupt => unreachable, // trusted local history
         else => |err| return err,
     };
@@ -749,9 +793,10 @@ pub fn resolveAnchors(
     const alive_before = try gpa.alloc(u64, w.s.items.items.len);
     defer gpa.free(alive_before);
     var count: u64 = 0;
-    for (w.s.seq.items) |arena| {
-        alive_before[arena] = count;
-        if (w.s.items.items[arena].effect_visible) count += 1;
+    var order = w.s.allIterator();
+    while (order.next()) |arena| {
+        alive_before[@intCast(arena)] = count;
+        if (w.s.items.items[@intCast(arena)].effect_visible) count += 1;
     }
 
     for (anchors, out) |a, *o| {
@@ -777,14 +822,19 @@ pub fn resolveAnchors(
     }
 }
 
-/// Full silent replay of the whole graph (current state).
+/// Full silent replay of the whole graph (current state). Its own
+/// scratch walker, not `merge_walk`: this takes `*const TextDoc` (called
+/// from anchor resolution, which makes no mutation promise to callers),
+/// so it can't share the mutable merge cache. Still O(history) per call
+/// — a candidate for the same caching `merge` got, left for later.
 fn silentReplay(self: *const TextDoc, gpa: Allocator) Allocator.Error!Replay {
-    var w = Replay.init(&self.history);
+    var w: Replay = .empty;
     errdefer w.deinit(gpa);
     if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
     var sink: std.ArrayList(ScalarEdit) = .empty;
     defer sink.deinit(gpa);
-    w.replayAll(gpa, @intCast(self.history.eventCount()), null, &sink) catch |e| switch (e) {
+    const n: Lv = @intCast(self.history.eventCount());
+    w.replayAll(gpa, &self.history, n, n, null, &sink) catch |e| switch (e) {
         error.Corrupt => unreachable, // trusted local history
         else => |err| return err,
     };
@@ -878,6 +928,10 @@ pub fn compact(self: *TextDoc, gpa: Allocator, stable_token: []const u8) Compact
     self.base_scalars = new_base_scalars;
     self.base_version = new_base_version;
     self.base_head = .{ .agent = self.history.findAgent(head_name).?, .seq = head_id.seq };
+    // Every retained event was just renumbered (`lv_map`); the cache's
+    // lv-indexed arrays point at the old space. Next merge rebuilds it
+    // against the new (smaller) base_scalars.
+    self.merge_walk.reset(gpa);
 }
 
 // ── Merge ───────────────────────────────────────────────────────────
@@ -1106,10 +1160,19 @@ fn historyPhase(
     }
     if (!any_new) return false;
 
-    var w = Replay.init(&self.history);
-    defer w.deinit(gpa);
-    if (self.base_scalars > 0) try w.initBase(gpa, self.base_scalars);
-    try w.replayAll(gpa, first_new, null, scalar_edits);
+    // The walker cache resumes from wherever the last successful merge
+    // (or, before that, initBase) left it — any local edits recorded
+    // since then replay silently alongside this batch's new events, in
+    // the same pass. A failure below (bad batch, OOM, a hole conflict)
+    // discards the cache rather than trying to unwind it: `s`'s FugueMax
+    // arena mutates existing entries' `pos_of` in place on insert, so a
+    // length-only rollback would leave it inconsistent. Rare path;
+    // the next successful merge just rebuilds from genesis once.
+    errdefer self.merge_walk.reset(gpa);
+    if (self.merge_walk.walked == 0 and self.base_scalars > 0) {
+        try self.merge_walk.initBase(gpa, self.base_scalars);
+    }
+    try self.merge_walk.replayAll(gpa, &self.history, @intCast(self.history.eventCount()), first_new, null, scalar_edits);
     // Edits landing inside unrealized base spans reject the whole batch
     // (graph rolls back): realize, then merge again.
     try self.checkHoleConflicts(gpa, scalar_edits.items);
