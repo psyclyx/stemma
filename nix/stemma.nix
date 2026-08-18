@@ -4,7 +4,7 @@
   zig_0_16,
   src ? ../.,
   pname ? "stemma",
-  version ? "0.0.0",
+  version ? "0.1.0",
   optimize ? "fast",
   cpu ? "baseline",
 }:

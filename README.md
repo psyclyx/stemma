@@ -5,17 +5,20 @@
 > 2. *(textual criticism)* a diagram showing the descent and relationships
 >    of the surviving manuscripts of a text.
 
-A library for the distributed, causal story of a text. The long-term shape is
-an event-graph CRDT library in the eg-walker family — a causal DAG of editing
-events, walked on demand to merge divergent histories, generic over
-materialized types — with text as the first and flagship materializer. Before
-CRDTs had the problem, scribes did: hand-copied manuscripts are distributed
-replicas diverging edit by edit, and reconstructing their descent is exactly
-the discipline this library is named for.
+An event-graph CRDT library in the eg-walker family (Gentle & Kleppmann,
+EuroSys 2025), built around an editor-grade text rope. The durable
+artifact is the causal event graph — the *stemma* of a document; the CRDT
+state is transient, rebuilt only while merging divergent histories. Text
+is the primary materializer, but the graph is generic over its operation
+payload.
 
-What ships today is the flagship's foundation: `Rope`, a persistent,
-snapshot-able UTF-8 text buffer built to be the fastest correct core for a
-text editor.
+The name is the discipline. Before CRDTs had the problem, scribes did:
+hand-copied manuscripts are distributed replicas diverging edit by edit,
+and reconstructing their descent is what a stemma records.
+
+Two layers, one flat API surface. `Rope` is usable on its own — the
+single-user path carries no collaboration state — and `TextDoc` /
+`ObjectDoc` add the causal graph on top of it.
 
 ## The rope
 
@@ -23,8 +26,8 @@ A B-tree of UTF-8 chunks whose nodes cache aggregate summaries (bytes /
 scalars / UTF-16 units / newlines), so metric queries and coordinate
 conversions — byte ⇄ point ⇄ UTF-16 ⇄ scalar — are one O(log n) descent.
 The design follows the structure shipping in Zed (SumTree), xi-rope, and
-Ropey, with three tradeoffs those implementations had to pick a side on
-dissolved instead:
+Ropey, with four tradeoffs those implementations had to pick a side on
+left open instead:
 
 - **In-place vs snapshots.** Nodes are refcounted: `snapshot()` is O(1)
   structural sharing, but an edit whose spine is uniquely owned mutates in
@@ -48,65 +51,83 @@ dissolved instead:
   of a 10 GB network file is arithmetic plus one window fetch. The rope
   itself does no I/O, ever.
 
-## Scope — decomplected on purpose
+## Scope
 
-**Owns:** the sequence (always valid UTF-8), metrics, coordinate conversion,
-O(1) snapshots, bidirectional chunk/scalar cursors, `split`/`append`, `eql`,
-a zero-copy `std.Io.Reader` adapter, and the `Edit` + `Anchor.shift`
-primitives that keep caller positions valid across edits.
+**The rope owns:** the sequence (always valid UTF-8), metrics, coordinate
+conversion, O(1) snapshots, bidirectional chunk/scalar cursors,
+`split`/`append`, `eql`, a zero-copy `std.Io.Reader` adapter, and the
+`Edit` + `Anchor.shift` primitives that keep caller positions valid across
+edits.
 
-**Leaves to the caller:** grapheme/word/display-column segmentation (the
-atomic unit is the Unicode scalar), cursors and selections as editor state (a
-slice of `Anchor`s you shift), undo/redo *policy* (compose it from snapshots
-and edits), files/mmap lifecycle, and syntax. Collaboration lives in the
-`graph` namespace — the event-graph engine, currently a design stub — so the
-single-user path pays zero collaboration tax.
+**Left to the caller:** grapheme/word/display-column segmentation (the
+atomic unit is the Unicode scalar), cursors and selections as editor state
+(a slice of `Anchor`s you shift), undo/redo *policy* (compose it from
+snapshots and edits), files/mmap lifecycle, syntax, transport, and
+presence. Collaboration is a distinct layer, so the single-user path pays
+no collaboration tax.
 
-Allocation is explicit and unmanaged: no type stores an allocator; the same
-allocator must serve a rope and everything derived from it, and must be
-thread-safe if snapshots cross threads.
+Allocation is explicit and unmanaged: no type stores an allocator; the
+same allocator must serve a rope and everything derived from it, and must
+be thread-safe if snapshots cross threads.
 
-## The graph layer
+## The collaboration layer
 
-`graph.TextDoc` is the collaboration surface: a rope plus the causal event
-graph that explains it. Local edits record causally-stamped events (no CRDT
-metadata on the document — the eg-walker model); `merge` integrates remote
-batches and returns the same byte-space `[]Edit` stream local edits produce,
-so `AnchorSet`s and cursors survive remote edits with zero extra machinery.
-Versions are opaque portable tokens; `eventsSince` is wire-ready and
-run-RLE encoded (a typing burst is one frame; `WireFormat.unit` serves
-pre-RLE decoders); `serialize`/`open` persist the graph (the document of
-record).
+Local edits record causally-stamped events; there is no CRDT metadata on
+the document itself (the eg-walker model). `merge` integrates a remote
+batch and returns the same byte-space `[]Edit` stream local edits produce,
+so `AnchorSet`s and cursors survive remote edits with no extra machinery.
+Two materializers share the graph, the wire format, and the sync protocol:
 
-Beyond the basics: **FugueMax ordering** (maximally non-interleaving in both
-directions — locked by block-contiguity tests before any replica ever
-shipped); **`materializeAt`** (time travel to any known version);
-**identity anchors** (portable name+seq positions for remote cursors that
-survive concurrent edits, batch-resolvable on any replica); **`compact`**
-(collapse all-peers-stable history into a frozen base — graph growth
-bounded by post-base activity, not document lifetime); **partial bases**
-(`openPartial`/`realizeBase` — a replica of a huge document fetches only
-the base spans it looks at, syncing and editing around the rest; merges
-into unfetched spans reject whole with `error.Unrealized`, realize-then-
-retry); and a **wasm32 target** (`zig build wasm`) so browser peers can
-speak the protocol.
+- **`TextDoc`** — a collaborative text document (a `Rope` plus its graph).
+- **`ObjectDoc`** — a collaborative JSON-shaped object tree: maps, lists,
+  inline scalars, and text nodes (each a full sequence CRDT with the same
+  ordering). Map reads return a deterministic winner plus the honest
+  multi-value conflict set — concurrent writes both survive, resolved by
+  caller policy.
+
+Both share:
+
+- **FugueMax ordering** — maximally non-interleaving concurrent insertions
+  in both directions, fixed by block-contiguity tests.
+- **Opaque portable versions** — `version` / `eventsSince` are wire-ready
+  and run-RLE encoded (a typing burst is one frame; `WireFormat.unit`
+  serves pre-RLE decoders). Replica-local identifiers never cross the wire.
+- **Persistence** — `serialize` / `open` store the event graph, which is
+  the document of record; the materialized value is derived from it.
+
+`TextDoc` additionally carries **`materializeAt`** (time travel to any
+known version), **identity anchors** (`anchorAt` / `resolveAnchors` —
+portable positions for remote cursors that survive concurrent edits),
+**`compact`** (collapse all-peers-stable history into a frozen base, so
+graph growth tracks post-base activity, not document lifetime), **partial
+bases** (`openPartial` / `realizeBase` — a replica of a huge document
+fetches only the base spans it touches; a merge into an unrealized span
+rejects whole with `error.Unrealized`, realize-then-retry), and a
+**wasm32 target** (`zig build wasm`) so browser peers speak the same
+protocol.
 
 Hostile input cannot crash a replica: malformed and malicious batches
-(including out-of-range positions) are rejected atomically, fuzz-gated.
-Convergence is oracle-tested: multi-peer seeded gossip, concurrent conflict
-shapes, batch splitting, fuzzed sessions — all replicas byte-identical,
-every merge's edit stream validated. Deferred to callers: transport,
-presence payloads, collaborative undo policy.
+(including out-of-range positions) are rejected atomically and leave the
+document untouched, fuzz-gated. Convergence is oracle-tested — multi-peer
+seeded gossip, concurrent conflict shapes, batch splitting, fuzzed
+sessions — with all replicas byte-identical and every merge's edit stream
+validated. Transport, presence payloads, and collaborative undo policy are
+the caller's.
+
+Not yet, and ledgered as such: compaction and identity anchors inside
+`ObjectDoc`, Peritext-style rich-text marks, and incremental persistence.
 
 ## Status
 
-Rope and graph layer implemented, tested, and benchmarked (see
-[BENCHMARKS.md](BENCHMARKS.md)). Headlines: ~20 ns/keystroke bare, ~56 ns
-through `TextDoc` (the collab tax is bookkeeping only), ~3 ns snapshots,
-27 GB/s chunk scans. v1 merges replay from genesis — correctness-first by
-design; the optimization ladder (run-RLE, LCA-bounded replay, B-tree walker
-state) is documented against baseline numbers and lands rung by rung with
-the convergence oracle as the gate.
+v0.1.0. The rope and both collaboration materializers are implemented,
+tested, and benchmarked (see [BENCHMARKS.md](BENCHMARKS.md)). Headlines on
+a Ryzen 9 5950X: ~20 ns/keystroke bare, ~60 ns through `TextDoc` (the
+collab tax is event bookkeeping, no CRDT work on the local path), ~2 ns
+snapshots, 27 GB/s chunk scans.
+
+Merges resume a persistent walker over an order-statistics sequence, so a
+sync costs O(log n) per event in the events since the last merge, not a
+replay from genesis. `compact` bounds it further for long-lived documents.
 
 ## Develop
 
@@ -114,7 +135,9 @@ the convergence oracle as the gate.
 direnv allow           # or: nix-shell
 zig build              # build the static library
 zig build test         # run the test suite
+zig build bench        # run the benchmarks (ReleaseFast)
+zig build wasm         # build the wasm32-wasi library
 ```
 
-The Zig toolchain (`zig_0_16`) comes from the npins-pinned nixpkgs, never the
-ambient `PATH`.
+The Zig toolchain (`zig_0_16`) comes from the npins-pinned nixpkgs, never
+the ambient `PATH`.

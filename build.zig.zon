@@ -1,6 +1,6 @@
 .{
     .name = .stemma,
-    .version = "0.0.0",
+    .version = "0.1.0",
     // Generated once by the Zig toolchain; never changes.
     .fingerprint = 0x963783a5a0ad8308,
     .minimum_zig_version = "0.16.0",
@@ -11,6 +11,7 @@
         "build.zig.zon",
         "src",
         "README.md",
+        "CHANGELOG.md",
         "LICENSE",
     },
 }
