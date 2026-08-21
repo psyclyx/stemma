@@ -26,6 +26,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // ── F3 validation sketch (exploratory, additive; app/weft's
+    // north-star-plan.md §5 F3) ──
+    // Deliberately its own module, NOT reachable from `stemma_mod`/root.zig:
+    // it validates parent-register + fractional-order-key structure before
+    // any client depends on it, consuming only causal.zig's EventGraph
+    // substrate. Wired into `zig build test` here so the gate is real
+    // without touching the public module graph.
+    const sketch_mod = b.createModule(.{
+        .root_source_file = b.path("src/stemma/collab/structure_sketch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sketch_tests = b.addTest(.{ .root_module = sketch_mod });
+    const run_sketch_tests = b.addRunArtifact(sketch_tests);
+    test_step.dependOn(&run_sketch_tests.step);
+
     // ── Benchmarks (always ReleaseFast: Debug numbers are lies) ──
     const bench_stemma = b.createModule(.{
         .root_source_file = b.path("src/stemma/root.zig"),
