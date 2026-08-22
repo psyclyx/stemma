@@ -45,7 +45,11 @@ const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
 const core = @import("core.zig");
-const Sequence = @import("Sequence.zig");
+const seq_walker = @import("SeqWalker.zig");
+// TextDoc's single sequence spans the WHOLE document and every event in
+// its graph is a sequence op — a dense array indexed by `lv` is a
+// perfect-fit O(1) slot per event (see `SeqWalker.Storage`).
+const SeqWalker = seq_walker.SeqWalker(.dense);
 const rope_mod = @import("../rope.zig");
 const geometry = @import("../geometry.zig");
 const wire = @import("wire.zig");
@@ -96,23 +100,21 @@ pub const WireFormat = enum {
 };
 
 /// Replay of the whole history against one shared `Sequence`: the
-/// eg-walker prepare/effect discipline (see sequence.zig for the ordering,
-/// causal.zig for the graph). Events before `emit_from` replay silently;
-/// newer (untrusted) events emit transformed scalar edits and get
-/// error-checked positions instead of asserts.
+/// eg-walker prepare/effect discipline (see `SeqWalker.zig` for the
+/// retreat/advance/apply mechanics this drives, `Sequence.zig` for the
+/// ordering, `causal.zig` for the graph). Events before `emit_from`
+/// replay silently; newer (untrusted) events emit transformed scalar
+/// edits and get error-checked positions instead of asserts.
 ///
 /// Holds no reference to a `Graph` — every method takes `history`
 /// explicitly — so a `Replay` can be parked as a long-lived cache (see
 /// `TextDoc.merge_walk`) across calls without risking a dangling pointer
 /// if the owning `TextDoc` is copied or `history` is rebuilt by
 /// `compact`. `walked` is the exclusive upper bound of what's already
-/// folded into `s`/`item_of`/`target_of`: a resumed `replayAll` only
-/// walks `[walked, target)`, not from genesis every time.
+/// folded into `sw`: a resumed `replayAll` only walks `[walked, target)`,
+/// not from genesis every time.
 const Replay = struct {
-    s: Sequence = .empty,
-    /// lv → arena of the item it inserted / deleted (retreat/advance).
-    item_of: std.ArrayList(i32) = .empty,
-    target_of: std.ArrayList(i32) = .empty,
+    sw: SeqWalker = .empty,
     prep_frontier: std.ArrayList(Lv) = .empty,
     walked: Lv = 0,
 
@@ -129,9 +131,7 @@ const Replay = struct {
     };
 
     fn deinit(self: *Replay, gpa: Allocator) void {
-        self.s.deinit(gpa);
-        self.item_of.deinit(gpa);
-        self.target_of.deinit(gpa);
+        self.sw.deinit(gpa);
         self.prep_frontier.deinit(gpa);
     }
 
@@ -146,9 +146,9 @@ const Replay = struct {
     }
 
     /// Must precede any live item; only valid when the cache is fresh
-    /// (`walked == 0`), since the placeholders must sit first in `s`.
+    /// (`walked == 0`), since the placeholders must sit first in `sw`.
     fn initBase(self: *Replay, gpa: Allocator, count: usize) Allocator.Error!void {
-        try self.s.initBase(gpa, count, base_lv);
+        try self.sw.initBase(gpa, count, base_lv);
     }
 
     const ReplayError = Allocator.Error || error{Corrupt};
@@ -168,23 +168,18 @@ const Replay = struct {
         include: ?[]const bool,
         out: *std.ArrayList(ScalarEdit),
     ) ReplayError!void {
-        const from = self.walked;
-        try self.item_of.appendNTimes(gpa, Sequence.none, target - from);
-        try self.target_of.appendNTimes(gpa, Sequence.none, target - from);
-        var lv = from;
+        var lv = self.walked;
         while (lv < target) : (lv += 1) {
             if (include) |inc| if (!inc[lv]) continue;
-            try self.movePrepareTo(gpa, history, history.parentsOf(lv));
+            try seq_walker.movePrepareTo(gpa, history, &self.prep_frontier, history.parentsOf(lv), self);
             const emit = lv >= emit_from;
             switch (history.opOf(lv)) {
                 .ins => |ins| {
-                    const res = try self.s.applyInsert(gpa, Names{ .g = history }, lv, ins.pos, emit);
-                    self.item_of.items[lv] = res.arena;
+                    const res = try self.sw.applyInsert(gpa, Names{ .g = history }, lv, ins.pos, emit);
                     if (emit) try out.append(gpa, .{ .ins = .{ .pos = res.effect_pos, .ch = ins.ch } });
                 },
                 .del => |pos| {
-                    const res = try self.s.applyDelete(pos, emit);
-                    self.target_of.items[lv] = res.arena;
+                    const res = try self.sw.applyDelete(gpa, lv, pos, emit);
                     if (emit) {
                         if (res.effect_pos) |p| try out.append(gpa, .{ .del = p });
                     }
@@ -196,25 +191,11 @@ const Replay = struct {
         self.walked = target;
     }
 
-    fn movePrepareTo(self: *Replay, gpa: Allocator, history: *const Graph, target: []const Lv) Allocator.Error!void {
-        if (std.mem.eql(Lv, self.prep_frontier.items, target)) return;
-        var d = try history.diff(gpa, self.prep_frontier.items, target);
-        defer d.deinit(gpa);
-        // Retreat newest-first, advance oldest-first.
-        var i = d.a_only.items.len;
-        while (i > 0) {
-            i -= 1;
-            self.toggle(history, d.a_only.items[i], false);
-        }
-        for (d.b_only.items) |lv| self.toggle(history, lv, true);
-        self.prep_frontier.clearRetainingCapacity();
-        try self.prep_frontier.appendSlice(gpa, target);
-    }
-
-    fn toggle(self: *Replay, history: *const Graph, lv: Lv, on: bool) void {
+    /// `SeqWalker.movePrepareTo`'s per-event callback.
+    pub fn toggle(self: *Replay, history: *const Graph, lv: Lv, on: bool) void {
         switch (history.opOf(lv)) {
-            .ins => self.s.toggleInsert(self.item_of.items[lv], on),
-            .del => self.s.toggleDelete(self.target_of.items[lv], on),
+            .ins => self.sw.toggleInsert(lv, on),
+            .del => self.sw.toggleDelete(lv, on),
         }
     }
 };
@@ -695,7 +676,7 @@ pub fn materializeAt(self: *const TextDoc, gpa: Allocator, version_token: []cons
     defer gpa.free(base_chars);
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
-    var it = w.s.aliveIterator();
+    var it = w.sw.s.aliveIterator();
     var buf: [4]u8 = undefined;
     while (it.next()) |alive| {
         const ch = if (alive.lv == base_lv)
@@ -760,7 +741,7 @@ pub fn anchorAt(
 
     var w = try self.silentReplay(gpa);
     defer w.deinit(gpa);
-    var it = w.s.aliveIterator();
+    var it = w.sw.s.aliveIterator();
     var i: usize = 0;
     while (it.next()) |alive| : (i += 1) {
         if (i == target_index) {
@@ -790,13 +771,13 @@ pub fn resolveAnchors(
     defer w.deinit(gpa);
 
     // One pass: per-arena count of alive items strictly before it.
-    const alive_before = try gpa.alloc(u64, w.s.items.items.len);
+    const alive_before = try gpa.alloc(u64, w.sw.s.items.items.len);
     defer gpa.free(alive_before);
     var count: u64 = 0;
-    var order = w.s.allIterator();
+    var order = w.sw.s.allIterator();
     while (order.next()) |arena| {
         alive_before[@intCast(arena)] = count;
-        if (w.s.items.items[@intCast(arena)].effect_visible) count += 1;
+        if (w.sw.s.items.items[@intCast(arena)].effect_visible) count += 1;
     }
 
     for (anchors, out) |a, *o| {
@@ -813,9 +794,10 @@ pub fn resolveAnchors(
             return if (self.history.isKnown(id)) error.Compacted else error.MissingDependency;
         };
         if (self.history.opOf(lv) != .ins) return error.Corrupt;
-        const arena = w.item_of.items[lv];
-        assert(arena != -1);
-        const item = &w.s.items.items[@intCast(arena)];
+        // `lv` was visited by the full silent replay above, so `arenaOf`
+        // is guaranteed populated — no separate liveness assert needed.
+        const arena = w.sw.arenaOf(lv);
+        const item = &w.sw.s.items.items[@intCast(arena)];
         var scalar = alive_before[@intCast(arena)];
         if (item.effect_visible and a.side == .after) scalar += 1;
         o.* = self.rope.scalarToOffset(scalar);

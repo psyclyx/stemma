@@ -16,6 +16,12 @@ const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
 const Sequence = @import("Sequence.zig");
+const seq_walker = @import("SeqWalker.zig");
+// Each object's SeqWalker sits over a `Lv` space shared with every other
+// object and every map register in the tree — a dense array would cost
+// memory proportional to the WHOLE document, once per object (see
+// `SeqWalker.Storage`).
+const SeqWalker = seq_walker.SeqWalker(.sparse);
 const Lv = causal.Lv;
 const EventId = causal.EventId;
 const none = Sequence.none;
@@ -95,12 +101,12 @@ pub const Walker = struct {
     graph: *const Graph,
     strings: []const u8,
 
-    /// Object-lv (or `root_key`) → sequence / register state.
-    seqs: std.AutoHashMapUnmanaged(Lv, Sequence) = .empty,
+    /// Object-lv (or `root_key`) → sequence / register state. Each
+    /// `SeqWalker` owns its own object's retreat/advance/apply
+    /// bookkeeping (see `SeqWalker.zig`) — the shared discipline `Walker`
+    /// also drives, per object, alongside the map-register logic below.
+    seqs: std.AutoHashMapUnmanaged(Lv, SeqWalker) = .empty,
     maps: std.AutoHashMapUnmanaged(Lv, MapReg) = .empty,
-    /// Sequence events (ins/del): arena index within their object's
-    /// sequence, for retreat/advance.
-    seq_slot_of: std.ArrayList(i32) = .empty,
     /// map_set events: index of their own RegItem within the key slot.
     reg_pos_of: std.ArrayList(i32) = .empty,
     /// Kill lists for map_set/map_del: spans into `kills_pool` of RegItem
@@ -132,7 +138,6 @@ pub const Walker = struct {
         var mit = self.maps.valueIterator();
         while (mit.next()) |m| m.deinit(gpa);
         self.maps.deinit(gpa);
-        self.seq_slot_of.deinit(gpa);
         self.reg_pos_of.deinit(gpa);
         self.kills_start.deinit(gpa);
         self.kills_len.deinit(gpa);
@@ -185,49 +190,31 @@ pub const Walker = struct {
     /// emit effects.
     pub fn replayAll(self: *Walker, gpa: Allocator, first_new: Lv, out: *std.ArrayList(Effect)) ReplayError!void {
         const n = self.graph.eventCount();
-        try self.seq_slot_of.appendNTimes(gpa, none, n);
         try self.reg_pos_of.appendNTimes(gpa, none, n);
         try self.kills_start.appendNTimes(gpa, 0, n);
         try self.kills_len.appendNTimes(gpa, 0, n);
         for (0..n) |lv_usize| {
             const lv: Lv = @intCast(lv_usize);
-            try self.movePrepareTo(gpa, self.graph.parentsOf(lv));
+            try seq_walker.movePrepareTo(gpa, self.graph, &self.prep_frontier, self.graph.parentsOf(lv), self);
             try self.apply(gpa, lv, lv >= first_new, out);
             self.prep_frontier.clearRetainingCapacity();
             try self.prep_frontier.append(gpa, lv);
         }
     }
 
-    fn movePrepareTo(self: *Walker, gpa: Allocator, target: []const Lv) Allocator.Error!void {
-        if (std.mem.eql(Lv, self.prep_frontier.items, target)) return;
-        var d = try self.graph.diff(gpa, self.prep_frontier.items, target);
-        defer d.deinit(gpa);
-        var i = d.a_only.items.len;
-        while (i > 0) {
-            i -= 1;
-            self.toggle(d.a_only.items[i], false);
-        }
-        for (d.b_only.items) |lv| self.toggle(lv, true);
-        self.prep_frontier.clearRetainingCapacity();
-        try self.prep_frontier.appendSlice(gpa, target);
-    }
-
-    /// Advance (`on = true`) or retreat an already-applied event's prepare
-    /// effect.
-    fn toggle(self: *Walker, lv: Lv, on: bool) void {
-        switch (self.graph.opOf(lv)) {
-            .list_ins, .text_ins => {
-                const s = self.seqs.getPtr(self.appliedSeqObj(lv)).?;
-                s.toggleInsert(self.seq_slot_of.items[lv], on);
-            },
-            .list_del, .text_del => {
-                const s = self.seqs.getPtr(self.appliedSeqObj(lv)).?;
-                s.toggleDelete(self.seq_slot_of.items[lv], on);
-            },
+    /// `SeqWalker.movePrepareTo`'s per-event callback: advance (`on =
+    /// true`) or retreat an already-applied event's prepare effect.
+    /// Sequence-shaped ops (list/text ins/del) delegate to the target
+    /// object's own `SeqWalker`; map ops are Walker's own (registers
+    /// aren't sequences, no `SeqWalker` involvement).
+    pub fn toggle(self: *Walker, history: *const Graph, lv: Lv, on: bool) void {
+        switch (history.opOf(lv)) {
+            .list_ins, .text_ins => self.seqs.getPtr(self.appliedSeqObj(lv)).?.toggleInsert(lv, on),
+            .list_del, .text_del => self.seqs.getPtr(self.appliedSeqObj(lv)).?.toggleDelete(lv, on),
             .map_set, .map_del => {
                 const info = self.appliedMapSlot(lv);
                 const slot = &self.maps.getPtr(info.obj).?.slots.items[info.slot];
-                if (self.graph.opOf(lv) == .map_set) {
+                if (history.opOf(lv) == .map_set) {
                     const rp = self.reg_pos_of.items[lv];
                     assert(rp != none);
                     slot.items.items[@intCast(rp)].prep_inserted = on;
@@ -273,7 +260,7 @@ pub const Walker = struct {
         unreachable;
     }
 
-    fn getSeq(self: *Walker, gpa: Allocator, obj: Lv) Allocator.Error!*Sequence {
+    fn getSeqWalker(self: *Walker, gpa: Allocator, obj: Lv) Allocator.Error!*SeqWalker {
         const gop = try self.seqs.getOrPut(gpa, obj);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         return gop.value_ptr;
@@ -316,36 +303,32 @@ pub const Walker = struct {
             },
             .list_ins => |l| {
                 const obj = try self.resolveObj(l.obj, lv, 1, emit);
-                const s = try self.getSeq(gpa, obj);
-                const res = try s.applyInsert(gpa, names, lv, l.pos, emit);
-                self.seq_slot_of.items[lv] = res.arena;
+                const sw = try self.getSeqWalker(gpa, obj);
+                const res = try sw.applyInsert(gpa, names, lv, l.pos, emit);
                 if (emit) {
                     try out.append(gpa, .{ .list_ins = .{ .obj = obj, .index = res.effect_pos, .lv = lv, .val = l.val } });
                 }
             },
             .list_del => |l| {
                 const obj = try self.resolveObj(l.obj, lv, 1, emit);
-                const s = try self.getSeq(gpa, obj);
-                const res = try s.applyDelete(l.pos, emit);
-                self.seq_slot_of.items[lv] = res.arena;
+                const sw = try self.getSeqWalker(gpa, obj);
+                const res = try sw.applyDelete(gpa, lv, l.pos, emit);
                 if (emit) {
                     if (res.effect_pos) |index| try out.append(gpa, .{ .list_del = .{ .obj = obj, .index = index } });
                 }
             },
             .text_ins => |x| {
                 const obj = try self.resolveObj(x.obj, lv, 2, emit);
-                const s = try self.getSeq(gpa, obj);
-                const res = try s.applyInsert(gpa, names, lv, x.pos, emit);
-                self.seq_slot_of.items[lv] = res.arena;
+                const sw = try self.getSeqWalker(gpa, obj);
+                const res = try sw.applyInsert(gpa, names, lv, x.pos, emit);
                 if (emit) {
                     try out.append(gpa, .{ .text_ins = .{ .obj = obj, .pos = res.effect_pos, .ch = x.ch } });
                 }
             },
             .text_del => |x| {
                 const obj = try self.resolveObj(x.obj, lv, 2, emit);
-                const s = try self.getSeq(gpa, obj);
-                const res = try s.applyDelete(x.pos, emit);
-                self.seq_slot_of.items[lv] = res.arena;
+                const sw = try self.getSeqWalker(gpa, obj);
+                const res = try sw.applyDelete(gpa, lv, x.pos, emit);
                 if (emit) {
                     if (res.effect_pos) |pos| try out.append(gpa, .{ .text_del = .{ .obj = obj, .pos = pos } });
                 }

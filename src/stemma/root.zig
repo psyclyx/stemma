@@ -71,6 +71,7 @@ test {
     _ = ObjectDoc;
     _ = @import("collab/core.zig");
     _ = @import("collab/Sequence.zig");
+    _ = @import("collab/SeqWalker.zig");
     _ = @import("collab/objects_state.zig");
     _ = @import("collab/wire.zig");
     _ = @import("rope_tests.zig");
