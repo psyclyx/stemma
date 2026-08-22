@@ -1105,6 +1105,366 @@ test "OOM: compaction paths are leak-free under every allocation failure" {
     try std.testing.checkAllAllocationFailures(t.allocator, compactOomScript, .{});
 }
 
+// ── W7-1: eventsBetween, bulk load, materializeAt ───────────────────────
+// `app/weft/doc/w7-rebase.md` §1/§4 — the four `Document`-consumed gaps
+// `stemma-unification.md` §4 risks 4/5 scoped OUT of the unification
+// deltas. This section closes the three that fit cleanly on the existing
+// compaction machinery (`base_version`/`text_bases`/`seq_base`); the
+// fourth (partial checkout) is reported as a design, not built here.
+
+test "wire compat: an ordinary uncompacted doc's serialize() bytes are byte-identical to before W7-1" {
+    // Locks the claim this whole section's doc comments make ("purely
+    // additive; no existing wire bytes change shape") against silent
+    // drift: none of `eventsBetween`/`openFromContent`/`materializeAt`
+    // touch `encodeEvents`/`Decoder` at all, so an everyday v1 doc (never
+    // compacted, never bulk-loaded) must still emit exactly what it did
+    // before this lane. Golden bytes captured from this exact sequence of
+    // ops at HEAD before W7-1 landed.
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+    _ = try d.mapSet(gpa, null, "title", .{ .str = "hello" });
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "hi");
+
+    const bytes = try d.serialize(gpa);
+    defer gpa.free(bytes);
+    const golden = [_]u8{
+        0x73, 0x74, 0x6a, 0x01, 0x01, 0x04, 0x73, 0x6f, 0x6c, 0x6f, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x05, 0x74, 0x69, 0x74, 0x6c, 0x65, 0x05, 0x05,
+        0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x62, 0x6f, 0x64, 0x79, 0x08, 0x00, 0x02, 0x01, 0x00, 0x01, 0x04,
+        0x01, 0x00, 0x01, 0x00, 0x68, 0x00, 0x03, 0x01, 0x00, 0x02, 0x04, 0x01,
+        0x00, 0x01, 0x01, 0x69,
+    };
+    try t.expectEqualSlices(u8, &golden, bytes);
+    // Also starts with `object_magic_v1` ("stj\x01") — never v2 — since
+    // this doc neither compacted nor bulk-loaded.
+    try t.expectEqualStrings("stj\x01", bytes[0..4]);
+}
+
+test "eventsBetween: bounded slice syncs a mirror to a past version" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+    _ = try d.mapSet(gpa, null, "title", .{ .str = "saved" });
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "saved state");
+    const saved = try d.version(gpa);
+    defer gpa.free(saved);
+    _ = try d.textInsert(gpa, body, d.ref(body).textRope().byteLen(), " and unsaved typing");
+
+    // Mirror follows to the saved point only.
+    var mirror: ObjectDoc = .empty;
+    defer mirror.deinit(gpa);
+    const mv = try mirror.version(gpa);
+    defer gpa.free(mv);
+    const slice = try d.eventsBetween(gpa, mv, saved);
+    defer gpa.free(slice);
+    gpa.free(try mirror.merge(gpa, slice));
+    const mirror_body = mirror.root().mapGet("body").?.objId().?;
+    const mirror_text = try bodyText(gpa, &mirror, mirror_body);
+    defer gpa.free(mirror_text);
+    try t.expectEqualStrings("saved state", mirror_text);
+
+    // Later: catch the mirror up from the saved point to head.
+    const mv2 = try mirror.version(gpa);
+    defer gpa.free(mv2);
+    const rest = try d.eventsSince(gpa, mv2);
+    defer gpa.free(rest);
+    gpa.free(try mirror.merge(gpa, rest));
+    try expectConverged(&[_]*ObjectDoc{ &d, &mirror });
+
+    // Unknown `to` entries are a hard error, not a guess.
+    var stranger: ObjectDoc = .empty;
+    defer stranger.deinit(gpa);
+    try stranger.setAgent(gpa, "stranger");
+    _ = try stranger.mapSet(gpa, null, "x", .{ .int = 1 });
+    const sv = try stranger.version(gpa);
+    defer gpa.free(sv);
+    try t.expectError(error.MissingDependency, d.eventsBetween(gpa, mv, sv));
+}
+
+test "eventsBetween: cross-check against eventsSince (from empty == eventsSince)" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+    _ = try d.mapSet(gpa, null, "title", .{ .str = "x" });
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "hello");
+
+    var empty: ObjectDoc = .empty;
+    defer empty.deinit(gpa);
+    const empty_v = try empty.version(gpa);
+    defer gpa.free(empty_v);
+    const head_v = try d.version(gpa);
+    defer gpa.free(head_v);
+
+    const via_between = try d.eventsBetween(gpa, empty_v, head_v);
+    defer gpa.free(via_between);
+    const via_since = try d.eventsSince(gpa, empty_v);
+    defer gpa.free(via_since);
+
+    var a: ObjectDoc = .empty;
+    defer a.deinit(gpa);
+    gpa.free(try a.merge(gpa, via_between));
+    var b: ObjectDoc = .empty;
+    defer b.deinit(gpa);
+    gpa.free(try b.merge(gpa, via_since));
+    try expectConverged(&[_]*ObjectDoc{ &a, &b, &d });
+}
+
+test "eventsBetween: `from` causally ahead of `to` yields an empty batch" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+    const early = try d.version(gpa);
+    defer gpa.free(early);
+    _ = try d.mapSet(gpa, null, "k", .{ .int = 1 });
+    const later = try d.version(gpa);
+    defer gpa.free(later);
+
+    // `from` = the current head, `to` = an earlier point: nothing new to
+    // report going "backwards".
+    const batch = try d.eventsBetween(gpa, later, early);
+    defer gpa.free(batch);
+    var mirror: ObjectDoc = .empty;
+    defer mirror.deinit(gpa);
+    gpa.free(try mirror.merge(gpa, batch));
+    try t.expectEqual(@as(usize, 0), mirror.history.eventCount());
+}
+
+test "eventsBetween: `from` naming an agent we've never heard of is ignored (lenient), not an error" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+    _ = try d.mapSet(gpa, null, "k", .{ .int = 1 });
+    const to = try d.version(gpa);
+    defer gpa.free(to);
+
+    var stranger: ObjectDoc = .empty;
+    defer stranger.deinit(gpa);
+    try stranger.setAgent(gpa, "stranger");
+    _ = try stranger.mapSet(gpa, null, "x", .{ .int = 9 });
+    const stranger_v = try stranger.version(gpa);
+    defer gpa.free(stranger_v);
+
+    // `d` has never heard of "stranger" — naming them in `from` (the
+    // lenient side) is silently ignored, unlike an unknown entry in `to`
+    // (the strict side, covered above), which is a hard error.
+    const batch = try d.eventsBetween(gpa, stranger_v, to);
+    defer gpa.free(batch);
+    var mirror: ObjectDoc = .empty;
+    defer mirror.deinit(gpa);
+    gpa.free(try mirror.merge(gpa, batch));
+    try expectConverged(&[_]*ObjectDoc{ &d, &mirror });
+}
+
+test "openFromContent: bulk load, shared root across independent loads" {
+    const gpa = t.allocator;
+    var a = try ObjectDoc.openFromContent(gpa, "the same big file contents\n", "body");
+    defer a.deinit(gpa);
+    var b = try ObjectDoc.openFromContent(gpa, "the same big file contents\n", "body");
+    defer b.deinit(gpa);
+    // ONE retained event (the `map_set` that creates the text object) —
+    // zero `text_ins` events regardless of content size.
+    try t.expectEqual(@as(usize, 1), a.history.eventCount());
+    const a_body = a.root().mapGet("body").?.objId().?;
+    const a_text = try bodyText(gpa, &a, a_body);
+    defer gpa.free(a_text);
+    try t.expectEqualStrings("the same big file contents\n", a_text);
+
+    // Independent loads of identical bytes share the history root: they
+    // sync as replicas of one document.
+    try a.setAgent(gpa, "alice");
+    try b.setAgent(gpa, "bob");
+    const b_body = b.root().mapGet("body").?.objId().?;
+    _ = try a.textInsert(gpa, a_body, 0, "A");
+    _ = try b.textInsert(gpa, b_body, b.ref(b_body).textRope().byteLen(), "B");
+    try syncBoth(gpa, &a, &b);
+    try expectConverged(&[_]*ObjectDoc{ &a, &b });
+
+    // Different contents produce different bases: never confusable.
+    var c = try ObjectDoc.openFromContent(gpa, "entirely different\n", "body");
+    defer c.deinit(gpa);
+    try c.setAgent(gpa, "carol");
+    const c_body = c.root().mapGet("body").?.objId().?;
+    _ = try c.textInsert(gpa, c_body, 0, "C");
+    const av = try a.version(gpa);
+    defer gpa.free(av);
+    const batch = try c.eventsSince(gpa, av);
+    defer gpa.free(batch);
+    try t.expectError(error.MissingDependency, a.merge(gpa, batch));
+}
+
+test "openFromContent: invalid UTF-8 is rejected" {
+    const gpa = t.allocator;
+    try t.expectError(error.Corrupt, ObjectDoc.openFromContent(gpa, "\xff\xfe", "body"));
+}
+
+test "openFromContent: same content under DIFFERENT keys mints DIFFERENT roots (never silently conflated)" {
+    const gpa = t.allocator;
+    // Same bytes, two different field names — a real shape (e.g. loading
+    // the same file as both a document's `body` and, elsewhere, its
+    // `preview`). If the synthetic agent name were content-only (ignoring
+    // `key`), both loads would mint the exact same `{base-<hash>, seq 0}`
+    // creation-event id carrying DIFFERENT `map_set` payloads, and the two
+    // docs would believe they were the same document at the same version
+    // (identical `base_version` tokens, an empty diff) while silently
+    // holding different keys. Folding `key` into the digest makes this a
+    // loud, honest `MissingDependency` instead of silent divergence.
+    var body_doc = try ObjectDoc.openFromContent(gpa, "shared bytes\n", "body");
+    defer body_doc.deinit(gpa);
+    var preview_doc = try ObjectDoc.openFromContent(gpa, "shared bytes\n", "preview");
+    defer preview_doc.deinit(gpa);
+
+    try t.expect(!std.mem.eql(u8, body_doc.base_version, preview_doc.base_version));
+    try t.expect(body_doc.root().mapGet("body") != null);
+    try t.expect(body_doc.root().mapGet("preview") == null);
+    try t.expect(preview_doc.root().mapGet("preview") != null);
+    try t.expect(preview_doc.root().mapGet("body") == null);
+
+    const bv = try body_doc.version(gpa);
+    defer gpa.free(bv);
+    const batch = try preview_doc.eventsSince(gpa, bv);
+    defer gpa.free(batch);
+    try t.expectError(error.MissingDependency, body_doc.merge(gpa, batch));
+}
+
+test "openFromContent: bulk load, then edit, sync, and compact — interplay with the existing compaction machinery" {
+    const gpa = t.allocator;
+    var founder = try ObjectDoc.openFromContent(gpa, "line one\nline two\n", "body");
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = founder.root().mapGet("body").?.objId().?;
+
+    var peer: ObjectDoc = .empty;
+    defer peer.deinit(gpa);
+    try peer.setAgent(gpa, "peer");
+    try syncOne(gpa, &founder, &peer); // peer bootstraps from founder's bulk-load base
+    const peer_body = peer.root().mapGet("body").?.objId().?;
+    _ = try peer.textInsert(gpa, peer_body, peer.ref(peer_body).textRope().byteLen(), "line three\n");
+    try syncOne(gpa, &peer, &founder);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &peer });
+
+    // Compact past the bulk-loaded base's own creation point AND the new
+    // edit — exercises `materializeTextBasesAt`'s progressive
+    // re-compaction (seeding from the EXISTING bulk-load base, not from
+    // scratch) on both replicas.
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    const before = try bodyText(gpa, &founder, body);
+    defer gpa.free(before);
+    try founder.compact(gpa, stable);
+    try peer.compact(gpa, stable);
+    const after = try bodyText(gpa, &founder, body);
+    defer gpa.free(after);
+    try t.expectEqualStrings(before, after);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &peer });
+
+    // Serialize/open round-trips a bulk-loaded-then-edited-then-compacted
+    // doc exactly like any other compacted doc.
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+    var reopened = try ObjectDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &reopened });
+
+    // Sync continues past the (now doubly-advanced) compaction point.
+    _ = try peer.textInsert(gpa, peer_body, 0, ">>> ");
+    try syncOne(gpa, &peer, &founder);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &peer });
+}
+
+test "materializeAt: time travel to any known version, scoped to one text object" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "author");
+    const v_empty = try d.version(gpa);
+    defer gpa.free(v_empty);
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+
+    _ = try d.textInsert(gpa, body, 0, "first draft \xf0\x9d\x84\x9e");
+    const v1 = try d.version(gpa);
+    defer gpa.free(v1);
+    const text_v1 = try bodyText(gpa, &d, body);
+    defer gpa.free(text_v1);
+
+    _ = try d.textDelete(gpa, body, .{ .start = 0, .end = 6 });
+    _ = try d.textInsert(gpa, body, 0, "FINAL");
+    const v2 = try d.version(gpa);
+    defer gpa.free(v2);
+
+    var at_v1 = try d.materializeAt(gpa, body, v1);
+    defer at_v1.deinit(gpa);
+    const got_v1 = try at_v1.toOwnedSlice(gpa);
+    defer gpa.free(got_v1);
+    try t.expectEqualStrings(text_v1, got_v1);
+
+    var at_v2 = try d.materializeAt(gpa, body, v2);
+    defer at_v2.deinit(gpa);
+    const got_v2 = try at_v2.toOwnedSlice(gpa);
+    defer gpa.free(got_v2);
+    const now = try bodyText(gpa, &d, body);
+    defer gpa.free(now);
+    try t.expectEqualStrings(now, got_v2);
+
+    // `body` did not exist yet at `v_empty` (its creating `map_set` comes
+    // right after) — a caller-contract violation, not a valid empty state.
+    try t.expectError(error.Corrupt, d.materializeAt(gpa, body, v_empty));
+
+    // A version we've never seen is a missing dependency.
+    const unknown = "stv\x01" ++ [_]u8{ 1, 5 } ++ "ghost" ++ [_]u8{9};
+    try t.expectError(error.MissingDependency, d.materializeAt(gpa, body, unknown));
+}
+
+test "materializeAt: agrees with what `compact` itself freezes into the base at the same point" {
+    const gpa = t.allocator;
+    // Two agents (founder creates, editor edits) — `compact`'s per-agent
+    // prefix invariant rejects a single agent that both creates a text
+    // object (excluded from `in_base`) and later edits it (included),
+    // same landmine the "compact: text history collapses..." battery
+    // above sidesteps the same way (see `compact`'s doc comment).
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+
+    var editor: ObjectDoc = .empty;
+    defer editor.deinit(gpa);
+    try editor.setAgent(gpa, "editor");
+    try syncOne(gpa, &founder, &editor);
+    const editor_body = editor.root().mapGet("body").?.objId().?;
+    _ = try editor.textInsert(gpa, editor_body, 0, "alpha beta");
+    try syncOne(gpa, &editor, &founder);
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+
+    // `materializeAt`'s independent live-graph replay...
+    var at_stable = try founder.materializeAt(gpa, body, stable);
+    defer at_stable.deinit(gpa);
+    const via_materialize = try at_stable.toOwnedSlice(gpa);
+    defer gpa.free(via_materialize);
+
+    // ...must agree with `compact`'s OWN materialization of the same
+    // point (`materializeTextBasesAt`, a related but separate code path)
+    // once `stable`'s own frontier event is folded into the base and no
+    // longer decodable as a version token at all.
+    _ = try editor.textInsert(gpa, editor_body, editor.ref(editor_body).textRope().byteLen(), " gamma");
+    try syncOne(gpa, &editor, &founder);
+    try founder.compact(gpa, stable);
+    const body_creation = founder.history.idOf(founder.history.lvOf(body).?);
+    const base = founder.text_bases.get(body_creation).?;
+    try t.expectEqualStrings(via_materialize, base.bytes);
+}
+
 // ── Structural ops (F3, delta 6 — the move op) ──────────────────────────
 // `stemma-unification.md` §3 step 5 — parent-register + fractional order
 // keys, ported from `structure_sketch.zig` and re-targeted at ObjectDoc's

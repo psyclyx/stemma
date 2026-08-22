@@ -65,11 +65,18 @@ const getBytes = wire.getBytes;
 const versionSingleEntry = core.versionSingleEntry;
 
 const object_magic_v1 = "stj\x01";
-/// v2: emitted only once this doc has compacted (`base_version.len > 0`).
-/// A doc that has never compacted always emits `object_magic_v1` bytes,
-/// byte-identical to pre-delta-2 output — old decoders (and every
-/// hand-written wire-byte test) keep working unchanged. See the "Wire
-/// format" section below for the exact v1/v2 layout diff.
+/// v2: emitted whenever `base_version.len > 0` — TWO producers, both
+/// meaning "this doc carries a compacted base": `compact` (delta 2) is
+/// the original one; `openFromContent`'s bulk load (W7-1) is the second,
+/// setting `base_version`/`text_bases` directly without ever calling
+/// `compact` itself (see `openFromContent`'s doc comment) — the wire
+/// doesn't distinguish "compacted via history" from "born compacted",
+/// only "has a base or not", so both route through the same v2 encoding
+/// unmodified. A doc that has neither compacted nor been bulk-loaded
+/// always emits `object_magic_v1` bytes, byte-identical to pre-delta-2
+/// output — old decoders (and every hand-written wire-byte test) keep
+/// working unchanged. See the "Wire format" section below for the exact
+/// v1/v2 layout diff.
 const object_magic_v2 = "stj\x02";
 const version_magic = core.version_magic;
 const no_node: u32 = std.math.maxInt(u32);
@@ -992,6 +999,34 @@ pub fn eventsSince(self: *const ObjectDoc, gpa: Allocator, remote_version: []con
     return self.encodeEvents(gpa, missing.items);
 }
 
+/// Wire-encode the events in `to_version`'s causal past that the holder
+/// of `from_version` lacks — `eventsSince` bounded above by `to` instead
+/// of the current head. Mirrors `TextDoc.eventsBetween` exactly (same
+/// contract, same `causal.diff` shape): the incremental-sync primitive
+/// for a consumer tracking a past state (persistence deltas, a
+/// saved-file mirror — `Document.zig`'s `peerSyncTo`, `w7-rebase.md` §1).
+/// Every entry of `to_version` must be stored here
+/// (`error.MissingDependency`); unknown `from` entries are ignored.
+pub fn eventsBetween(
+    self: *const ObjectDoc,
+    gpa: Allocator,
+    from_version: []const u8,
+    to_version: []const u8,
+) MergeError![]u8 {
+    var known: std.ArrayList(Lv) = .empty;
+    defer known.deinit(gpa);
+    self.decodeVersion(gpa, from_version, false, &known) catch |e| switch (e) {
+        error.MissingDependency => unreachable, // lenient mode
+        else => |err| return err,
+    };
+    var to_heads: std.ArrayList(Lv) = .empty;
+    defer to_heads.deinit(gpa);
+    try self.decodeVersion(gpa, to_version, true, &to_heads);
+    var d = try self.history.diff(gpa, to_heads.items, known.items);
+    defer d.deinit(gpa);
+    return self.encodeEvents(gpa, d.a_only.items);
+}
+
 pub fn serialize(self: *const ObjectDoc, gpa: Allocator) Allocator.Error![]u8 {
     var missing = try self.history.missingFrom(gpa, &.{});
     defer missing.deinit(gpa);
@@ -1003,6 +1038,108 @@ pub fn open(gpa: Allocator, bytes: []const u8) MergeError!ObjectDoc {
     errdefer doc.deinit(gpa);
     const changes = try doc.merge(gpa, bytes);
     gpa.free(changes);
+    return doc;
+}
+
+// ── Bulk load ──────────────────────────────────────────────────────
+// `w7-rebase.md` §1/§4 W7-1, `stemma-unification.md` §4 risk 4's sibling
+// gap: `TextDoc.openFromContent`'s bulk-load shape, generalized past "the
+// whole doc IS the text" (`ObjectDoc`'s root is always a map —
+// `ensureRoot` — so the degenerate one-text-node doc this builds is
+// `root.map -> key: text`, exactly the shape `stemma-unification.md`'s W7
+// study names as "text is a degenerate graph doc").
+
+/// Bulk-load `content` as a fresh document whose root map has exactly one
+/// key, `key`, holding a text object initialized to `content` — O(content)
+/// cost, ZERO `text_ins` events (a naive port would cost one event per
+/// scalar, `mapSet` + `textInsert` in a loop; a large file would be
+/// millions of events for zero reason). The text object's CREATION event
+/// (the `map_set` that mints it) is a real, retained event — unlike
+/// `TextDoc.openFromContent`'s fully synthetic base, `compact`'s own
+/// contract never folds away a creating `map_set` (object identity needs
+/// it to keep resolving — see `compact`'s doc comment) — so this
+/// reproduces EXACTLY the state `mapSet(root, key, .text)` followed by
+/// inserting `content` char-by-char and then `compact`ing to that one
+/// event would leave behind: the same `text_bases`/`base_version`/
+/// `base_head` shape `compact` already produces and the wire (v2,
+/// `object_magic_v2`) already carries, not a third base representation.
+///
+/// Independent loads of identical bytes UNDER THE SAME `key` mint the
+/// same synthetic agent name (content-AND-key-hash-derived — see below),
+/// so they share a document root and can sync as replicas of one
+/// document. `self.agent` is left unset, same as
+/// `open`/`TextDoc.openFromContent`: call `setAgent` before any local
+/// edit.
+///
+/// `key` is folded into the digest (length-prefixed, then `content`),
+/// NOT just `content` alone as `TextDoc.openFromContent` folds (`TextDoc`
+/// has no key — the whole doc IS the text, so content-only identity is
+/// already unambiguous there). For `ObjectDoc` it is NOT optional: two
+/// independent loads of identical `content` under DIFFERENT `key`s must
+/// mint DIFFERENT roots. If the digest ignored `key`, both loads would
+/// mint the SAME `{base-<hash>, seq 0}` creation event id carrying
+/// DIFFERENT `map_set` payloads (different key) — `historyPhase` dedups
+/// purely by id with no payload check, the two `base_version` tokens
+/// would be byte-identical (so the "same base" sync guard in `merge`
+/// passes), and `eventsSince` between them would emit zero events, so the
+/// two documents would silently believe they are the same doc at the
+/// same version while actually holding different keys — a probability-1
+/// deterministic divergence within the feature's own intended usage
+/// (loading the same bytes under two different field names), not the
+/// accepted 2^-64 SHA-256 collision posture `TextDoc.openFromContent`
+/// relies on for content-only identity. Folding `key` in makes
+/// same-content/different-key loads mint different roots, so any attempt
+/// to sync them is a loud, honest `error.MissingDependency` instead.
+pub fn openFromContent(gpa: Allocator, content: []const u8, key: []const u8) (Allocator.Error || error{Corrupt})!ObjectDoc {
+    if (!std.unicode.utf8ValidateSlice(content)) return error.Corrupt;
+    const scalars = std.unicode.utf8CountCodepoints(content) catch unreachable;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var key_len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &key_len_buf, key.len, .little);
+    hasher.update(&key_len_buf);
+    hasher.update(key);
+    hasher.update(content);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var name_buf: [5 + 32]u8 = undefined;
+    @memcpy(name_buf[0..5], "base-");
+    for (digest[0..16], 0..) |b, i| {
+        _ = std.fmt.bufPrint(name_buf[5 + i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    }
+    const name = name_buf[0..];
+
+    var doc: ObjectDoc = .empty;
+    errdefer doc.deinit(gpa);
+    const aid = try doc.history.registerAgent(gpa, name);
+
+    // One real, structural event — never a target of `compact`'s
+    // text-only folding (see the doc comment above) — mints the text
+    // object's identity. `self.agent` is set only for this one call.
+    doc.agent = aid;
+    const obj = (try doc.mapSet(gpa, null, key, .text)).?;
+    doc.agent = null;
+
+    // Seed the compacted base directly (block-scoped so the `errdefer`
+    // retires the instant ownership transfers into `text_bases` — a
+    // later failure below must not double-free it).
+    {
+        const bytes_owned = try gpa.dupe(u8, content);
+        errdefer gpa.free(bytes_owned);
+        try doc.text_bases.put(gpa, obj, .{ .bytes = bytes_owned, .scalars = scalars });
+    }
+    {
+        var rope = try Rope.fromSlice(gpa, content);
+        errdefer rope.deinit(gpa);
+        const node_idx = doc.resolveObjNode(obj);
+        doc.nodes.items[node_idx].text.rope = rope;
+    }
+
+    // The one retained event is the whole document's stable point — same
+    // doc-wide `base_version`/`base_head` shape `compact` leaves behind.
+    doc.base_version = try doc.version(gpa);
+    doc.base_head = doc.history.idOf(doc.history.lvOf(obj).?);
+
     return doc;
 }
 
@@ -1337,6 +1474,101 @@ pub fn resolveObjectAnchors(
     for (out) |*o| o.* = rope.scalarToOffset(o.*);
 }
 
+// ── Time travel ─────────────────────────────────────────────────────
+
+/// Materialize text object `obj`'s content as it was at `version_token`
+/// — the per-object analog of `TextDoc.materializeAt` (a graph doc has no
+/// single "the text" to time-travel through; `obj` names which text
+/// object — `w7-rebase.md` §1's `materializeAt` row / `Document.textAt`).
+/// `version_token` must be fully known to us, same contract as every
+/// other version token here (`error.MissingDependency` otherwise).
+/// `error.Corrupt` if `obj` had not yet been created as of that version
+/// — there is no "the text" to travel to before the object exists. This
+/// reuses `error.Corrupt` for a DIFFERENT meaning than its usual "the
+/// bytes/token are malformed" sense elsewhere in this file (matching the
+/// local convention `openPartial`/`realizeBase` already set for a
+/// similar "structurally valid but not applicable here" case) — the
+/// token itself is perfectly valid, it just names a point in this
+/// object's history that predates the object's own existence. Named here
+/// explicitly so a future caller does not read `error.Corrupt` as "bad
+/// wire bytes" and treat it as fatal-and-unexpected rather than a normal,
+/// checkable precondition failure.
+/// Returns a fresh Rope the caller owns. O(history) replay, reusing the
+/// exact same `Walker`/`text_bases` machinery `compact`'s own
+/// `materializeTextBasesAt` drives (this is that operation without the
+/// graph-rebuild commit, scoped to one object instead of every touched
+/// one).
+pub fn materializeAt(
+    self: *const ObjectDoc,
+    gpa: Allocator,
+    obj: ObjId,
+    version_token: []const u8,
+) MergeError!Rope {
+    var heads: std.ArrayList(Lv) = .empty;
+    defer heads.deinit(gpa);
+    try self.decodeVersion(gpa, version_token, true, &heads);
+
+    const n: Lv = @intCast(self.history.eventCount());
+    const include = try gpa.alloc(bool, n);
+    defer gpa.free(include);
+    @memset(include, false);
+    var d = try self.history.diff(gpa, heads.items, &.{});
+    defer d.deinit(gpa);
+    for (d.a_only.items) |lv| include[lv] = true;
+
+    const obj_lv = self.history.lvOf(obj).?;
+    if (!include[obj_lv]) return error.Corrupt; // not created yet at this version
+    assert(self.objKind(obj_lv) == .text);
+
+    var w = Walker.initWithBases(&self.history, self.strings.items, &self.text_bases);
+    defer w.deinit(gpa);
+    var sink: std.ArrayList(Effect) = .empty;
+    defer sink.deinit(gpa);
+    // Silent (first_new == n: nothing emits) and filtered to `include` —
+    // reconstructs `obj`'s state as of `version_token` without walking
+    // anything strictly after it. Same discipline as
+    // `materializeTextBasesAt`, scoped to one object via `w.seqs`.
+    w.replayAll(gpa, n, &sink, include) catch |e| switch (e) {
+        error.Corrupt => unreachable, // trusted local history
+        else => |err| return err,
+    };
+    assert(sink.items.len == 0);
+
+    const obj_id = self.history.idOf(obj_lv);
+    var sw: SeqWalker = if (w.seqs.fetchRemove(obj_lv)) |kv| kv.value else blk: {
+        // `obj` exists as of this version but nothing in `include` ever
+        // touched its sequence (e.g. an untouched compacted base, or a
+        // just-created empty text object): same fallback
+        // `silentObjectReplay` uses for the analogous current-version case.
+        var s: SeqWalker = .empty;
+        if (self.text_bases.get(obj_id)) |base| {
+            try s.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv);
+        }
+        break :blk s;
+    };
+    defer sw.deinit(gpa);
+
+    var base_chars: ?[]u21 = null;
+    defer if (base_chars) |bc| gpa.free(bc);
+    if (self.text_bases.get(obj_id)) |base| {
+        base_chars = try decodeUtf8Scalars(gpa, base.bytes);
+    }
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    var buf: [4]u8 = undefined;
+    var it = sw.s.aliveIterator();
+    while (it.next()) |alive| {
+        const ch = if (alive.lv == seq_walker.base_placeholder_lv)
+            base_chars.?[alive.arena]
+        else
+            self.history.opOf(alive.lv).text_ins.ch;
+        const len = std.unicode.utf8Encode(ch, &buf) catch unreachable;
+        try bytes.appendSlice(gpa, buf[0..len]);
+    }
+    return Rope.fromSlice(gpa, bytes.items);
+}
+
 // ── Compaction (text-object compaction — the W7 shape) ───────────────
 // delta 2, `stemma-unification.md` §3 step 4. WHOLE-DOC, ONE linearization
 // point — the exact TextDoc.compact shape (`heads.len == 1`, everything
@@ -1451,6 +1683,15 @@ pub fn resolveObjectAnchors(
 // object, sharing `causal.compactGraph`'s graph-rebuild and
 // `SeqWalker.initBase`/`base_placeholder_lv`'s base-placeholder
 // mechanism — the generalization this step is chartered to prove out.
+
+/// One concrete instance of the per-agent-prefix guard above, worth
+/// naming plainly: a SINGLE agent that both creates a text object AND
+/// later edits it, with that edit in the causal past of `stable_token`,
+/// is `error.NotCompactable` (creating `map_set` excluded from `in_base`,
+/// editing `text_ins` included, on the same agent's timeline → not a
+/// prefix). `object_tests.zig`'s compaction battery always splits
+/// "founder creates" from "a different agent edits" for exactly this
+/// reason — not stylistic, load-bearing.
 pub fn compact(self: *ObjectDoc, gpa: Allocator, stable_token: []const u8) CompactError!void {
     var heads: std.ArrayList(Lv) = .empty;
     defer heads.deinit(gpa);
@@ -1907,7 +2148,8 @@ fn internVal(self: *ObjectDoc, gpa: Allocator, v: Decoder.RawVal) Allocator.Erro
 // uv event_count, per event: uv agent_idx, uv seq, uv parent_count,
 // parents (uv agent_idx, uv seq); u8 op tag; obj ref (u8 0 = root,
 // 1 + uv agent_idx + uv seq); op-specific fields. Ints are zigzag'd.
-// v2 "stj" 0x02 (emitted only once compacted — see `object_magic_v2`):
+// v2 "stj" 0x02 (emitted whenever `base_version.len > 0` — via `compact`
+// OR via `openFromContent`'s bulk load, see `object_magic_v2`):
 //   uv agent_count, per agent: uv name_len, name, uv seq_base   (v1 +
 //     seq_base per agent; 0 for an agent with nothing compacted)
 //   uv base_version_len, base_version bytes                     (a
