@@ -47,6 +47,15 @@ const ValPayload = jw.ValPayload;
 const Str = jw.Str;
 const Effect = jw.Effect;
 const SeqWalker = jw.SeqWalker;
+/// Where a structural node's parent register can point (F3, delta 6): the
+/// two permanent roots, or another structural node by portable identity.
+/// See `structCreate`/`structMove`/`structParent`.
+pub const StructRef = jw.StructRef;
+/// Byte-string fractional order-key midpoint — see `structCreate`'s doc
+/// comment for the sibling-ordering contract (`structChildren`'s sort
+/// key) and `structure_sketch.zig`'s module doc for the full growth-bound
+/// discussion this port carries unchanged.
+pub const orderKeyBetween = jw.between;
 const Rope = rope_mod.Rope;
 const Range = geometry.Range;
 const Edit = geometry.Edit;
@@ -65,6 +74,17 @@ const object_magic_v2 = "stj\x02";
 const version_magic = core.version_magic;
 const no_node: u32 = std.math.maxInt(u32);
 const root_key = Walker.root_key;
+/// Wire cap on a structural order key's byte length (`Decoder`'s
+/// `getBytes(&cur, max_order_key_len)` for `struct_create`/`struct_move`)
+/// — asserted at the ORIGINATING end too (`structCreate`/`structMove`),
+/// so a key can never be written that this same decoder couldn't read
+/// back. Not expected to bind in practice: `orderKeyBetween`'s growth is
+/// ~N/8 bytes even under the adversarial same-gap pattern (see its doc
+/// comment) — a key anywhere near this cap is a sign the periodic
+/// sibling-key rebalancing named as owed (F3 caveat 2, `compact`'s doc
+/// comment on structural ops) is overdue, not a case this wire format
+/// tries to accommodate unbounded.
+const max_order_key_len: usize = 4096;
 
 const ObjectDoc = @This();
 /// Input values for local edits.
@@ -90,6 +110,12 @@ pub const Change = union(enum) {
     list_del: struct { obj: ObjId, index: usize },
     /// Byte-space edit within a text object; shift that object's anchors.
     text: struct { obj: ObjId, edit: Edit },
+    /// A structural node's effective parent, or its cycle-break status,
+    /// may have changed — re-read via `structParent`/`structCycleBroken`/
+    /// `structConflictCount` (F3, delta 6). See `structParent`'s doc
+    /// comment for the landmine: this is a DIFFERENT conflict-resolution
+    /// rule than the plain `map` case above.
+    structure: struct { node: ObjId },
 };
 
 history: Graph = .empty,
@@ -126,7 +152,51 @@ base_head: ?EventId = null,
 /// comment).
 text_bases: jw.TextBaseMap = .empty,
 
+/// Structural parent-register placements (F3, delta 6): a node's
+/// PORTABLE creation identity → its currently RESOLVED (effective)
+/// placement. Populated by `structCreate`/`structMove` (local, always
+/// single-writer — see `wouldCycleLocal`) and by `merge`'s
+/// `.struct_parent` effect handler (remote, via `Walker`'s GLOBAL
+/// Lamport-canonical resolution — see `objects_state.Walker.resolveStructs`
+/// and, at this API boundary, `structParent`'s doc comment for how its
+/// winner rule differs from `mapGet`'s). `EventId`-keyed like
+/// `obj_index`/`text_bases` — stable across `compact` (structural ops
+/// currently refuse compaction outright, see `compact`'s doc comment, so
+/// this is defense-in-depth rather than load-bearing today).
+struct_parents: std.AutoHashMapUnmanaged(EventId, StructPlacement) = .empty,
+
 pub const empty: ObjectDoc = .{};
+
+/// Walker-effect-space-adjacent, but keyed by portable `EventId` (this is
+/// ObjectDoc's OWN materialized copy, not Walker's transient Lv-keyed
+/// state).
+const StructPlacementRef = union(enum) { root, trash, node: EventId };
+const StructPlacement = struct {
+    parent: StructPlacementRef,
+    order_key: Str,
+    key_writer: EventId,
+    conflict_count: u32,
+    cycle_broken: bool,
+};
+
+fn toPlacementRef(r: StructRef) StructPlacementRef {
+    return switch (r) {
+        .root => .root,
+        .trash => .trash,
+        .node => |id| .{ .node = id },
+    };
+}
+
+fn structRefEql(a: StructPlacementRef, b: StructPlacementRef) bool {
+    return switch (a) {
+        .root => b == .root,
+        .trash => b == .trash,
+        .node => |na| switch (b) {
+            .node => |nb| std.meta.eql(na, nb),
+            else => false,
+        },
+    };
+}
 
 pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency };
 pub const CompactError = MergeError || error{NotCompactable};
@@ -181,6 +251,7 @@ pub fn deinit(self: *ObjectDoc, gpa: Allocator) void {
     var bit = self.text_bases.valueIterator();
     while (bit.next()) |b| gpa.free(b.bytes);
     self.text_bases.deinit(gpa);
+    self.struct_parents.deinit(gpa);
     self.* = .{};
 }
 
@@ -408,6 +479,255 @@ pub fn textDelete(self: *ObjectDoc, gpa: Allocator, obj: ObjId, range: Range) Al
     return edit;
 }
 
+// ── Structural editing (F3, delta 6 — the move op) ────────────────────
+// `stemma-unification.md` §3 step 5, ported from `structure_sketch.zig`.
+// A structural node's identity is its `struct_create` event, exactly like
+// every other object kind; it ALSO behaves as an ordinary map object (see
+// `objects_state.Walker.resolveObj`'s `.struct_create` case), so
+// `mapSet`/`mapGet`/etc against a structural node's `ObjId` work
+// unmodified — this facility is purely about WHERE the node sits in a
+// separate, reparentable tree (parent + fractional order key), never
+// about its own properties. Lists remain the right shape for leaf
+// sequences that never reparent (F3's rationale) — do not use these ops
+// to reorder ordinary list elements.
+//
+// Local edits below are always single-writer (no concurrent sibling can
+// exist yet, since a local write's causal parents are the current
+// frontier — see `EventGraph.addLocal`), so `wouldCycleLocal` is the only
+// check needed here; a REMOTE batch's concurrent/conflicting writes are
+// resolved by `objects_state.Walker`'s global Lamport-canonical replay
+// during `merge` (see `structParent`'s doc comment for how that rule
+// differs from `mapGet`'s).
+
+/// Would giving `node` the parent `parent` make `node` its own ancestor,
+/// given the CURRENTLY materialized structural state? Mirrors
+/// `objects_state.Walker.wouldCycleStruct`/`structure_sketch.zig:
+/// wouldCycle`, operating on `self.struct_parents` (portable
+/// `EventId`-keyed) instead of a Walker's transient Lv-keyed state — the
+/// two must stay behaviorally identical, or a local edit's immediately
+/// materialized view could diverge from what a later `merge`'s full
+/// replay reconstructs from the same history.
+fn wouldCycleLocal(self: *const ObjectDoc, node: ObjId, parent: StructRef) bool {
+    if (parent != .node) return false;
+    var cur = parent.node;
+    if (std.meta.eql(cur, node)) return true;
+    var guard: usize = 0;
+    while (true) {
+        guard += 1;
+        assert(guard <= self.struct_parents.count() + 2);
+        const st = self.struct_parents.get(cur) orelse return false;
+        switch (st.parent) {
+            .root, .trash => return false,
+            .node => |next| {
+                if (std.meta.eql(next, node)) return true;
+                cur = next;
+            },
+        }
+    }
+}
+
+/// Create a new structural node under `parent`, at `order_key` among its
+/// siblings (see `orderKeyBetween`). Returns the new node's id — also
+/// usable immediately with `mapSet`/`mapGet` (see the section doc
+/// comment). This write can never be cycle-rejected: a brand-new node
+/// cannot already be anyone's ancestor.
+///
+/// `error.OrderKeyTooLong` if `order_key.len > max_order_key_len`: this is
+/// DATA-DRIVEN (order-key growth is ~N/8 bytes under adversarial
+/// same-locus reordering — `orderKeyBetween`'s doc comment — and periodic
+/// sibling-key rebalancing isn't implemented yet, see `compact`'s doc
+/// comment on structural ops), not a caller-contract bug, so it is a
+/// real error a caller must be able to handle, in every build mode — NOT
+/// an `assert` (which compiles out in `ReleaseFast`/`ReleaseSmall`,
+/// which would silently reopen the exact un-round-trippable hole
+/// `max_order_key_len`'s doc comment promises is closed).
+pub fn structCreate(self: *ObjectDoc, gpa: Allocator, parent: StructRef, order_key: []const u8) (Allocator.Error || error{OrderKeyTooLong})!ObjId {
+    if (order_key.len > max_order_key_len) return error.OrderKeyTooLong;
+    const agent = self.agent.?;
+    try self.ensureRoot(gpa);
+    const key_str = try self.intern(gpa, order_key);
+    const lv = try self.history.addLocal(gpa, agent, .{ .struct_create = .{ .parent = parent, .order_key = key_str } });
+    try self.ensureNodeMap(gpa);
+    _ = try self.makeValueNode(gpa, .new_map, lv);
+    const id = self.history.idOf(lv);
+    try self.struct_parents.put(gpa, id, .{
+        .parent = toPlacementRef(parent),
+        .order_key = key_str,
+        .key_writer = id,
+        .conflict_count = 1,
+        .cycle_broken = false,
+    });
+    return id;
+}
+
+/// Identity-preserving move: one parent-register write against an
+/// existing structural node. If this write would make `node` its own
+/// ancestor, it is deterministically NOT applied to the materialized
+/// tree (the event is still recorded — never un-appended, matching the
+/// CRDT's no-true-deletes discipline — but `node`'s EFFECTIVE PARENT is
+/// unchanged); a later `merge`'s full-history replay reconstructs the
+/// identical outcome (see `wouldCycleLocal`'s doc comment), so the
+/// EFFECTIVE PARENT this diverges from what a fresh replica opening the
+/// same bytes would see. INVARIANT `struct_parents` must uphold even on
+/// this refusal path: the stored entry must always equal the canonical
+/// resolution of the CURRENT (post-append) history — not just "the
+/// currently-accepted parent" — because `structConflictCount`/
+/// `structCycleBroken` are documented as reporting THAT resolution. See
+/// the refusal branch below for why the conflict metadata (not the
+/// parent) still changes.
+///
+/// `error.OrderKeyTooLong` if `order_key.len > max_order_key_len` — see
+/// `structCreate`'s doc comment for why this is a real, data-driven
+/// error rather than an `assert`.
+pub fn structMove(self: *ObjectDoc, gpa: Allocator, node: ObjId, parent: StructRef, order_key: []const u8) (Allocator.Error || error{OrderKeyTooLong})!void {
+    if (order_key.len > max_order_key_len) return error.OrderKeyTooLong;
+    const agent = self.agent.?;
+    const key_str = try self.intern(gpa, order_key);
+    const lv = try self.history.addLocal(gpa, agent, .{ .struct_move = .{ .node = node, .parent = parent, .order_key = key_str } });
+    const id = self.history.idOf(lv);
+    if (self.wouldCycleLocal(node, parent)) {
+        // Refused: the EFFECTIVE parent doesn't change. But this write's
+        // causal parents are the CURRENT frontier (`addLocal`), which
+        // causally dominates every write this replica has ever seen —
+        // so it supersedes every prior write to `node`'s register in the
+        // canonical-order sense, exactly like
+        // `objects_state.Walker.resolveStructs`'s `conflict_live`
+        // bookkeeping (superseded entries are dropped WHETHER OR NOT the
+        // superseding write itself goes on to be accepted). The
+        // antichain therefore collapses to exactly {this refused write}
+        // — size 1 — and the winner (whatever `node` already resolved to)
+        // sits OUTSIDE it: `conflict_count = 1`, `cycle_broken = true`.
+        // Leaving the old (pre-this-write) metadata in place here would
+        // make this replica's OWN accessors disagree with what its own
+        // history canonically resolves to — and nothing else ever
+        // corrects it (`merge`'s `emitStructEffects` only emits an
+        // effect when a FRESH before/after diff differs; a diff against
+        // itself never does), so the divergence would be permanent, not
+        // just transient.
+        if (self.struct_parents.getPtr(node)) |cur| {
+            cur.conflict_count = 1;
+            cur.cycle_broken = true;
+        }
+        return;
+    }
+    try self.struct_parents.put(gpa, node, .{
+        .parent = toPlacementRef(parent),
+        .order_key = key_str,
+        .key_writer = id,
+        .conflict_count = 1,
+        .cycle_broken = false,
+    });
+}
+
+/// Sugar: move to `.trash` — "trash is another parent" (F3). Not
+/// recursive: `node`'s children keep pointing at it; they simply become
+/// unreachable from `.root` until `node` (with its whole subtree,
+/// including any structural edits made to it while hidden) is moved back
+/// out. See `structChildren(.trash)` / `structParent` to inspect trashed
+/// nodes.
+pub fn structDelete(self: *ObjectDoc, gpa: Allocator, node: ObjId) Allocator.Error!void {
+    // The empty order key can never trip `error.OrderKeyTooLong` (`0 <=
+    // max_order_key_len` always) — narrow back to `Allocator.Error` so
+    // `structDelete`'s own callers don't have to handle an error that is
+    // structurally unreachable for them, rather than widening this
+    // signature to match `structMove`'s.
+    self.structMove(gpa, node, .trash, &.{}) catch |err| switch (err) {
+        error.OrderKeyTooLong => unreachable,
+        else => |e| return e,
+    };
+}
+
+// ── Structural reads ───────────────────────────────────────────────────
+
+/// The effective parent of `node`'s parent register (F3, delta 6).
+///
+/// LANDMINE (`stemma-unification.md` §4.1 risk 1): this winner is picked
+/// by a DIFFERENT rule than `ValueRef.mapGet`'s. `mapGet` picks the
+/// greatest `(agent name, seq)` among the causally-maximal antichain — a
+/// purely LOCAL, per-key rule that never needs to look outside one
+/// register. A structural node's parent-register winner instead needs a
+/// GLOBAL, replica-portable Lamport-then-(agent name, seq) canonical
+/// order over EVERY structural write in the document, replayed once with
+/// per-write cycle rejection — cross-node cycles (A moves under B while B
+/// concurrently moves under A) cannot be resolved one register at a time.
+/// In the common case this still lands on a causally-maximal
+/// conflict-set member (see `structConflictCount`) — but when every
+/// causally-dominant write to a node's register would cycle, the
+/// effective winner falls back to an EARLIER, already-superseded write
+/// (in the limit, the node's own `structCreate`) that sits OUTSIDE the
+/// reported conflict set entirely. `structCycleBroken` reports exactly
+/// this case. Never assume "greatest antichain member" for a structural
+/// parent the way it is safe to for a map key — a structural editor or
+/// projection surfacing "why is this node here" MUST check
+/// `structCycleBroken` before explaining the placement as "the newest
+/// concurrent write."
+pub fn structParent(self: *const ObjectDoc, node: ObjId) ?StructRef {
+    const p = self.struct_parents.get(node) orelse return null;
+    return switch (p.parent) {
+        .root => .root,
+        .trash => .trash,
+        .node => |id| .{ .node = id },
+    };
+}
+
+/// Size of `node`'s parent-register conflict set (concurrent writes still
+/// causally-maximal) — same shape as `ValueRef.mapConflictCount`. See
+/// `structParent`'s doc comment: unlike a map key, the EFFECTIVE winner
+/// can sit outside this set (`structCycleBroken`).
+pub fn structConflictCount(self: *const ObjectDoc, node: ObjId) usize {
+    const p = self.struct_parents.get(node) orelse return 0;
+    return p.conflict_count;
+}
+
+/// True iff `node`'s effective parent (`structParent`) is NOT a member of
+/// its own reported conflict set (`structConflictCount`) — the
+/// cycle-break survivor case named in `structParent`'s doc comment. This
+/// is the minimal honest query a projection needs to surface "a cycle
+/// was broken, this node landed at a non-obvious parent" rather than
+/// silently presenting the fallback parent as an ordinary uncontested
+/// write.
+pub fn structCycleBroken(self: *const ObjectDoc, node: ObjId) bool {
+    const p = self.struct_parents.get(node) orelse return false;
+    return p.cycle_broken;
+}
+
+/// `node`'s current order-key bytes (see `orderKeyBetween`) — the sort
+/// key `structChildren` uses among siblings. Borrowed (valid for the
+/// doc's lifetime, like `ValueRef.asStr`).
+pub fn structOrderKey(self: *const ObjectDoc, node: ObjId) ?[]const u8 {
+    const p = self.struct_parents.get(node) orelse return null;
+    return self.str(p.order_key);
+}
+
+/// Children of `parent`, sorted by order key then authoring identity
+/// (the tiebreak `orderKeyBetween`'s doc comment names — two replicas
+/// computing the identical midpoint independently). Caller owns.
+pub fn structChildren(self: *const ObjectDoc, gpa: Allocator, parent: StructRef) Allocator.Error![]ObjId {
+    var out: std.ArrayList(ObjId) = .empty;
+    errdefer out.deinit(gpa);
+    const want = toPlacementRef(parent);
+    var it = self.struct_parents.iterator();
+    while (it.next()) |kv| {
+        if (structRefEql(kv.value_ptr.parent, want)) try out.append(gpa, kv.key_ptr.*);
+    }
+    const SortCtx = struct {
+        doc: *const ObjectDoc,
+        fn less(ctx: @This(), a: EventId, b: EventId) bool {
+            const sa = ctx.doc.struct_parents.get(a).?;
+            const sb = ctx.doc.struct_parents.get(b).?;
+            const order = std.mem.order(u8, ctx.doc.str(sa.order_key), ctx.doc.str(sb.order_key));
+            if (order != .eq) return order == .lt;
+            const na = ctx.doc.history.agentName(sa.key_writer.agent);
+            const nb = ctx.doc.history.agentName(sb.key_writer.agent);
+            const name_order = std.mem.order(u8, na, nb);
+            if (name_order != .eq) return name_order == .lt;
+            return sa.key_writer.seq < sb.key_writer.seq;
+        }
+    };
+    std.mem.sort(EventId, out.items, SortCtx{ .doc = self }, SortCtx.less);
+    return out.toOwnedSlice(gpa);
+}
+
 // ── Reads ───────────────────────────────────────────────────────────
 
 pub fn root(self: *const ObjectDoc) ValueRef {
@@ -559,7 +879,12 @@ fn setOrder(self: *const ObjectDoc, a: EventId, b: EventId) std.math.Order {
 
 /// Canonical JSON dump (winner-only, keys sorted, text objects as
 /// strings). Caller owns. Conflicts are invisible here — inspect them
-/// via `mapConflictCount`.
+/// via `mapConflictCount`. The structural tree (F3, delta 6) is ALSO
+/// invisible here — a structural node only appears if something reached
+/// it via ordinary map/list containment (`mapSet`/`listInsert`); its
+/// `structParent`/`structChildren` placement is a separate forest this
+/// walk never traverses. Inspect it via `structChildren(.root)` (and,
+/// for trashed subtrees, `structChildren(.trash)`).
 pub fn toJson(self: *const ObjectDoc, gpa: Allocator) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -820,6 +1145,41 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
                 _ = try self.nodes.items[text_node].text.rope.delete(gpa, .{ .start = start, .end = end });
                 try appendTextChange(gpa, &changes, self.history.idOf(e.obj), .{ .offset = start, .removed = end - start, .inserted = 0 });
             },
+            .struct_created => |e| {
+                // Eager, in Lv order — see the `Effect.struct_created`
+                // doc comment for why this can't wait for the deferred
+                // `struct_parent` post-pass. Idempotent defensively (a
+                // node is only ever created once, but `obj_index` is the
+                // authoritative check, matching every other `.new_map`
+                // site).
+                const node_id = self.history.idOf(e.node);
+                if (self.obj_index.get(node_id) == null) {
+                    _ = try self.makeValueNode(gpa, .new_map, e.node);
+                }
+            },
+            .struct_parent => |e| {
+                const node_id = self.history.idOf(e.node);
+                // Defensive fallback (should be unreachable: `struct_created`
+                // always precedes this for the SAME node, since its Lv is
+                // strictly lower — see `resolveObj`'s `.struct_create` case
+                // for why creation always causally precedes any reference).
+                if (self.obj_index.get(node_id) == null) {
+                    _ = try self.makeValueNode(gpa, .new_map, e.node);
+                }
+                const parent_ref: StructPlacementRef = switch (e.parent) {
+                    .root => .root,
+                    .trash => .trash,
+                    .node => |lv| .{ .node = self.history.idOf(lv) },
+                };
+                try self.struct_parents.put(gpa, node_id, .{
+                    .parent = parent_ref,
+                    .order_key = e.order_key,
+                    .key_writer = self.history.idOf(e.key_writer),
+                    .conflict_count = e.conflict_count,
+                    .cycle_broken = e.cycle_broken,
+                });
+                try changes.append(gpa, .{ .structure = .{ .node = node_id } });
+            },
         }
     }
     if (bootstrap) try self.adoptTextBases(gpa, dec.base.?, aids);
@@ -978,6 +1338,12 @@ pub fn resolveObjectAnchors(
 // finer per-object design is a materially different, harder problem this
 // step does not attempt).
 //
+// STRUCTURAL OPS (F3, delta 6, added after this section was written): a
+// `struct_create`/`struct_move` anywhere in the causal past of the stable
+// point refuses compaction outright too (`error.NotCompactable`, same
+// refusal as list structure — see the check below and its doc comment) —
+// delta 2b's scope grows to cover them alongside list content.
+//
 // SCOPE, NAMED PRECISELY: this compacts TEXT-OBJECT content only — the
 // shape W7 (weft's `Document` re-basing onto the unified core) actually
 // needs, since weft's text buffers are exactly "one `EventGraph` with one
@@ -1110,7 +1476,20 @@ pub fn compact(self: *ObjectDoc, gpa: Allocator, stable_token: []const u8) Compa
     for (0..n) |lv| {
         if (!past_s[lv]) continue;
         switch (self.history.opOf(@intCast(lv))) {
-            .list_ins, .list_del => return error.NotCompactable,
+            // List structure: see the doc comment above. Structural ops
+            // (F3, delta 6) get the SAME safe refusal for the SAME
+            // reason — `causal.compactGraph`'s materialization story
+            // (`SeqWalker.initBase`) has no analog for the parent-register
+            // tree, and folding away a `struct_create`/`struct_move`
+            // would break the global-Lamport canonical order the SAME way
+            // folding a `map_set` would break `mapConflictCount` (§4.1
+            // risk 5's hazard, structural-tree-shaped): a later
+            // `merge`/replay needs every retained structural write's true
+            // causal relationship to every other one to reproduce cycle
+            // rejection identically. A real implementation extending
+            // compaction to structural ops is delta 2b's scope, same as
+            // list content — not attempted here.
+            .list_ins, .list_del, .struct_create, .struct_move => return error.NotCompactable,
             else => {},
         }
     }
@@ -1481,6 +1860,24 @@ fn internOp(self: *ObjectDoc, gpa: Allocator, ev: Decoder.Event, aids: []const A
         .list_del => .{ .list_del = .{ .obj = obj.?, .pos = ev.pos } },
         .text_ins => .{ .text_ins = .{ .obj = obj.?, .pos = ev.pos, .ch = ev.ch } },
         .text_del => .{ .text_del = .{ .obj = obj.?, .pos = ev.pos } },
+        .struct_create => .{ .struct_create = .{
+            .parent = self.structRefFrom(ev.struct_parent, aids),
+            .order_key = try self.intern(gpa, ev.order_key),
+        } },
+        .struct_move => .{ .struct_move = .{
+            .node = .{ .agent = aids[ev.struct_node.agent_idx], .seq = ev.struct_node.seq },
+            .parent = self.structRefFrom(ev.struct_parent, aids),
+            .order_key = try self.intern(gpa, ev.order_key),
+        } },
+    };
+}
+
+fn structRefFrom(self: *const ObjectDoc, wire_ref: Decoder.StructRefWire, aids: []const AgentId) StructRef {
+    _ = self;
+    return switch (wire_ref) {
+        .root => .root,
+        .trash => .trash,
+        .node => |o| .{ .node = .{ .agent = aids[o.agent_idx], .seq = o.seq } },
     };
 }
 
@@ -1517,7 +1914,21 @@ fn internVal(self: *ObjectDoc, gpa: Allocator, v: Decoder.RawVal) Allocator.Erro
 //     compacted — see `compact`'s doc comment — so nothing about the
 //     event stream itself changes shape between v1 and v2)
 
-const OpTag = enum(u8) { map_set = 0, map_del = 1, list_ins = 2, list_del = 3, text_ins = 4, text_del = 5 };
+// F3, delta 6 (`stemma-unification.md` §3 step 5): `struct_create`/
+// `struct_move` are ADDITIVE new tags (6/7) — a doc with no structural ops
+// never emits them, so its wire bytes are byte-identical to before this
+// step; a decoder built before this step would reject bytes that DO carry
+// them (an unrecognized tag), which is the expected, one-directional
+// shape of "additive" (old bytes still decode under the NEW decoder; new
+// bytes are not required to decode under an OLD one). Payload, appended
+// after the generic `has_obj` byte (always 0 for these two tags — see
+// `opObj`):
+//   struct_create: struct-ref(parent), uv order_key_len, order_key bytes
+//   struct_move:   uv node_agent_idx, uv node_seq, struct-ref(parent),
+//                  uv order_key_len, order_key bytes
+// struct-ref: u8 tag (0=root, 1=trash, 2=node), node only: uv agent_idx,
+//   uv seq.
+const OpTag = enum(u8) { map_set = 0, map_del = 1, list_ins = 2, list_del = 3, text_ins = 4, text_del = 5, struct_create = 6, struct_move = 7 };
 const ValTag = enum(u8) { null_ = 0, false_ = 1, true_ = 2, int = 3, float = 4, str = 5, new_map = 6, new_list = 7, new_text = 8 };
 
 fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocator.Error![]u8 {
@@ -1531,7 +1942,16 @@ fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocat
     for (lvs) |lv| {
         try tableAdd(gpa, &table, self.history.idOf(lv).agent);
         for (self.history.parentsOf(lv)) |p| try tableAdd(gpa, &table, self.history.idOf(p).agent);
-        if (opObj(self.history.opOf(lv))) |o| try tableAdd(gpa, &table, o.agent);
+        const op = self.history.opOf(lv);
+        if (opObj(op)) |o| try tableAdd(gpa, &table, o.agent);
+        switch (op) {
+            .struct_create => |c| if (structRefAgent(c.parent)) |a| try tableAdd(gpa, &table, a),
+            .struct_move => |m| {
+                try tableAdd(gpa, &table, m.node.agent);
+                if (structRefAgent(m.parent)) |a| try tableAdd(gpa, &table, a);
+            },
+            else => {},
+        }
     }
     if (compacted) {
         var bit = self.text_bases.keyIterator();
@@ -1588,6 +2008,8 @@ fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocat
             .list_del => .list_del,
             .text_ins => .text_ins,
             .text_del => .text_del,
+            .struct_create => .struct_create,
+            .struct_move => .struct_move,
         })));
         if (opObj(op)) |o| {
             try out.append(gpa, 1);
@@ -1616,6 +2038,18 @@ fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocat
                 try putUv(gpa, &out, x.ch);
             },
             .text_del => |x| try putUv(gpa, &out, x.pos),
+            .struct_create => |c| {
+                try self.encodeStructRef(gpa, &out, table.items, c.parent);
+                try putUv(gpa, &out, c.order_key.len);
+                try out.appendSlice(gpa, self.str(c.order_key));
+            },
+            .struct_move => |m| {
+                try putUv(gpa, &out, tableIndexOf(table.items, m.node.agent));
+                try putUv(gpa, &out, m.node.seq);
+                try self.encodeStructRef(gpa, &out, table.items, m.parent);
+                try putUv(gpa, &out, m.order_key.len);
+                try out.appendSlice(gpa, self.str(m.order_key));
+            },
         }
     }
     return out.toOwnedSlice(gpa);
@@ -1629,7 +2063,32 @@ fn opObj(op: ObjectOp) ?ObjId {
         .list_del => |l| l.obj,
         .text_ins => |x| x.obj,
         .text_del => |x| x.obj,
+        // Structural ops encode their own refs separately (`struct_move`
+        // has TWO — `node` and `parent` — and `struct_create` has none of
+        // this generic single-obj shape at all) — see the `OpTag` doc
+        // comment.
+        .struct_create, .struct_move => null,
     };
+}
+
+fn structRefAgent(r: StructRef) ?AgentId {
+    return switch (r) {
+        .root, .trash => null,
+        .node => |id| id.agent,
+    };
+}
+
+fn encodeStructRef(self: *const ObjectDoc, gpa: Allocator, out: *std.ArrayList(u8), table: []const AgentId, r: StructRef) Allocator.Error!void {
+    _ = self;
+    switch (r) {
+        .root => try out.append(gpa, 0),
+        .trash => try out.append(gpa, 1),
+        .node => |id| {
+            try out.append(gpa, 2);
+            try putUv(gpa, out, tableIndexOf(table, id.agent));
+            try putUv(gpa, out, id.seq);
+        },
+    }
 }
 
 fn encodeVal(self: *const ObjectDoc, gpa: Allocator, out: *std.ArrayList(u8), v: ValPayload) Allocator.Error!void {
@@ -1679,6 +2138,11 @@ const Decoder = struct {
         new_list,
         new_text,
     };
+    /// Decoded `StructRef` (F3, delta 6) — `node`'s agent index is only
+    /// meaningful relative to THIS batch's table, resolved to a real
+    /// `AgentId` (via `aids`) in `ObjectDoc.structRefFrom`, same
+    /// two-phase discipline as every other batch-table-relative ref.
+    const StructRefWire = union(enum) { root, trash, node: ObjRef };
     const Event = struct {
         agent_idx: u32,
         seq: u64,
@@ -1690,6 +2154,10 @@ const Decoder = struct {
         pos: u64 = 0,
         ch: u21 = 0,
         val: ?RawVal = null,
+        // struct_create/struct_move only:
+        struct_node: ObjRef = .{ .agent_idx = 0, .seq = 0 },
+        struct_parent: StructRefWire = .root,
+        order_key: []const u8 = &.{}, // borrowed
     };
     /// One decoded `jw.TextBase` wire entry — `obj` names its text
     /// object's creation event (by batch table index; resolved to an
@@ -1791,7 +2259,7 @@ const Decoder = struct {
             if (cur.len == 0) return error.Corrupt;
             const tag_byte = cur[0];
             cur = cur[1..];
-            if (tag_byte > 5) return error.Corrupt;
+            if (tag_byte > 7) return error.Corrupt;
             ev.op_tag = @enumFromInt(tag_byte);
             if (cur.len == 0) return error.Corrupt;
             const has_obj = cur[0];
@@ -1802,8 +2270,12 @@ const Decoder = struct {
                 if (oaidx >= self.names.items.len) return error.Corrupt;
                 break :blk .{ .agent_idx = @intCast(oaidx), .seq = try getUv(&cur) };
             } else null;
-            // Root refs are only legal for map ops.
-            if (ev.obj == null and ev.op_tag != .map_set and ev.op_tag != .map_del) return error.Corrupt;
+            // Root refs are only legal for map ops and structural ops
+            // (struct_create/struct_move encode their own refs separately
+            // — see the `OpTag` doc comment; they never use the generic
+            // `has_obj` slot at all, so `ev.obj` is always null for them).
+            if (ev.obj == null and ev.op_tag != .map_set and ev.op_tag != .map_del and
+                ev.op_tag != .struct_create and ev.op_tag != .struct_move) return error.Corrupt;
             ev.key = &.{};
             ev.pos = 0;
             ev.ch = 0;
@@ -1831,6 +2303,18 @@ const Decoder = struct {
                     ev.ch = @intCast(ch);
                 },
                 .text_del => ev.pos = try getUv(&cur),
+                .struct_create => {
+                    ev.struct_parent = try decodeStructRef(&cur, self.names.items.len);
+                    ev.order_key = try getBytes(&cur, max_order_key_len);
+                },
+                .struct_move => {
+                    const naidx = try getUv(&cur);
+                    if (naidx >= self.names.items.len) return error.Corrupt;
+                    const nseq = try getUv(&cur);
+                    ev.struct_node = .{ .agent_idx = @intCast(naidx), .seq = nseq };
+                    ev.struct_parent = try decodeStructRef(&cur, self.names.items.len);
+                    ev.order_key = try getBytes(&cur, max_order_key_len);
+                },
             }
             try self.events.append(gpa, ev);
         }
@@ -1856,6 +2340,23 @@ const Decoder = struct {
             .new_map => .new_map,
             .new_list => .new_list,
             .new_text => .new_text,
+        };
+    }
+
+    fn decodeStructRef(cur: *[]const u8, agent_count: usize) error{Corrupt}!StructRefWire {
+        if (cur.len == 0) return error.Corrupt;
+        const tag = cur.*[0];
+        cur.* = cur.*[1..];
+        return switch (tag) {
+            0 => .root,
+            1 => .trash,
+            2 => blk: {
+                const aidx = try getUv(cur);
+                if (aidx >= agent_count) return error.Corrupt;
+                const seq = try getUv(cur);
+                break :blk .{ .node = .{ .agent_idx = @intCast(aidx), .seq = seq } };
+            },
+            else => error.Corrupt,
         };
     }
 

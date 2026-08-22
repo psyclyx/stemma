@@ -590,6 +590,18 @@ fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
     _ = try author.listInsert(gpa, l, 0, .{ .str = "s" });
     const txt = (try author.mapSet(gpa, null, "t", .text)).?;
     _ = try author.textInsert(gpa, txt, 0, "wire");
+    // A well-formed structural op (F3, delta 6 — `OpTag` values 6/7) in
+    // the seed doc, so byte mutations below land on GENUINE
+    // struct_create/struct_move wire regions (op tag, struct-ref tag,
+    // order-key length/bytes) some of the time, rather than needing a
+    // mutation to incidentally produce tag 6/7 from scratch out of
+    // otherwise-map/list/text bytes.
+    const sk = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(sk);
+    const sn = try author.structCreate(gpa, .root, sk);
+    const sk2 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(sk2);
+    try author.structMove(gpa, sn, .trash, sk2);
     const valid = try author.serialize(gpa);
     defer gpa.free(valid);
 
@@ -1091,4 +1103,730 @@ fn compactOomScript(gpa: std.mem.Allocator) !void {
 
 test "OOM: compaction paths are leak-free under every allocation failure" {
     try std.testing.checkAllAllocationFailures(t.allocator, compactOomScript, .{});
+}
+
+// ── Structural ops (F3, delta 6 — the move op) ──────────────────────────
+// `stemma-unification.md` §3 step 5 — parent-register + fractional order
+// keys, ported from `structure_sketch.zig` and re-targeted at ObjectDoc's
+// real API. Hand-written cases mirror the sketch's (`structure_sketch.zig`
+// ~716-1060) 1:1 where the shape carries over; the property campaign below
+// is the sketch's ~400-seed campaign, trimmed (see its doc comment).
+
+fn eqId(a: ObjectDoc.EventId, b: ObjectDoc.EventId) bool {
+    return std.meta.eql(a, b);
+}
+
+/// Portable canonical dump of the structural tree (agent NAME + seq, never
+/// a doc-local `ObjId`) — mirrors `structure_sketch.zig`'s
+/// `Materialized.dump`, for convergence comparison across replicas.
+fn structDump(gpa: std.mem.Allocator, d: *const ObjectDoc, out: *std.ArrayList(u8)) !void {
+    try out.appendSlice(gpa, "ROOT\n");
+    try structDumpChildren(gpa, d, out, .root, 1);
+    try out.appendSlice(gpa, "TRASH\n");
+    try structDumpChildren(gpa, d, out, .trash, 1);
+}
+
+fn structDumpChildren(gpa: std.mem.Allocator, d: *const ObjectDoc, out: *std.ArrayList(u8), parent: ObjectDoc.StructRef, depth: usize) !void {
+    const kids = try d.structChildren(gpa, parent);
+    defer gpa.free(kids);
+    for (kids) |k| {
+        for (0..depth) |_| try out.appendSlice(gpa, "  ");
+        try out.appendSlice(gpa, d.history.agentName(k.agent));
+        try out.print(gpa, "#{d}\n", .{k.seq});
+        try structDumpChildren(gpa, d, out, .{ .node = k }, depth + 1);
+    }
+}
+
+/// Independent oracle: walk from both roots via `structChildren`, asserting
+/// every node with a resolved parent is reached exactly once (no orphans,
+/// no cycles) — mirrors `structure_sketch.zig`'s `Materialized.verifyForest`,
+/// does not trust any of `Walker`'s own bookkeeping.
+fn verifyStructForest(gpa: std.mem.Allocator, d: *const ObjectDoc, total_nodes: usize) !void {
+    var visited: std.AutoHashMapUnmanaged(ObjectDoc.EventId, void) = .empty;
+    defer visited.deinit(gpa);
+    try structWalkCount(gpa, d, .root, &visited);
+    try structWalkCount(gpa, d, .trash, &visited);
+    try t.expectEqual(total_nodes, visited.count());
+}
+
+fn structWalkCount(gpa: std.mem.Allocator, d: *const ObjectDoc, parent: ObjectDoc.StructRef, visited: *std.AutoHashMapUnmanaged(ObjectDoc.EventId, void)) !void {
+    const kids = try d.structChildren(gpa, parent);
+    defer gpa.free(kids);
+    for (kids) |k| {
+        const gop = try visited.getOrPut(gpa, k);
+        try t.expect(!gop.found_existing); // CycleDetected / double-parented
+        try structWalkCount(gpa, d, .{ .node = k }, visited);
+    }
+}
+
+test "structCreate + structMove: children read back sorted, one register write per move" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const mid = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(mid);
+    const a = try d.structCreate(gpa, .root, mid);
+    const before_count = d.history.eventCount();
+
+    const k2 = try ObjectDoc.orderKeyBetween(gpa, mid, null);
+    defer gpa.free(k2);
+    const b = try d.structCreate(gpa, .root, k2);
+
+    const roots1 = try d.structChildren(gpa, .root);
+    defer gpa.free(roots1);
+    try t.expectEqual(@as(usize, 2), roots1.len);
+    try t.expect(eqId(roots1[0], a));
+    try t.expect(eqId(roots1[1], b));
+
+    const k3 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k3);
+    try d.structMove(gpa, b, .{ .node = a }, k3);
+    try t.expectEqual(before_count + 2, d.history.eventCount());
+
+    const roots2 = try d.structChildren(gpa, .root);
+    defer gpa.free(roots2);
+    try t.expectEqual(@as(usize, 1), roots2.len);
+    const a_kids = try d.structChildren(gpa, .{ .node = a });
+    defer gpa.free(a_kids);
+    try t.expectEqual(@as(usize, 1), a_kids.len);
+    try t.expect(eqId(a_kids[0], b));
+    try verifyStructForest(gpa, &d, 2);
+}
+
+test "a structural node doubles as an ordinary map object" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const key = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(key);
+    const node = try d.structCreate(gpa, .root, key);
+    _ = try d.mapSet(gpa, node, "title", .{ .str = "hello" });
+    const ref = d.ref(node);
+    try t.expectEqualStrings("hello", ref.mapGet("title").?.asStr());
+}
+
+test "structCreate/structMove refuse an order key longer than the wire cap, in every build mode" {
+    // `assert` would compile out under ReleaseFast/ReleaseSmall (silently
+    // reopening the un-round-trippable hole `max_order_key_len`'s doc
+    // comment closes) and would crash THIS suite outright even in Debug
+    // — the very reason this has to be a real error, not an assert, and
+    // the very reason it's untestable any other way: a test asserting an
+    // `assert` fires is a test that kills the test binary.
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const too_long = try gpa.alloc(u8, 4097);
+    defer gpa.free(too_long);
+    @memset(too_long, 'x');
+    try t.expectError(error.OrderKeyTooLong, d.structCreate(gpa, .root, too_long));
+    try t.expectEqual(@as(usize, 0), d.history.eventCount()); // refused before any mutation
+
+    const ok_key = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(ok_key);
+    const node = try d.structCreate(gpa, .root, ok_key);
+    try t.expectError(error.OrderKeyTooLong, d.structMove(gpa, node, .root, too_long));
+    // The refused move's own event IS recorded (only the STRUCT_CREATE
+    // above was refused pre-append) — `structMove`'s length check runs
+    // before `addLocal` too, so no new event exists for this rejection.
+    const events_before = d.history.eventCount();
+    try t.expectError(error.OrderKeyTooLong, d.structMove(gpa, node, .root, too_long));
+    try t.expectEqual(events_before, d.history.eventCount());
+}
+
+test "concurrent structMove of the same node: both survive as conflicts, deterministic winner, both replicas converge" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    const shared = try alice.structCreate(gpa, .root, k0);
+    const k1 = try ObjectDoc.orderKeyBetween(gpa, k0, null);
+    defer gpa.free(k1);
+    const parent_a = try alice.structCreate(gpa, .root, k1);
+    const k2 = try ObjectDoc.orderKeyBetween(gpa, k1, null);
+    defer gpa.free(k2);
+    const parent_b = try alice.structCreate(gpa, .root, k2);
+    try syncOne(gpa, &alice, &bob);
+
+    const ka = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(ka);
+    try alice.structMove(gpa, shared, .{ .node = parent_a }, ka);
+    // `shared`/`parent_b` are ALICE-numbered `ObjId`s (`EventId.agent` is
+    // replica-local — causal.zig) — translate through bob's own agent
+    // table before using them in a call against `bob`, exactly like the
+    // existing map-conflict tests above do for cross-replica `ObjId`s.
+    const bob_shared: ObjectDoc.ObjId = .{ .agent = bob.history.findAgent("alice").?, .seq = shared.seq };
+    const bob_parent_b: ObjectDoc.ObjId = .{ .agent = bob.history.findAgent("alice").?, .seq = parent_b.seq };
+    const kb = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(kb);
+    try bob.structMove(gpa, bob_shared, .{ .node = bob_parent_b }, kb);
+
+    try syncBoth(gpa, &alice, &bob);
+
+    var dump_a: std.ArrayList(u8) = .empty;
+    defer dump_a.deinit(gpa);
+    try structDump(gpa, &alice, &dump_a);
+    var dump_b: std.ArrayList(u8) = .empty;
+    defer dump_b.deinit(gpa);
+    try structDump(gpa, &bob, &dump_b);
+    try t.expectEqualStrings(dump_a.items, dump_b.items);
+
+    // Honest MV: 2 concurrent writes to `shared`'s register both survive.
+    try t.expectEqual(@as(usize, 2), alice.structConflictCount(shared));
+    try t.expectEqual(@as(usize, 2), bob.structConflictCount(bob_shared));
+    try t.expect(!alice.structCycleBroken(shared));
+
+    const winner = alice.structParent(shared).?;
+    try t.expect(winner == .node);
+    try t.expect(eqId(winner.node, parent_a) or eqId(winner.node, parent_b));
+    try verifyStructForest(gpa, &alice, 3);
+}
+
+test "concurrent moves that individually are acyclic but jointly cycle: deterministically resolved, stays acyclic, both replicas agree" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    const na = try alice.structCreate(gpa, .root, k0);
+    const k1 = try ObjectDoc.orderKeyBetween(gpa, k0, null);
+    defer gpa.free(k1);
+    const nb = try alice.structCreate(gpa, .root, k1);
+    try syncOne(gpa, &alice, &bob);
+
+    const ka = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(ka);
+    try alice.structMove(gpa, na, .{ .node = nb }, ka);
+    // Translate through bob's own agent table — see the note in the
+    // "concurrent structMove of the same node" test above.
+    const bob_na: ObjectDoc.ObjId = .{ .agent = bob.history.findAgent("alice").?, .seq = na.seq };
+    const bob_nb: ObjectDoc.ObjId = .{ .agent = bob.history.findAgent("alice").?, .seq = nb.seq };
+    const kb = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(kb);
+    try bob.structMove(gpa, bob_nb, .{ .node = bob_na }, kb);
+
+    try syncBoth(gpa, &alice, &bob);
+
+    try verifyStructForest(gpa, &alice, 2);
+    try verifyStructForest(gpa, &bob, 2);
+
+    var dump_a: std.ArrayList(u8) = .empty;
+    defer dump_a.deinit(gpa);
+    try structDump(gpa, &alice, &dump_a);
+    var dump_b: std.ArrayList(u8) = .empty;
+    defer dump_b.deinit(gpa);
+    try structDump(gpa, &bob, &dump_b);
+    try t.expectEqualStrings(dump_a.items, dump_b.items);
+}
+
+// Pins the FINDING documented on `ObjectDoc.structParent`: a rejected write
+// can strand an earlier, already-superseded write as the effective parent,
+// outside the reported conflict set. Single replica, fully sequential (no
+// MV conflict at all — this is about cycle-rejection, not concurrency):
+// create N; create P; move P under N (accepted); move N under P (would
+// make N its own ancestor via P — rejected). N's effective parent falls
+// all the way back to its own `structCreate` (`.root`), but `structCreate`
+// was already causally superseded in the conflict-set bookkeeping by the
+// (rejected) move — see `structure_sketch.zig`'s pinned counterexample
+// test (~875-915) for the exact mechanism this mirrors.
+test "a rejected write can leave an earlier, already-superseded write as the effective parent — outside the reported conflict set" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const kn = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(kn);
+    const n = try d.structCreate(gpa, .root, kn);
+    const kp = try ObjectDoc.orderKeyBetween(gpa, kn, null);
+    defer gpa.free(kp);
+    const p = try d.structCreate(gpa, .root, kp);
+
+    const k1 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k1);
+    try d.structMove(gpa, p, .{ .node = n }, k1); // P under N: fine, no cycle yet
+
+    const k2 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k2);
+    try d.structMove(gpa, n, .{ .node = p }, k2); // N under P: would cycle — local apply refuses
+
+    try verifyStructForest(gpa, &d, 2);
+
+    // The EFFECTIVE PARENT: N's own `create`, all the way back — not the
+    // rejected move.
+    const winner = d.structParent(n).?;
+    try t.expect(winner == .root);
+    // The CONVERGENCE PROPERTY this test actually pins: the AUTHORING
+    // replica's own accessors must already agree with what a canonical
+    // (Lamport-order) resolution of this exact history reports — not
+    // some stale pre-refusal snapshot. The refused move's causal parents
+    // are the frontier at the time it was written, which dominates every
+    // prior write to N's register (including N's own `create`) — so it
+    // supersedes them in the antichain regardless of being rejected,
+    // collapsing `conflict_live` to size 1 with the WINNER outside it.
+    // `structMove`'s refusal branch must update this metadata even
+    // though the effective parent itself doesn't change — see that
+    // function's doc comment for the invariant.
+    try t.expectEqual(@as(usize, 1), d.structConflictCount(n));
+    try t.expect(d.structCycleBroken(n));
+
+    // Now replay the SAME history through a fresh replica via the wire —
+    // this exercises `objects_state.Walker`'s GLOBAL Lamport-canonical
+    // resolution (the standalone `resolveStructs` pass, not `structMove`'s
+    // local fast path above) — and must report EXACTLY the same thing.
+    // Two replicas holding identical history must never disagree on a
+    // documented accessor, even when the disagreement would only ever be
+    // about "conflict" bookkeeping metadata rather than the (correct,
+    // convergent) effective parent itself.
+    var other: ObjectDoc = .empty;
+    defer other.deinit(gpa);
+    try other.setAgent(gpa, "other");
+    try syncOne(gpa, &d, &other);
+
+    try verifyStructForest(gpa, &other, 2);
+    const other_n: ObjectDoc.ObjId = .{ .agent = other.history.findAgent("solo").?, .seq = n.seq };
+    const other_winner = other.structParent(other_n).?;
+    try t.expect(other_winner == .root);
+    try t.expectEqual(@as(usize, 1), other.structConflictCount(other_n));
+    try t.expect(other.structCycleBroken(other_n));
+
+    // The two replicas AGREE — the actual property, not just each one's
+    // own internal self-consistency.
+    try t.expectEqual(d.structConflictCount(n), other.structConflictCount(other_n));
+    try t.expectEqual(d.structCycleBroken(n), other.structCycleBroken(other_n));
+}
+
+test "structDelete hides a subtree without destroying it; undelete restores it intact" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    const parent = try d.structCreate(gpa, .root, k0);
+    const k1 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k1);
+    const child = try d.structCreate(gpa, .{ .node = parent }, k1);
+
+    try d.structDelete(gpa, parent);
+
+    const roots1 = try d.structChildren(gpa, .root);
+    defer gpa.free(roots1);
+    try t.expectEqual(@as(usize, 0), roots1.len);
+    const trash_kids = try d.structChildren(gpa, .trash);
+    defer gpa.free(trash_kids);
+    try t.expectEqual(@as(usize, 1), trash_kids.len);
+    try t.expect(eqId(trash_kids[0], parent));
+    const under_trashed = try d.structChildren(gpa, .{ .node = parent });
+    defer gpa.free(under_trashed);
+    try t.expectEqual(@as(usize, 1), under_trashed.len);
+    try t.expect(eqId(under_trashed[0], child));
+    try verifyStructForest(gpa, &d, 2);
+
+    const k2 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k2);
+    try d.structMove(gpa, parent, .root, k2);
+
+    const roots2 = try d.structChildren(gpa, .root);
+    defer gpa.free(roots2);
+    try t.expectEqual(@as(usize, 1), roots2.len);
+    const restored_kids = try d.structChildren(gpa, .{ .node = parent });
+    defer gpa.free(restored_kids);
+    try t.expectEqual(@as(usize, 1), restored_kids.len);
+    try t.expect(eqId(restored_kids[0], child));
+    try verifyStructForest(gpa, &d, 2);
+}
+
+test "untouched siblings keep relative order across merges" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    var prev: ?[]u8 = null;
+    var untouched: [3]ObjectDoc.ObjId = undefined;
+    for (0..3) |i| {
+        const k = try ObjectDoc.orderKeyBetween(gpa, prev, null);
+        defer gpa.free(k);
+        untouched[i] = try alice.structCreate(gpa, .root, k);
+        if (prev) |p| gpa.free(p);
+        prev = try gpa.dupe(u8, k);
+    }
+    if (prev) |p| gpa.free(p);
+    try syncOne(gpa, &alice, &bob);
+
+    const bob_roots = try bob.structChildren(gpa, .root);
+    defer gpa.free(bob_roots);
+    const bk = try ObjectDoc.orderKeyBetween(gpa, bob.structOrderKey(bob_roots[0]), bob.structOrderKey(bob_roots[1]));
+    defer gpa.free(bk);
+    _ = try bob.structCreate(gpa, .root, bk);
+
+    try syncBoth(gpa, &alice, &bob);
+
+    const final_roots = try alice.structChildren(gpa, .root);
+    defer gpa.free(final_roots);
+    try t.expectEqual(@as(usize, 4), final_roots.len);
+
+    var positions: [3]usize = undefined;
+    for (untouched, 0..) |u, ui| {
+        for (final_roots, 0..) |r, ri| {
+            if (eqId(r, u)) positions[ui] = ri;
+        }
+    }
+    try t.expect(positions[0] < positions[1]);
+    try t.expect(positions[1] < positions[2]);
+}
+
+test "wire round-trip: structural frames survive serialize/open, structure-free docs are unaffected" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    const a = try d.structCreate(gpa, .root, k0);
+    _ = try d.mapSet(gpa, a, "n", .{ .int = 1 });
+    const k1 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k1);
+    const b = try d.structCreate(gpa, .{ .node = a }, k1);
+    _ = b;
+    try d.structDelete(gpa, a);
+
+    const bytes = try d.serialize(gpa);
+    defer gpa.free(bytes);
+    var re = try ObjectDoc.open(gpa, bytes);
+    defer re.deinit(gpa);
+
+    var d1: std.ArrayList(u8) = .empty;
+    defer d1.deinit(gpa);
+    try structDump(gpa, &d, &d1);
+    var d2: std.ArrayList(u8) = .empty;
+    defer d2.deinit(gpa);
+    try structDump(gpa, &re, &d2);
+    try t.expectEqualStrings(d1.items, d2.items);
+    try verifyStructForest(gpa, &re, 2);
+}
+
+test "wire: a doc with no structural ops carries no struct_create/struct_move tag bytes" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+    _ = try d.mapSet(gpa, null, "a", .{ .int = 1 });
+    const list = (try d.mapSet(gpa, null, "l", .list)).?;
+    _ = try d.listInsert(gpa, list, 0, .{ .int = 2 });
+
+    const bytes = try d.serialize(gpa);
+    defer gpa.free(bytes);
+    // Every op-tag byte in a struct-op-free stream is <= 5 (the pre-delta-6
+    // tag range) — a hand-decoded scan confirms the encoder never touches
+    // tags 6/7 unless a structural op is actually present, i.e. wire bytes
+    // for a structure-free doc are exactly what pre-delta-6 code emitted.
+    var re = try ObjectDoc.open(gpa, bytes);
+    defer re.deinit(gpa);
+    const got = try re.toJson(gpa);
+    defer gpa.free(got);
+    try t.expectEqualStrings(
+        \\{"a":1,"l":[2]}
+    , got);
+}
+
+test "old wire bytes (tags 0-5 only, hand-built) still decode under the delta-6 decoder" {
+    const gpa = t.allocator;
+    // Hand-built v1 batch: one agent "solo", one event — map_set root.a=7.
+    // Exactly the pre-delta-6 wire shape (OpTag values 0-5 only,
+    // `object_magic_v1`) — proves the extended decoder (tag bound now 7,
+    // not 5) still accepts every byte a pre-delta-6 encoder ever produced.
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, "stj\x01");
+    try bytes.append(gpa, 1); // agent_count
+    try bytes.append(gpa, 4); // name len
+    try bytes.appendSlice(gpa, "solo");
+    try bytes.append(gpa, 1); // event_count
+    try bytes.append(gpa, 0); // agent_idx
+    try bytes.append(gpa, 0); // seq
+    try bytes.append(gpa, 0); // parent_count
+    try bytes.append(gpa, 0); // op tag: map_set
+    try bytes.append(gpa, 0); // has_obj = 0 (root)
+    try bytes.append(gpa, 1); // key len
+    try bytes.appendSlice(gpa, "a");
+    try bytes.append(gpa, 3); // ValTag.int
+    try bytes.append(gpa, 14); // zigzag(7) = 14
+
+    var d = try ObjectDoc.open(gpa, bytes.items);
+    defer d.deinit(gpa);
+    try t.expectEqual(@as(i64, 7), d.root().mapGet("a").?.asInt());
+}
+
+test "compact: refuses when a structural op is in the causal past" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    _ = try d.structCreate(gpa, .root, k0);
+
+    const stable = try d.version(gpa);
+    defer gpa.free(stable);
+    try t.expectError(error.NotCompactable, d.compact(gpa, stable));
+}
+
+test "compact still works on a doc whose structural ops are all AFTER the stable point" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+    // A plain scalar map write (never `in_base`-eligible either way — see
+    // `compact`'s doc comment) rather than a text object, to stay clear of
+    // the SEPARATE, pre-existing "same agent creates then edits an object
+    // straddling the stable point" prefix limitation that doc comment
+    // names (unrelated to structural ops).
+    _ = try d.mapSet(gpa, null, "title", .{ .str = "doc" });
+
+    const stable = try d.version(gpa);
+    defer gpa.free(stable);
+    try d.compact(gpa, stable);
+
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    const a = try d.structCreate(gpa, .root, k0);
+    const kids = try d.structChildren(gpa, .root);
+    defer gpa.free(kids);
+    try t.expectEqual(@as(usize, 1), kids.len);
+    try t.expect(eqId(kids[0], a));
+}
+
+test "moves + text edits + map writes interleaved: converges, structure and content both correct" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    const k0 = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(k0);
+    const a = try alice.structCreate(gpa, .root, k0);
+    _ = try alice.mapSet(gpa, a, "title", .{ .str = "note" });
+    const k1 = try ObjectDoc.orderKeyBetween(gpa, k0, null);
+    defer gpa.free(k1);
+    const b = try alice.structCreate(gpa, .root, k1);
+    try syncOne(gpa, &alice, &bob);
+
+    // Concurrent: alice edits a map key on `a` AND moves `b` under `a`;
+    // bob independently edits text and also moves `b`'s sibling ordering.
+    _ = try alice.mapSet(gpa, a, "title", .{ .str = "note!" });
+    const ka = try ObjectDoc.orderKeyBetween(gpa, null, null);
+    defer gpa.free(ka);
+    try alice.structMove(gpa, b, .{ .node = a }, ka);
+
+    const bob_a: ObjectDoc.ObjId = .{ .agent = bob.history.findAgent("alice").?, .seq = a.seq };
+    _ = try bob.mapSet(gpa, bob_a, "note_body", .text);
+    const body_obj = bob.ref(bob_a).mapGet("note_body").?.objId().?;
+    _ = try bob.textInsert(gpa, body_obj, 0, "hi");
+
+    try syncBoth(gpa, &alice, &bob);
+
+    try t.expectEqualStrings("note!", alice.ref(a).mapGet("title").?.asStr());
+    try t.expectEqualStrings("note!", bob.ref(bob_a).mapGet("title").?.asStr());
+    var da: std.ArrayList(u8) = .empty;
+    defer da.deinit(gpa);
+    try structDump(gpa, &alice, &da);
+    var db: std.ArrayList(u8) = .empty;
+    defer db.deinit(gpa);
+    try structDump(gpa, &bob, &db);
+    try t.expectEqualStrings(da.items, db.items);
+    try verifyStructForest(gpa, &alice, 2);
+
+    const alice_json = try alice.toJson(gpa);
+    defer gpa.free(alice_json);
+    const bob_json = try bob.toJson(gpa);
+    defer gpa.free(bob_json);
+    try t.expectEqualStrings(alice_json, bob_json);
+}
+
+// ── Property campaign (F3, delta 6) ─────────────────────────────────────
+// Ported from `structure_sketch.zig`'s ~400-seed / ~30-op / up-to-4-replica
+// campaign (~1095-1192), re-targeted at ObjectDoc's real API (structural
+// ops interleaved with map/list/text edits, going through the SAME
+// `merge`/`Walker` path production code uses — not a standalone sketch
+// `Doc`). TRIMMED to 80 seeds / 20 ops / up to 3 replicas: `ObjectDoc`'s
+// replay is materially heavier per call than the sketch's (map/list/text
+// state plus two structural canonical-order passes, all recomputed on
+// every `merge`, per `objects_state.Walker`'s doc comment) — 400 seeds at
+// the sketch's op count made this suite noticeably slower without
+// exercising new code paths past roughly the first several dozen seeds
+// (each schedule is i.i.d.; the interesting shapes — MV conflicts,
+// cross-node cycles, trash/resurrection — all recur well within 80).
+// Asserts, every seed: convergence (byte-identical structural dumps AND
+// canonical JSON) and acyclicity + full reachability
+// (`verifyStructForest`, independent of `Walker`'s own bookkeeping).
+test "property: random structural + map/list/text schedules across 2-3 replicas converge, stay acyclic, stay reachable" {
+    const gpa = t.allocator;
+    const schedules = 80;
+    var seed: u64 = 0;
+    while (seed < schedules) : (seed += 1) {
+        runStructSchedule(gpa, seed) catch |err| {
+            std.debug.print("seed={d} failed\n", .{seed});
+            return err;
+        };
+    }
+}
+
+const NodeHandle = struct { name: []const u8, seq: u64 };
+
+fn runStructSchedule(gpa: std.mem.Allocator, seed: u64) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const replica_count = 2 + random.uintLessThan(usize, 2); // 2..3
+
+    var docs: [3]ObjectDoc = .{ .empty, .empty, .empty };
+    defer for (0..replica_count) |i| docs[i].deinit(gpa);
+    const names = [_][]const u8{ "r0", "r1", "r2" };
+    for (0..replica_count) |i| try docs[i].setAgent(gpa, names[i]);
+
+    var handles: std.ArrayList(NodeHandle) = .empty;
+    defer handles.deinit(gpa);
+    var total_nodes: usize = 0;
+
+    const op_count = 20;
+    for (0..op_count) |_| {
+        const ri = random.uintLessThan(usize, replica_count);
+        const d = &docs[ri];
+        const choice = random.uintLessThan(u8, 6);
+        switch (choice) {
+            0, 1 => { // structCreate (weighted higher — material to move)
+                const parent = (try pickStructTarget(gpa, d, random, handles.items, true)).?;
+                const kids = try d.structChildren(gpa, parent);
+                defer gpa.free(kids);
+                const digits = try randomGapKey(gpa, d, kids, random);
+                defer gpa.free(digits);
+                const id = try d.structCreate(gpa, parent, digits);
+                try handles.append(gpa, .{ .name = d.history.agentName(id.agent), .seq = id.seq });
+                total_nodes += 1;
+            },
+            2 => { // structMove / reorder
+                const target = try pickStructTarget(gpa, d, random, handles.items, false) orelse continue;
+                if (target != .node) continue;
+                const parent = (try pickStructTarget(gpa, d, random, handles.items, true)).?;
+                const kids = try d.structChildren(gpa, parent);
+                defer gpa.free(kids);
+                const digits = try randomGapKey(gpa, d, kids, random);
+                defer gpa.free(digits);
+                try d.structMove(gpa, target.node, parent, digits);
+            },
+            3 => { // structDelete
+                const target = try pickStructTarget(gpa, d, random, handles.items, false) orelse continue;
+                if (target != .node) continue;
+                try d.structDelete(gpa, target.node);
+            },
+            4 => { // an ordinary map write on a random known node — cross-boundary interaction
+                const target = try pickStructTarget(gpa, d, random, handles.items, false) orelse continue;
+                if (target != .node) continue;
+                _ = d.mapSet(gpa, target.node, "tag", .{ .int = @intCast(seed) }) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                };
+            },
+            5 => { // sync a random pair, both directions
+                if (replica_count < 2) continue;
+                var i = random.uintLessThan(usize, replica_count);
+                var j = random.uintLessThan(usize, replica_count);
+                if (i == j) j = (j + 1) % replica_count;
+                try syncOne(gpa, &docs[j], &docs[i]);
+                i = random.uintLessThan(usize, replica_count);
+                j = random.uintLessThan(usize, replica_count);
+                if (i == j) j = (j + 1) % replica_count;
+                try syncOne(gpa, &docs[j], &docs[i]);
+            },
+            else => unreachable,
+        }
+    }
+
+    for (0..2) |_| {
+        for (0..replica_count) |i| {
+            for (0..replica_count) |j| {
+                if (i != j) try syncOne(gpa, &docs[j], &docs[i]);
+            }
+        }
+    }
+
+    var dumps: [3]std.ArrayList(u8) = .{ .empty, .empty, .empty };
+    defer for (0..replica_count) |i| dumps[i].deinit(gpa);
+    var jsons: [3][]u8 = undefined;
+    defer for (0..replica_count) |i| gpa.free(jsons[i]);
+    for (0..replica_count) |i| {
+        try verifyStructForest(gpa, &docs[i], total_nodes);
+        try structDump(gpa, &docs[i], &dumps[i]);
+        jsons[i] = try docs[i].toJson(gpa);
+    }
+    for (1..replica_count) |i| {
+        try t.expectEqualStrings(dumps[0].items, dumps[i].items);
+        try t.expectEqualStrings(jsons[0], jsons[i]);
+    }
+}
+
+fn pickStructTarget(
+    gpa: std.mem.Allocator,
+    d: *const ObjectDoc,
+    random: std.Random,
+    handles: []const NodeHandle,
+    allow_special: bool,
+) !?ObjectDoc.StructRef {
+    var known: std.ArrayList(ObjectDoc.ObjId) = .empty;
+    defer known.deinit(gpa);
+    for (handles) |h| {
+        if (d.history.findAgent(h.name)) |aid| {
+            const id: ObjectDoc.EventId = .{ .agent = aid, .seq = h.seq };
+            if (d.history.isKnown(id)) try known.append(gpa, id);
+        }
+    }
+    if (allow_special) {
+        const pool = known.items.len + 2;
+        const pick = random.uintLessThan(usize, pool);
+        if (pick == 0) return .root;
+        if (pick == 1) return .trash;
+        return .{ .node = known.items[pick - 2] };
+    }
+    if (known.items.len == 0) return null;
+    return .{ .node = known.items[random.uintLessThan(usize, known.items.len)] };
+}
+
+fn randomGapKey(gpa: std.mem.Allocator, d: *const ObjectDoc, kids: []const ObjectDoc.ObjId, random: std.Random) ![]u8 {
+    if (kids.len == 0) return ObjectDoc.orderKeyBetween(gpa, null, null);
+    const gap = random.uintLessThan(usize, kids.len + 1);
+    var a: ?[]const u8 = if (gap == 0) null else d.structOrderKey(kids[gap - 1]);
+    var b: ?[]const u8 = if (gap == kids.len) null else d.structOrderKey(kids[gap]);
+    if (a != null and b != null and std.mem.eql(u8, a.?, b.?)) {
+        var lo = gap;
+        while (lo > 0 and std.mem.eql(u8, d.structOrderKey(kids[lo - 1]).?, a.?)) lo -= 1;
+        var hi = gap;
+        while (hi < kids.len and std.mem.eql(u8, d.structOrderKey(kids[hi]).?, b.?)) hi += 1;
+        a = if (lo == 0) null else d.structOrderKey(kids[lo - 1]);
+        b = if (hi == kids.len) null else d.structOrderKey(kids[hi]);
+    }
+    return ObjectDoc.orderKeyBetween(gpa, a, b);
 }

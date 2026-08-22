@@ -47,6 +47,16 @@ pub const ValPayload = union(enum) {
     new_text,
 };
 
+/// Where a structural node's parent register can point (F3, delta 6 —
+/// `stemma-unification.md` §3 step 5, ported from `structure_sketch.zig`'s
+/// `NodeRef`): the two permanent roots, or another structural node by
+/// portable identity. Wire-portable (`ObjId` = `EventId`).
+pub const StructRef = union(enum) {
+    root,
+    trash,
+    node: ObjId,
+};
+
 pub const ObjectOp = union(enum) {
     map_set: struct { obj: ?ObjId, key: Str, val: ValPayload },
     map_del: struct { obj: ?ObjId, key: Str },
@@ -54,9 +64,47 @@ pub const ObjectOp = union(enum) {
     list_del: struct { obj: ObjId, pos: u64 },
     text_ins: struct { obj: ObjId, pos: u64, ch: u21 },
     text_del: struct { obj: ObjId, pos: u64 },
+    /// Allocates a new structural node (identity = this event's own id,
+    /// and — see `Walker.resolveObj`'s `.struct_create` case — it also
+    /// doubles as an ordinary map object, so `mapSet`/`mapGet` work on it
+    /// unmodified) and performs its first parent-register write in the
+    /// same event. Mirrors `structure_sketch.zig`'s `StructureOp.create`.
+    struct_create: struct { parent: StructRef, order_key: Str },
+    /// A subsequent parent-register write against an existing structural
+    /// node. Identity-preserving move: exactly one register write, same
+    /// shape as `create`'s. Mirrors the sketch's `StructureOp.move`.
+    struct_move: struct { node: ObjId, parent: StructRef, order_key: Str },
 };
 
 pub const Graph = causal.EventGraph(ObjectOp);
+
+// ── Order keys (F3, delta 6): byte-string fractional midpoints ─────────
+// Ported verbatim from `structure_sketch.zig`'s `between` — see that
+// file's module doc for the full growth-bound discussion (random
+// insertion ~O(log N); adversarial same-gap insertion ~N/8 bytes; a real
+// implementation needs periodic sibling-key rebalancing during
+// compaction, not attempted here — see `ObjectDoc.compact`'s doc comment
+// on why structural ops refuse compaction outright for now).
+
+/// Byte-string fractional midpoint strictly between `a` and `b` (`null` a =
+/// -infinity, `null` b = +infinity). Caller owns the returned slice.
+pub fn between(gpa: Allocator, a: ?[]const u8, b: ?[]const u8) Allocator.Error![]u8 {
+    assert(a == null or b == null or std.mem.order(u8, a.?, b.?) == .lt);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (true) {
+        const da: u16 = if (a) |aa| (if (i < aa.len) aa[i] else 0) else 0;
+        const db: u16 = if (b) |bb| (if (i < bb.len) bb[i] else 256) else 256;
+        if (db - da >= 2) {
+            const mid = da + (db - da) / 2;
+            try out.append(gpa, @intCast(mid));
+            return out.toOwnedSlice(gpa);
+        }
+        try out.append(gpa, @intCast(da));
+        i += 1;
+    }
+}
 
 /// A text object's compacted pre-history: alive scalar content as of the
 /// stable point it was last compacted at (`ObjectDoc.compact`, delta 2,
@@ -75,6 +123,14 @@ pub const TextBase = struct { bytes: []const u8, scalars: usize };
 /// changes, so this one doesn't.
 pub const TextBaseMap = std.AutoHashMapUnmanaged(causal.EventId, TextBase);
 
+/// Walker-internal (Lv-space) counterpart to `StructRef` — resolved once
+/// per structural event via `Walker.resolveStructRef`.
+pub const StructTarget = union(enum) {
+    root,
+    trash,
+    node: Lv,
+};
+
 /// Effects emitted for NEW events during replay, in application order.
 /// Positions are indices/scalars valid against the state produced by all
 /// previously emitted effects.
@@ -85,6 +141,40 @@ pub const Effect = union(enum) {
     list_del: struct { obj: Lv, index: u64 },
     text_ins: struct { obj: Lv, pos: u64, ch: u21 },
     text_del: struct { obj: Lv, pos: u64 },
+    /// A structural node (F3, delta 6) was just created — emitted EAGERLY,
+    /// in causal Lv order, from `struct_create`'s own dispatch in `apply`
+    /// (unlike `struct_parent` below, which is a deferred post-pass
+    /// effect). This has to be its own effect, emitted in-line: a
+    /// SAME-BATCH `map_set`/`list_ins`/`text_ins` targeting this node
+    /// (always causally AFTER it, hence later in Lv order — see
+    /// `Walker.resolveObj`'s `.struct_create` case) needs the node to
+    /// already exist by the time IT is processed, and the deferred
+    /// `struct_parent` post-pass runs only after the WHOLE main loop
+    /// finishes. A `struct_create`'s own placement can never be
+    /// cycle-rejected (a brand-new node cannot already be anyone's
+    /// ancestor — see `Walker.resolveStructs`'s doc comment), so emitting
+    /// its existence eagerly is always sound.
+    struct_created: struct { node: Lv },
+    /// A structural node's parent-register EFFECTIVE state (winner) has
+    /// changed as a result of this replay — see `Walker.emitStructEffects`
+    /// for the before/after diff that decides when this fires, and the
+    /// module doc / `ObjectDoc.structParent` for the landmine: this is NOT
+    /// the same winner rule `map_add`/`map_remove` implement. One entry
+    /// per NODE (not per write) — only the FINAL resolved state after this
+    /// replay, unlike map's per-event add/remove pairs.
+    struct_parent: struct {
+        node: Lv,
+        parent: StructTarget,
+        order_key: Str,
+        /// The Lv of the write that IS the effective parent (may be an
+        /// earlier, already-superseded write — see `cycle_broken`).
+        key_writer: Lv,
+        /// Size of the node's causally-maximal register antichain.
+        conflict_count: u32,
+        /// True iff `key_writer` is NOT a member of that antichain — the
+        /// cycle-break survivor case (F3 caveat 1, landmine 1).
+        cycle_broken: bool,
+    },
 };
 
 // ── Per-(object, key) register state ────────────────────────────────────
@@ -142,6 +232,23 @@ pub const Walker = struct {
     kills_len: std.ArrayList(u32) = .empty,
     kills_pool: std.ArrayList(u32) = .empty,
     prep_frontier: std.ArrayList(Lv) = .empty,
+    /// Per-event Lamport timestamp (F3, delta 6) — filled ONLY when
+    /// `emitStructEffects` actually runs (`struct_events.items.len > 0`
+    /// AND there's something new to report), by `computeLamport`'s own
+    /// whole-graph pass (the SAME shape as `structure_sketch.zig`'s
+    /// `computeLamport` — a separate pass, not threaded into the main
+    /// per-event loop above). Deliberately NOT computed unconditionally:
+    /// the overwhelming majority of replays (every text/map/list-only
+    /// doc — W7's degenerate one-node text buffers chief among them) have
+    /// zero structural events and must pay zero cost for a mechanism they
+    /// never touch. Empty (and never indexed) for such a replay.
+    lamport: std.ArrayList(u32) = .empty,
+    /// Lv's of every `struct_create`/`struct_move` event visited this
+    /// replay, in Lv (causal) order — the candidate pool
+    /// `emitStructEffects` sorts into GLOBAL Lamport-canonical order. Kept
+    /// separate from `maps`/`seqs` because parent-register resolution is
+    /// not a per-key/per-sequence discipline (see landmine 1).
+    struct_events: std.ArrayList(Lv) = .empty,
 
     pub const root_key: Lv = std.math.maxInt(Lv);
 
@@ -182,6 +289,8 @@ pub const Walker = struct {
         self.kills_len.deinit(gpa);
         self.kills_pool.deinit(gpa);
         self.prep_frontier.deinit(gpa);
+        self.lamport.deinit(gpa);
+        self.struct_events.deinit(gpa);
     }
 
     fn str(self: *const Walker, s: Str) []const u8 {
@@ -210,6 +319,12 @@ pub const Walker = struct {
         const val: ?ValPayload = switch (self.graph.opOf(creation)) {
             .map_set => |m| m.val,
             .list_ins => |l| l.val,
+            // A structural node (F3, delta 6) doubles as an ordinary map
+            // object for property storage — its OWN placement in the
+            // parent-register tree is a separate concern (see
+            // `resolveStructRef`/`resolveStructNode`), but `mapSet`/
+            // `mapGet` against it work unmodified once it exists.
+            .struct_create => .new_map,
             else => null,
         };
         const ok = if (val) |v| switch (v) {
@@ -251,6 +366,13 @@ pub const Walker = struct {
             self.prep_frontier.clearRetainingCapacity();
             try self.prep_frontier.append(gpa, lv);
         }
+        // Lamport (F3, delta 6) is computed ONLY here, inside
+        // `emitStructEffects`, and ONLY when there is at least one
+        // structural event — see `lamport`'s doc comment: a struct-free
+        // replay (the common case) never allocates or touches it.
+        if (self.struct_events.items.len > 0) {
+            try self.emitStructEffects(gpa, first_new, out);
+        }
     }
 
     /// `SeqWalker.movePrepareTo`'s per-event callback: advance (`on =
@@ -277,6 +399,12 @@ pub const Walker = struct {
                     if (on) v.prep_overwritten += 1 else v.prep_overwritten -= 1;
                 }
             },
+            // Structural ops (F3, delta 6) have no per-key/per-sequence
+            // prepare-visibility state to retreat/advance — their
+            // resolution is a separate, GLOBAL canonical-order pass (see
+            // `emitStructEffects`), not relative to any one event's
+            // authoring-time frontier.
+            .struct_create, .struct_move => {},
         }
     }
 
@@ -395,6 +523,16 @@ pub const Walker = struct {
                     if (res.effect_pos) |pos| try out.append(gpa, .{ .text_del = .{ .obj = obj, .pos = pos } });
                 }
             },
+            .struct_create => |c| {
+                _ = try self.resolveStructRef(c.parent, lv, emit);
+                try self.struct_events.append(gpa, lv);
+                if (emit) try out.append(gpa, .{ .struct_created = .{ .node = lv } });
+            },
+            .struct_move => |m| {
+                _ = try self.resolveStructNode(m.node, lv, emit);
+                _ = try self.resolveStructRef(m.parent, lv, emit);
+                try self.struct_events.append(gpa, lv);
+            },
         }
     }
 
@@ -426,6 +564,272 @@ pub const Walker = struct {
             }
         }
         self.kills_len.items[lv] = killed;
+    }
+
+    // ── Structural parent-register resolution (F3, delta 6) ────────────
+    // `stemma-unification.md` §3 step 5, ported from
+    // `structure_sketch.zig`'s `materialize`/`computeLamport`/`CanonCtx`.
+    // See landmine 1 (`ObjectDoc.structParent`'s doc comment): this is a
+    // GLOBAL, replica-portable total order over every structural write —
+    // Lamport per event, ties broken by (agent name, seq) — replayed once
+    // with per-write cycle rejection. It is NOT the per-register MV rule
+    // `registerWrite`/`mapGet` use above; a tree's parent registers can't
+    // be resolved one register at a time, because an edge accepted in one
+    // node's register can make a candidate edge in ANOTHER node's
+    // register cyclic.
+    //
+    // Delta from the sketch's `materialize`: the sketch recomputes the
+    // WHOLE tree from scratch on every call, into a standalone
+    // `Materialized` value a caller queries separately from any replay.
+    // Here, resolution is scoped to just the `struct_create`/`struct_move`
+    // SUBSET of events (`struct_events`, collected during the ordinary
+    // Lv-ordered pass above — cheap when most of the document is
+    // map/list/text, unlike the sketch's document which has nothing else),
+    // and its OUTPUT is `Effect`s appended to the SAME stream
+    // `ObjectDoc.merge`'s existing effect-consuming loop already drives —
+    // not a second, disconnected query surface. To decide WHICH nodes
+    // actually changed (so `merge`'s `Change` stream stays a real diff,
+    // not "every structural node, every merge"), resolution runs twice per
+    // replay — once restricted to events strictly before `first_new` (the
+    // "before" state: what a prior call already materialized), once over
+    // every visited event (the "after" state) — and only nodes whose
+    // resolved (key_writer, cycle_broken, conflict_count) tuple differs
+    // emit an effect. This is NOT a fully cross-merge-incremental
+    // canonical replay (a new event with lower Lamport than
+    // already-resolved ones can, in principle, change a distant node's
+    // outcome — the before/after diff catches this correctly because it
+    // always recomputes the full canonical order over `struct_events`, it
+    // just avoids re-touching `map`/`seq` state to do it); true
+    // incrementality across separate `Walker` instances is not attempted,
+    // matching every OTHER piece of `Walker` state (a fresh `Walker` walks
+    // `0..n` on every `replayAll` call already — see the type doc above).
+
+    const ResolvedStruct = struct {
+        have_state: bool = false,
+        parent: StructTarget = .root,
+        order_key: Str = undefined,
+        key_writer: Lv = undefined,
+        conflict_count: u32 = 0,
+        cycle_broken: bool = false,
+    };
+
+    /// `ref` (portable `StructRef`) → Walker-local `StructTarget`,
+    /// validating existence/causal-order/kind exactly like `resolveObj`
+    /// (`untrusted`: true for a new, not-yet-trusted remote event).
+    fn resolveStructRef(self: *const Walker, ref: StructRef, at_lv: Lv, untrusted: bool) error{Corrupt}!StructTarget {
+        return switch (ref) {
+            .root => .root,
+            .trash => .trash,
+            .node => |id| .{ .node = try self.resolveStructNode(id, at_lv, untrusted) },
+        };
+    }
+
+    /// Same as `resolveStructRef`'s `.node` case, standalone — used for
+    /// `struct_move`'s `node` field, which (unlike `parent`) is never
+    /// `.root`/`.trash`.
+    fn resolveStructNode(self: *const Walker, id: ObjId, at_lv: Lv, untrusted: bool) error{Corrupt}!Lv {
+        const creation = self.graph.lvOf(id) orelse {
+            if (untrusted) return error.Corrupt;
+            unreachable;
+        };
+        if (creation >= at_lv) {
+            if (untrusted) return error.Corrupt;
+            unreachable;
+        }
+        const ok = switch (self.graph.opOf(creation)) {
+            .struct_create => true,
+            else => false,
+        };
+        if (!ok) {
+            if (untrusted) return error.Corrupt;
+            unreachable;
+        }
+        return creation;
+    }
+
+    /// Same resolution as `resolveStructRef`, but for a ref ALREADY
+    /// validated earlier this replay (every `struct_events` member passed
+    /// through `resolveStructRef`/`resolveStructNode` in `apply` first) —
+    /// used by `resolveStructs`'s canonical-order pass, which re-derives
+    /// `parent`/`node` from `graph.opOf` rather than stashing them.
+    fn resolveStructRefTrusted(self: *const Walker, ref: StructRef) StructTarget {
+        return switch (ref) {
+            .root => .root,
+            .trash => .trash,
+            .node => |id| .{ .node = self.graph.lvOf(id).? },
+        };
+    }
+
+    /// Would giving `node` the parent `parent` make `node` its own
+    /// ancestor, given `states` (already acyclic, by induction — see
+    /// `resolveStructs`'s proof note, mirroring
+    /// `structure_sketch.zig:wouldCycle`)?
+    fn wouldCycleStruct(states: *const std.AutoHashMapUnmanaged(Lv, ResolvedStruct), node: Lv, parent: StructTarget) bool {
+        if (parent != .node) return false;
+        var cur = parent.node;
+        if (cur == node) return true;
+        var guard: usize = 0;
+        while (true) {
+            guard += 1;
+            assert(guard <= states.count() + 2); // invariant: chains are finite and acyclic
+            const st = states.get(cur) orelse return false;
+            if (!st.have_state) return false;
+            switch (st.parent) {
+                .root, .trash => return false,
+                .node => |next| {
+                    if (next == node) return true;
+                    cur = next;
+                },
+            }
+        }
+    }
+
+    /// Resolve every `struct_events` member with `lv < horizon` into final
+    /// per-node parent-register state, in GLOBAL Lamport-canonical order
+    /// with per-write cycle rejection — see the section doc comment above.
+    /// Caller owns the returned map (`freeStructStates`).
+    fn resolveStructs(self: *const Walker, gpa: Allocator, horizon: Lv) Allocator.Error!std.AutoHashMapUnmanaged(Lv, ResolvedStruct) {
+        var order: std.ArrayList(Lv) = .empty;
+        defer order.deinit(gpa);
+        for (self.struct_events.items) |lv| {
+            if (lv < horizon) try order.append(gpa, lv);
+        }
+        const SortCtx = struct {
+            w: *const Walker,
+            fn less(ctx: @This(), a: Lv, b: Lv) bool {
+                const la = ctx.w.lamport.items[a];
+                const lb = ctx.w.lamport.items[b];
+                if (la != lb) return la < lb;
+                const ida = ctx.w.graph.idOf(a);
+                const idb = ctx.w.graph.idOf(b);
+                const name_order = std.mem.order(u8, ctx.w.graph.agentName(ida.agent), ctx.w.graph.agentName(idb.agent));
+                if (name_order != .eq) return name_order == .lt;
+                return ida.seq < idb.seq;
+            }
+        };
+        std.mem.sort(Lv, order.items, SortCtx{ .w = self }, SortCtx.less);
+
+        var live: std.AutoHashMapUnmanaged(Lv, std.ArrayList(Lv)) = .empty;
+        defer {
+            var lit = live.valueIterator();
+            while (lit.next()) |l| l.deinit(gpa);
+            live.deinit(gpa);
+        }
+        var states: std.AutoHashMapUnmanaged(Lv, ResolvedStruct) = .empty;
+        errdefer states.deinit(gpa);
+
+        for (order.items) |lv| {
+            const op = self.graph.opOf(lv);
+            const node: Lv = switch (op) {
+                .struct_create => lv,
+                .struct_move => |m| self.graph.lvOf(m.node).?, // validated in `apply`
+                else => unreachable,
+            };
+            const parent: StructTarget = switch (op) {
+                .struct_create => |c| self.resolveStructRefTrusted(c.parent),
+                .struct_move => |m| self.resolveStructRefTrusted(m.parent),
+                else => unreachable,
+            };
+            const order_key: Str = switch (op) {
+                .struct_create => |c| c.order_key,
+                .struct_move => |m| m.order_key,
+                else => unreachable,
+            };
+
+            // Register conflict bookkeeping: keep entries not causally
+            // superseded by this write, then add it — identical rule to
+            // `registerWrite`'s map-register bookkeeping above, just keyed
+            // by node instead of (obj, key).
+            const live_gop = try live.getOrPut(gpa, node);
+            if (!live_gop.found_existing) live_gop.value_ptr.* = .empty;
+            var w: usize = 0;
+            for (live_gop.value_ptr.items) |e| {
+                const rel = try self.graph.compareFrontiers(gpa, &.{e}, &.{lv});
+                if (rel != .ancestor) {
+                    live_gop.value_ptr.items[w] = e;
+                    w += 1;
+                }
+            }
+            live_gop.value_ptr.items.len = w;
+            try live_gop.value_ptr.append(gpa, lv);
+
+            const st_gop = try states.getOrPut(gpa, node);
+            if (!st_gop.found_existing) st_gop.value_ptr.* = .{};
+
+            if (op == .struct_move and wouldCycleStruct(&states, node, parent)) continue; // rejected
+
+            st_gop.value_ptr.have_state = true;
+            st_gop.value_ptr.parent = parent;
+            st_gop.value_ptr.order_key = order_key;
+            st_gop.value_ptr.key_writer = lv;
+        }
+
+        var sit = states.iterator();
+        while (sit.next()) |kv| {
+            const l = live.get(kv.key_ptr.*).?;
+            kv.value_ptr.conflict_count = @intCast(l.items.len);
+            kv.value_ptr.cycle_broken = std.mem.indexOfScalar(Lv, l.items, kv.value_ptr.key_writer) == null;
+        }
+        return states;
+    }
+
+    fn freeStructStates(gpa: Allocator, m: *std.AutoHashMapUnmanaged(Lv, ResolvedStruct)) void {
+        m.deinit(gpa);
+    }
+
+    /// `lamport[lv] = 1 + max(lamport[parent])` over the WHOLE graph
+    /// (every op kind — a structural event's parents can be non-structural
+    /// events, since `ObjectDoc` shares ONE `EventGraph` across every op),
+    /// a separate pass exactly like `structure_sketch.zig:computeLamport`.
+    /// Only ever called from `emitStructEffects`, which only runs when
+    /// `struct_events` is non-empty — see `lamport`'s doc comment for why
+    /// this is deliberately NOT folded into the main per-event loop above.
+    fn computeLamport(self: *Walker, gpa: Allocator) Allocator.Error!void {
+        const n = self.graph.eventCount();
+        try self.lamport.appendNTimes(gpa, 0, n);
+        for (0..n) |lv_usize| {
+            const lv: Lv = @intCast(lv_usize);
+            var m: u32 = 0;
+            for (self.graph.parentsOf(lv)) |p| m = @max(m, self.lamport.items[p] + 1);
+            self.lamport.items[lv] = m;
+        }
+    }
+
+    /// Diff the "before this replay's new events" and "after" resolved
+    /// structural state, emitting one `Effect.struct_parent` per node
+    /// whose (winner, cycle-break status, conflict count) actually
+    /// changed. See the section doc comment above for why this is scoped
+    /// to `struct_events` rather than the whole graph, and what
+    /// "incremental" does and doesn't mean here.
+    fn emitStructEffects(self: *Walker, gpa: Allocator, first_new: Lv, out: *std.ArrayList(Effect)) Allocator.Error!void {
+        const n_all: Lv = @intCast(self.graph.eventCount());
+        if (first_new >= n_all) return; // nothing new this replay — no-op fast path
+        try self.computeLamport(gpa);
+        var before = try self.resolveStructs(gpa, first_new);
+        defer freeStructStates(gpa, &before);
+        var after = try self.resolveStructs(gpa, n_all);
+        defer freeStructStates(gpa, &after);
+
+        var it = after.iterator();
+        while (it.next()) |kv| {
+            const node = kv.key_ptr.*;
+            const ns = kv.value_ptr.*;
+            if (!ns.have_state) continue; // unreachable in practice: create always accepts
+            const changed = if (before.get(node)) |os|
+                (!os.have_state or os.key_writer != ns.key_writer or
+                    os.cycle_broken != ns.cycle_broken or os.conflict_count != ns.conflict_count)
+            else
+                true;
+            if (!changed) continue;
+            try out.append(gpa, .{ .struct_parent = .{
+                .node = node,
+                .parent = ns.parent,
+                .order_key = ns.order_key,
+                .key_writer = ns.key_writer,
+                .conflict_count = ns.conflict_count,
+                .cycle_broken = ns.cycle_broken,
+            } });
+        }
     }
 };
 
