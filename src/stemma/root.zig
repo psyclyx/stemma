@@ -39,6 +39,7 @@ const std = @import("std");
 const geometry = @import("geometry.zig");
 const rope = @import("rope.zig");
 const causal = @import("collab/causal.zig");
+const seq_walker = @import("collab/SeqWalker.zig");
 
 // ── Value types ──
 pub const Point = geometry.Point;
@@ -61,6 +62,14 @@ pub const EventGraph = causal.EventGraph;
 pub const AgentId = causal.AgentId;
 pub const EventId = causal.EventId;
 pub const VersionOrder = causal.VersionOrder;
+/// The portable identity-anchor shape (agent name + seq + side) shared by
+/// `TextDoc` (whole-document `SeqWalker`) and `ObjectDoc` (one `SeqWalker`
+/// per text object) — `SeqWalker.zig`'s `EventAnchor`/`AnchorSide`, named
+/// here once so callers of either doc type (or code, like `Document`'s
+/// facade, generic over which one backs it) can spell the shared type
+/// without reaching through either doc's re-export.
+pub const EventAnchor = seq_walker.EventAnchor;
+pub const AnchorSide = seq_walker.AnchorSide;
 
 test {
     _ = geometry;

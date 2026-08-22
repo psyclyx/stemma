@@ -259,6 +259,14 @@ pub fn setAgent(self: *ObjectDoc, gpa: Allocator, name: []const u8) Allocator.Er
     self.agent = try self.history.registerAgent(gpa, name);
 }
 
+/// Raw event count since the last compaction (or since genesis,
+/// uncompacted) — replay cost scales with this. Delegates to `history`
+/// so callers never need to reach through `ObjectDoc`'s internal `Graph`
+/// field.
+pub fn eventCount(self: *const ObjectDoc) usize {
+    return self.history.eventCount();
+}
+
 // ObjId values are DOC-LOCAL handles (they embed replica-local agent
 // numbering) — never transport one to another replica. To reference an
 // object across peers, either navigate document structure (paths) or

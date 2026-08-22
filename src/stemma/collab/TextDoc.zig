@@ -261,6 +261,14 @@ pub fn setAgent(self: *TextDoc, gpa: Allocator, name: []const u8) Allocator.Erro
     self.agent = try self.history.registerAgent(gpa, name);
 }
 
+/// Raw event count since the last compaction (or since genesis,
+/// uncompacted) — replay cost scales with this. Delegates to `history`
+/// so callers never need to reach through `TextDoc`'s internal `Graph`
+/// field.
+pub fn eventCount(self: *const TextDoc) usize {
+    return self.history.eventCount();
+}
+
 /// Read access to the materialized document.
 pub fn text(self: *const TextDoc) *const Rope {
     return &self.rope;
