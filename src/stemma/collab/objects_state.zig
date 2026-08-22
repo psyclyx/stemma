@@ -58,6 +58,23 @@ pub const ObjectOp = union(enum) {
 
 pub const Graph = causal.EventGraph(ObjectOp);
 
+/// A text object's compacted pre-history: alive scalar content as of the
+/// stable point it was last compacted at (`ObjectDoc.compact`, delta 2,
+/// `stemma-unification.md` §3 step 4) — the per-object analog of
+/// `TextDoc.base_bytes`/`base_scalars`. Only text objects get one (see
+/// `ObjectDoc.zig`'s compaction doc comment for why list content doesn't).
+/// Owned by the `ObjectDoc`; `Walker` only borrows it (read-only, to seed
+/// a fresh per-object `SeqWalker`'s `initBase`).
+pub const TextBase = struct { bytes: []const u8, scalars: usize };
+/// Keyed by the text object's PORTABLE creation identity, not its `Lv` —
+/// under whole-doc compaction the object's OWN creation event (a
+/// `map_set` or `list_ins`) can itself end up compacted away, same as
+/// any other event before the stable point (see `ObjectDoc.compact`'s
+/// doc comment on why `in_base` can't selectively exempt op kinds). A
+/// `Lv`-keyed map would need re-keying on every `compact`; `EventId` never
+/// changes, so this one doesn't.
+pub const TextBaseMap = std.AutoHashMapUnmanaged(causal.EventId, TextBase);
+
 /// Effects emitted for NEW events during replay, in application order.
 /// Positions are indices/scalars valid against the state produced by all
 /// previously emitted effects.
@@ -102,6 +119,14 @@ const MapReg = struct {
 pub const Walker = struct {
     graph: *const Graph,
     strings: []const u8,
+    /// This doc's compacted text-object bases, if any (`null` for a doc
+    /// that has never compacted — the common case, and every call site
+    /// before delta 2). Borrowed; `Walker` never mutates it. Consulted
+    /// exactly once per object, the moment its `SeqWalker` is first
+    /// created (`getSeqWalker`) — list objects are never present in the
+    /// map (see `TextBase`'s doc comment), so this is a no-op lookup for
+    /// them, same cost as today.
+    text_bases: ?*const TextBaseMap = null,
 
     /// Object-lv (or `root_key`) → sequence / register state. Each
     /// `SeqWalker` owns its own object's retreat/advance/apply
@@ -131,6 +156,18 @@ pub const Walker = struct {
 
     pub fn init(graph: *const Graph, strings: []const u8) Walker {
         return .{ .graph = graph, .strings = strings };
+    }
+
+    /// Same as `init`, plus this doc's compacted text-object bases — every
+    /// call site that replays against a doc which may have compacted
+    /// (`ObjectDoc.historyPhase`, `ObjectDoc.silentObjectReplay`,
+    /// `ObjectDoc.compact`'s own base-materialization pass) must use this
+    /// instead of `init`, or a freshly-touched compacted text object's
+    /// `SeqWalker` would start with no base at all (empty document,
+    /// silently wrong — not an error, so this is worth getting right at
+    /// every call site rather than defaulting).
+    pub fn initWithBases(graph: *const Graph, strings: []const u8, text_bases: *const TextBaseMap) Walker {
+        return .{ .graph = graph, .strings = strings, .text_bases = text_bases };
     }
 
     pub fn deinit(self: *Walker, gpa: Allocator) void {
@@ -189,14 +226,26 @@ pub const Walker = struct {
     }
 
     /// Replay the whole graph in Lv order; events at `lv >= first_new`
-    /// emit effects.
-    pub fn replayAll(self: *Walker, gpa: Allocator, first_new: Lv, out: *std.ArrayList(Effect)) ReplayError!void {
+    /// emit effects. `include` (mirrors `TextDoc.Replay.replayAll`): when
+    /// non-null, events where `include[lv]` is false are skipped
+    /// entirely — as if absent from the graph, not merely silent. Used by
+    /// `ObjectDoc.compact` to materialize per-object state as of a past
+    /// stable point without walking the events strictly after it; `null`
+    /// (the normal, hot path) walks everything.
+    pub fn replayAll(
+        self: *Walker,
+        gpa: Allocator,
+        first_new: Lv,
+        out: *std.ArrayList(Effect),
+        include: ?[]const bool,
+    ) ReplayError!void {
         const n = self.graph.eventCount();
         try self.reg_pos_of.appendNTimes(gpa, none, n);
         try self.kills_start.appendNTimes(gpa, 0, n);
         try self.kills_len.appendNTimes(gpa, 0, n);
         for (0..n) |lv_usize| {
             const lv: Lv = @intCast(lv_usize);
+            if (include) |inc| if (!inc[lv]) continue;
             try seq_walker.movePrepareTo(gpa, self.graph, &self.prep_frontier, self.graph.parentsOf(lv), self);
             try self.apply(gpa, lv, lv >= first_new, out);
             self.prep_frontier.clearRetainingCapacity();
@@ -264,7 +313,18 @@ pub const Walker = struct {
 
     fn getSeqWalker(self: *Walker, gpa: Allocator, obj: Lv) Allocator.Error!*SeqWalker {
         const gop = try self.seqs.getOrPut(gpa, obj);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+            // Seed a freshly-touched object's placeholder items from its
+            // compacted base, if it has one (text objects only — see
+            // `TextBase`). Must happen before any real item is applied
+            // (`SeqWalker.initBase`'s own precondition).
+            if (self.text_bases) |bases| {
+                if (bases.get(self.graph.idOf(obj))) |base| {
+                    try gop.value_ptr.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv);
+                }
+            }
+        }
         return gop.value_ptr;
     }
 

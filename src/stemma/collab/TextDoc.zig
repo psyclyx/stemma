@@ -838,41 +838,23 @@ pub fn compact(self: *TextDoc, gpa: Allocator, stable_token: []const u8) Compact
 
     // Rebuild the graph: same agents (same order → same AgentIds, so
     // `self.agent` stays valid), watermarks raised by their share of
-    // the base, retained events re-added in causal order.
-    var new_graph: Graph = .empty;
-    errdefer new_graph.deinit(gpa);
-    for (self.history.agents.items, 0..) |a, i| {
-        const name = self.history.names.items[a.name_start..][0..a.name_len];
-        const aid = try new_graph.registerAgent(gpa, name);
-        assert(@intFromEnum(aid) == i);
-        var compacted: u64 = 0;
-        for (a.lv_by_seq.items) |lv| {
-            if (in_base[lv]) compacted += 1;
-        }
-        new_graph.agents.items[i].seq_base = a.seq_base + compacted;
-    }
-    const lv_map = try gpa.alloc(Lv, n);
-    defer gpa.free(lv_map);
-    var parent_buf: std.ArrayList(Lv) = .empty;
-    defer parent_buf.deinit(gpa);
-    for (0..n) |old_lv| {
-        if (in_base[old_lv]) continue;
-        parent_buf.clearRetainingCapacity();
-        for (self.history.parentsOf(@intCast(old_lv))) |p| {
-            if (p == s) continue; // implicit: based on the base
-            assert(!in_base[p]);
-            try parent_buf.append(gpa, lv_map[p]);
-        }
-        const e = self.history.events.items[old_lv];
-        lv_map[old_lv] = try new_graph.add(gpa, e.id, parent_buf.items, e.op);
-    }
+    // the base, retained events re-added in causal order. Graph-shape-only
+    // (never inspects `TextOp`) — shared with `ObjectDoc.compact` as
+    // `causal.compactGraph` (`stemma-unification.md` §3 step 4). The
+    // reachability check just above guarantees every retained event's only
+    // `in_base` parent (if any) is `s` itself, so `compactGraph`'s blanket
+    // "drop any `in_base` parent" rule specializes, for TextDoc, to exactly
+    // the old "skip `p == s`, assert no other `in_base` parent" logic.
+    var result = try causal.compactGraph(gpa, &self.history, in_base, s);
+    errdefer result.graph.deinit(gpa);
+    gpa.free(result.lv_map); // TextDoc has no lv-indexed state to remap
 
     // Commit.
     const head_id = self.history.idOf(s);
     const head_name = try gpa.dupe(u8, self.history.agentName(head_id.agent));
     defer gpa.free(head_name);
     self.history.deinit(gpa);
-    self.history = new_graph;
+    self.history = result.graph;
     gpa.free(self.base_bytes);
     gpa.free(self.base_version);
     self.base_bytes = new_base_bytes;

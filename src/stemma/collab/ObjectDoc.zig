@@ -53,8 +53,15 @@ const Edit = geometry.Edit;
 const putUv = wire.putUv;
 const getUv = wire.getUv;
 const getBytes = wire.getBytes;
+const versionSingleEntry = core.versionSingleEntry;
 
-const object_magic = "stj\x01";
+const object_magic_v1 = "stj\x01";
+/// v2: emitted only once this doc has compacted (`base_version.len > 0`).
+/// A doc that has never compacted always emits `object_magic_v1` bytes,
+/// byte-identical to pre-delta-2 output — old decoders (and every
+/// hand-written wire-byte test) keep working unchanged. See the "Wire
+/// format" section below for the exact v1/v2 layout diff.
+const object_magic_v2 = "stj\x02";
 const version_magic = core.version_magic;
 const no_node: u32 = std.math.maxInt(u32);
 const root_key = Walker.root_key;
@@ -91,12 +98,38 @@ agent: ?AgentId = null,
 strings: std.ArrayList(u8) = .empty,
 /// Materialized tree. Node 0 (once created) is the root map.
 nodes: std.ArrayList(Node) = .empty,
-/// Creation-event lv → node index (no_node until materialized).
+/// Creation-event lv → node index (no_node until materialized). ONLY
+/// valid against `self.history`'s CURRENT `Lv` space — a transient,
+/// replay-time index (`nodeOfObjLv`), rebuilt at the new size on every
+/// `compact`. Never consult it with an `Lv` obtained before a `compact`
+/// call; that's exactly what `obj_index` is for.
 node_of: std.ArrayList(u32) = .empty,
+/// Creation `EventId` → node index — the STABLE counterpart to `node_of`,
+/// keyed by portable identity rather than `Lv`. Populated once per
+/// creation (`makeValueNode`) and NEVER touched by `compact` (an
+/// `EventId` doesn't change when its creating event's `Lv` is renumbered
+/// or folded into a base — see `compact`'s doc comment). This is what
+/// makes an `ObjId` obtained before compaction still resolve afterward.
+obj_index: std.AutoHashMapUnmanaged(EventId, u32) = .empty,
+
+/// Compaction (delta 2, `stemma-unification.md` §3 step 4). Whole-doc,
+/// one linearization point — see `compact`'s doc comment for the exact
+/// contract: only `text_ins`/`text_del` ever fold away; map registers and
+/// list structure never do. `base_version.len == 0` = never compacted
+/// (every doc's initial state; the overwhelming common case, and the
+/// ONLY state pre-delta-2 code ever saw).
+base_version: []u8 = &.{},
+/// The single stable head `base_version` was compacted at, once compacted.
+base_head: ?EventId = null,
+/// Per-text-object compacted bases — see `jw.TextBase`. Keyed by the
+/// text object's portable creation identity (`jw.TextBaseMap`'s doc
+/// comment).
+text_bases: jw.TextBaseMap = .empty,
 
 pub const empty: ObjectDoc = .{};
 
 pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency };
+pub const CompactError = MergeError || error{NotCompactable};
 pub const VersionOrder = causal.VersionOrder;
 
 // Identity anchors (delta 3, stemma-unification.md §3 step 3): same
@@ -110,13 +143,23 @@ pub const EventAnchor = seq_walker.EventAnchor;
 pub const AnchorError = seq_walker.AnchorError;
 
 const ScalarNode = union(enum) { null_, bool_: bool, int: i64, float: f64, str: Str };
-const TreeVal = struct { set_lv: Lv, node: u32 };
+// `TreeVal.set_id` and every `Node` variant's `obj` are the PORTABLE
+// identity (`EventId` = agent + seq) of the event that created them, not
+// the transient `Lv` of the moment — see `compact`'s doc comment: once
+// map/list/text creation events can themselves be folded into a
+// compacted base, a raw `Lv` stops being a valid handle (it may no
+// longer name any node in `self.history` at all), while `EventId` is
+// stable forever (compaction renumbers `Lv`s; it never changes an
+// agent's registration order or an event's `seq`). `self.obj_index`
+// (`EventId` → node index) is the read-direction counterpart, populated
+// once per creation and never touched by `compact`.
+const TreeVal = struct { set_id: EventId, node: u32 };
 const TreeSlot = struct { key: Str, values: std.ArrayList(TreeVal) = .empty };
 const Node = union(enum) {
     scalar: ScalarNode,
-    map: struct { obj: ?Lv, slots: std.ArrayList(TreeSlot) = .empty },
-    list: struct { obj: Lv, elems: std.ArrayList(u32) = .empty },
-    text: struct { obj: Lv, rope: Rope = .empty },
+    map: struct { obj: ?EventId, slots: std.ArrayList(TreeSlot) = .empty },
+    list: struct { obj: EventId, elems: std.ArrayList(u32) = .empty },
+    text: struct { obj: EventId, rope: Rope = .empty },
 };
 
 pub fn deinit(self: *ObjectDoc, gpa: Allocator) void {
@@ -131,8 +174,13 @@ pub fn deinit(self: *ObjectDoc, gpa: Allocator) void {
     };
     self.nodes.deinit(gpa);
     self.node_of.deinit(gpa);
+    self.obj_index.deinit(gpa);
     self.strings.deinit(gpa);
     self.history.deinit(gpa);
+    gpa.free(self.base_version);
+    var bit = self.text_bases.valueIterator();
+    while (bit.next()) |b| gpa.free(b.bytes);
+    self.text_bases.deinit(gpa);
     self.* = .{};
 }
 
@@ -195,31 +243,47 @@ fn ensureNodeMap(self: *ObjectDoc, gpa: Allocator) Allocator.Error!void {
     }
 }
 
+/// `obj`'s node index, valid ONLY against `self.history`'s CURRENT `Lv`
+/// space — used strictly transiently, during local edits or one replay
+/// pass, always with an `Lv` obtained THIS SAME call (never one cached
+/// across a `compact`).
 fn nodeOfObjLv(self: *const ObjectDoc, obj: Lv) u32 {
     return if (obj == root_key) 0 else self.node_of.items[obj];
 }
 
+/// `obj`'s node index by PORTABLE identity — safe against an `ObjId`
+/// obtained at any point in the past, compacted away or not (see
+/// `obj_index`'s doc comment).
 fn resolveObjNode(self: *const ObjectDoc, obj: ?ObjId) u32 {
     const id = obj orelse return 0;
-    return self.node_of.items[self.history.lvOf(id).?];
+    return self.obj_index.get(id).?;
 }
 
-/// Create the tree node for a freshly applied value payload.
+/// Create the tree node for a freshly applied value payload. `creation_lv`
+/// is this replica's CURRENT `Lv` for the creating event — used only to
+/// look up its portable `EventId` (stored on the node, and as
+/// `obj_index`'s key) and to size-index the transient `node_of`; never
+/// itself retained past this call.
 fn makeValueNode(self: *ObjectDoc, gpa: Allocator, val: ValPayload, creation_lv: Lv) Allocator.Error!u32 {
     const idx: u32 = @intCast(self.nodes.items.len);
+    const id = self.history.idOf(creation_lv);
     const node: Node = switch (val) {
         .null_ => .{ .scalar = .null_ },
         .bool_ => |b| .{ .scalar = .{ .bool_ = b } },
         .int => |v| .{ .scalar = .{ .int = v } },
         .float => |v| .{ .scalar = .{ .float = v } },
         .str => |s| .{ .scalar = .{ .str = s } },
-        .new_map => .{ .map = .{ .obj = creation_lv } },
-        .new_list => .{ .list = .{ .obj = creation_lv } },
-        .new_text => .{ .text = .{ .obj = creation_lv } },
+        .new_map => .{ .map = .{ .obj = id } },
+        .new_list => .{ .list = .{ .obj = id } },
+        .new_text => .{ .text = .{ .obj = id } },
     };
     try self.nodes.append(gpa, node);
+    errdefer _ = self.nodes.pop();
     switch (val) {
-        .new_map, .new_list, .new_text => self.node_of.items[creation_lv] = idx,
+        .new_map, .new_list, .new_text => {
+            self.node_of.items[creation_lv] = idx;
+            try self.obj_index.put(gpa, id, idx);
+        },
         else => {},
     }
     return idx;
@@ -264,7 +328,7 @@ pub fn mapSet(self: *ObjectDoc, gpa: Allocator, obj: ?ObjId, key: []const u8, va
     const value_node = try self.makeValueNode(gpa, payload, lv);
     const slot = try self.treeSlot(gpa, map_node, key_str);
     slot.values.clearRetainingCapacity(); // local set overwrites all seen
-    try slot.values.append(gpa, .{ .set_lv = lv, .node = value_node });
+    try slot.values.append(gpa, .{ .set_id = self.history.idOf(lv), .node = value_node });
     return switch (payload) {
         .new_map, .new_list, .new_text => self.history.idOf(lv),
         else => null,
@@ -407,15 +471,16 @@ pub const ValueRef = struct {
     }
 
     /// The object's identity, usable for edits (`null` = root map).
+    /// Portable and stable regardless of compaction — see `Node`'s doc
+    /// comment.
     pub fn objId(self: ValueRef) ?ObjId {
         const n = self.nodePtr() orelse return null;
-        const lv: ?Lv = switch (n.*) {
+        return switch (n.*) {
             .map => |m| m.obj,
             .list => |l| l.obj,
             .text => |t| t.obj,
             .scalar => unreachable, // scalars have no identity
         };
-        return if (lv) |v| self.doc.history.idOf(v) else null;
     }
 
     fn slotOf(self: ValueRef, key: []const u8) ?*const TreeSlot {
@@ -434,7 +499,7 @@ pub const ValueRef = struct {
         if (slot.values.items.len == 0) return null;
         var best: TreeVal = slot.values.items[0];
         for (slot.values.items[1..]) |v| {
-            if (self.doc.setOrder(best.set_lv, v.set_lv) == .lt) best = v;
+            if (self.doc.setOrder(best.set_id, v.set_id) == .lt) best = v;
         }
         return .{ .doc = self.doc, .node = best.node };
     }
@@ -480,12 +545,16 @@ pub const ValueRef = struct {
     }
 };
 
-fn setOrder(self: *const ObjectDoc, a: Lv, b: Lv) std.math.Order {
-    const ia = self.history.idOf(a);
-    const ib = self.history.idOf(b);
-    const name_order = std.mem.order(u8, self.history.agentName(ia.agent), self.history.agentName(ib.agent));
+/// Deterministic MV-register tiebreak: greatest `(agent name, seq)`.
+/// Takes `EventId`s directly (not `Lv`s) — this must stay correct even
+/// when `a`/`b` name a compacted-away `map_set` (see `Node`'s doc
+/// comment); an agent's registration and its own `seq` numbering are
+/// both stable across `compact`, so this needs nothing from `self.history`
+/// beyond `agentName`, which is.
+fn setOrder(self: *const ObjectDoc, a: EventId, b: EventId) std.math.Order {
+    const name_order = std.mem.order(u8, self.history.agentName(a.agent), self.history.agentName(b.agent));
     if (name_order != .eq) return name_order;
-    return std.math.order(ia.seq, ib.seq);
+    return std.math.order(a.seq, b.seq);
 }
 
 /// Canonical JSON dump (winner-only, keys sorted, text objects as
@@ -608,22 +677,94 @@ pub fn open(gpa: Allocator, bytes: []const u8) MergeError!ObjectDoc {
 
 /// Integrate encoded remote events; returns the change stream (caller
 /// owns). Same atomic-reject semantics as `TextDoc.merge`.
+///
+/// Sync-across-compaction discipline, ported from `TextDoc.merge`: a
+/// batch carrying a base section (§3 step 4's v2 wire — see `compact`)
+/// can only be accepted by a replica that is EITHER empty (bootstraps,
+/// adopting the batch's base) OR already compacted to the EXACT SAME
+/// stable point (`base_version` equality) — anything else, including a
+/// non-empty uncompacted replica, or one compacted to a DIFFERENT point,
+/// is rejected whole with `error.MissingDependency`. This is the "peer
+/// behind the compaction point" case named in the compaction study: LOUD
+/// and documented, never a silent partial/divergent merge. A peer that IS
+/// caught up to (or past) the stable point converges normally — its own
+/// new events' parent references resolve either directly or (for the
+/// exact boundary event) implicitly via `batch_head`, same as
+/// `TextDoc.historyPhase`'s "validated to be the base head" comment.
+/// Full catch-up FROM an arbitrary earlier point across a compaction
+/// boundary (an uncompacted or differently-compacted peer automatically
+/// re-synchronizing) is explicitly not attempted here — a materially
+/// larger feature than this step carries; see `TextDoc.openPartial`'s
+/// watermark/chunk machinery for what that would need, ported wholesale.
 pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]Change {
     var dec = try Decoder.init(gpa, bytes);
     defer dec.deinit(gpa);
 
+    const bootstrap = dec.base != null and self.base_version.len == 0 and self.history.eventCount() == 0;
+    if (dec.base) |b| {
+        if (!bootstrap and !std.mem.eql(u8, self.base_version, b.version)) {
+            return error.MissingDependency;
+        }
+    }
+
     const aids = try gpa.alloc(AgentId, dec.names.items.len);
     defer gpa.free(aids);
-    for (dec.names.items, aids) |name, *aid| {
+    const eff_base = try gpa.alloc(u64, dec.names.items.len);
+    defer gpa.free(eff_base);
+    for (dec.names.items, aids, eff_base, dec.seq_bases.items) |name, *aid, *eff, batch_base| {
         aid.* = try self.history.registerAgent(gpa, name);
+        const have = self.history.agents.items[@intFromEnum(aid.*)].seq_base;
+        if (bootstrap) {
+            eff.* = batch_base;
+        } else if (batch_base != 0 and batch_base != have) {
+            // Same base implies identical watermarks; v1 batches carry 0.
+            return error.Corrupt;
+        } else {
+            eff.* = have;
+        }
     }
-    try dec.validate(self, aids);
+
+    // The base boundary an incoming compacted-parent reference (or, for a
+    // bootstrap, a text-base entry) may name implicitly.
+    var batch_head: ?EventId = self.base_head;
+    if (bootstrap) {
+        const entry = try versionSingleEntry(dec.base.?.version);
+        const agent = self.history.findAgent(entry.name) orelse return error.Corrupt;
+        batch_head = .{ .agent = agent, .seq = entry.seq };
+    }
+
+    try dec.validate(self, aids, eff_base, batch_head);
+
+    // Commit the bootstrap watermarks now (validated) — event-adding
+    // below needs `nextSeq` to already reflect them.
+    if (bootstrap) {
+        for (aids, eff_base) |aid, eff| {
+            self.history.agents.items[@intFromEnum(aid)].seq_base = eff;
+        }
+    }
 
     // Graph phase with wholesale rollback (including interned strings).
     var effects: std.ArrayList(Effect) = .empty;
     defer effects.deinit(gpa);
     const any_new = try self.historyPhase(gpa, &dec, aids, &effects);
-    if (!any_new) return try gpa.alloc(Change, 0);
+
+    // A bootstrap's base fields (`base_version`/`base_head`) commit
+    // regardless of `any_new` (a compacted-but-otherwise-idle doc's
+    // serialize() can legitimately carry zero pending events); adopting
+    // the text bases' CONTENT is deferred to after tree application below
+    // — each entry names its object by its creation event, whose node
+    // (and `obj_index` entry) only exists once `makeValueNode` has run
+    // for it, which happens there, not in `historyPhase`.
+    if (bootstrap) {
+        gpa.free(self.base_version);
+        self.base_version = try gpa.dupe(u8, dec.base.?.version);
+        self.base_head = batch_head;
+    }
+
+    if (!any_new) {
+        if (bootstrap) try self.adoptTextBases(gpa, dec.base.?, aids);
+        return try gpa.alloc(Change, 0);
+    }
 
     // Tree application + change stream.
     try self.ensureRoot(gpa);
@@ -637,14 +778,15 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
                 const map_node = self.nodeOfObjLv(e.obj orelse root_key);
                 const value_node = try self.makeValueNode(gpa, e.val, e.set_lv);
                 const slot = try self.treeSlot(gpa, map_node, e.key);
-                try slot.values.append(gpa, .{ .set_lv = e.set_lv, .node = value_node });
+                try slot.values.append(gpa, .{ .set_id = self.history.idOf(e.set_lv), .node = value_node });
                 try changes.append(gpa, .{ .map = .{ .obj = self.objIdOf(e.obj), .key = self.str(e.key) } });
             },
             .map_remove => |e| {
                 const map_node = self.nodeOfObjLv(e.obj orelse root_key);
                 const slot = try self.treeSlot(gpa, map_node, e.key);
+                const target = self.history.idOf(e.set_lv);
                 for (slot.values.items, 0..) |v, i| {
-                    if (v.set_lv == e.set_lv) {
+                    if (v.set_id.agent == target.agent and v.set_id.seq == target.seq) {
                         _ = slot.values.orderedRemove(i);
                         break;
                     }
@@ -680,6 +822,7 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
             },
         }
     }
+    if (bootstrap) try self.adoptTextBases(gpa, dec.base.?, aids);
     return changes.toOwnedSlice(gpa);
 }
 
@@ -739,21 +882,31 @@ const TextInsertCtx = struct {
 /// for later, same as TextDoc's `merge_walk` is for its own single
 /// sequence).
 fn silentObjectReplay(self: *const ObjectDoc, gpa: Allocator, obj_lv: Lv) Allocator.Error!SeqWalker {
-    var w = Walker.init(&self.history, self.strings.items);
+    var w = Walker.initWithBases(&self.history, self.strings.items, &self.text_bases);
     defer w.deinit(gpa);
     var sink: std.ArrayList(Effect) = .empty;
     defer sink.deinit(gpa);
     const n: Lv = @intCast(self.history.eventCount());
-    w.replayAll(gpa, n, &sink) catch |e| switch (e) {
+    w.replayAll(gpa, n, &sink, null) catch |e| switch (e) {
         error.Corrupt => unreachable, // trusted local history
         else => |err| return err,
     };
     assert(sink.items.len == 0); // first_new == n: nothing emits
     // Detach `obj`'s walker before `w.deinit` below frees every object's
-    // and register's state — an object with zero ins/del events (a
-    // freshly created, still-empty text node) never got a `seqs` entry.
+    // and register's state — an object with zero ins/del events never
+    // got a `seqs` entry (`getSeqWalker` is only reached from inside an
+    // actual ins/del dispatch). Two reasons that can happen: a freshly
+    // created, still-empty text node — OR a text object whose ENTIRE
+    // content has been compacted away (every retained event elsewhere in
+    // the graph, none touching this object at all) — the base placeholder
+    // never gets a chance to seed via `getSeqWalker` either, so build it
+    // directly from `self.text_bases` here.
     if (w.seqs.fetchRemove(obj_lv)) |kv| return kv.value;
-    return SeqWalker.empty;
+    var sw: SeqWalker = .empty;
+    if (self.text_bases.get(self.history.idOf(obj_lv))) |base| {
+        try sw.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv);
+    }
+    return sw;
 }
 
 /// An identity anchor for the position `byte_offset` inside text object
@@ -816,6 +969,446 @@ pub fn resolveObjectAnchors(
     for (out) |*o| o.* = rope.scalarToOffset(o.*);
 }
 
+// ── Compaction (text-object compaction — the W7 shape) ───────────────
+// delta 2, `stemma-unification.md` §3 step 4. WHOLE-DOC, ONE linearization
+// point — the exact TextDoc.compact shape (`heads.len == 1`, everything
+// causally before the stable point becomes a frozen base), NOT per-object
+// compaction (explicitly out of scope, §4.1 risk 3: compacting anything
+// forces a linearization point across the whole tree, on purpose — a
+// finer per-object design is a materially different, harder problem this
+// step does not attempt).
+//
+// SCOPE, NAMED PRECISELY: this compacts TEXT-OBJECT content only — the
+// shape W7 (weft's `Document` re-basing onto the unified core) actually
+// needs, since weft's text buffers are exactly "one `EventGraph` with one
+// `SeqWalker`," the degenerate case this generalizes from TextDoc. It
+// does NOT compact list content or map-register history. A separate
+// follow-up — call it delta 2b — would need an ordered-list-of-values
+// base (including nested-object references, in FugueMax document order)
+// with no `SeqWalker.initBase` analog today; not attempted here. Plainly:
+// a transcript, or any document, with list content in the causal past of
+// its chosen stable point CANNOT compact past that point (below); it can
+// still compact an EARLIER, list-free point.
+//
+// ONLY `text_ins`/`text_del` actually compact. Two INDEPENDENT reasons,
+// both discovered while implementing (neither visible from the study),
+// rule out folding away `map_set`/`map_del`/`list_ins`/`list_del` too:
+//
+// 1. **`causal.compactGraph`'s per-agent watermark (`seq_base`) can only
+//    represent "this agent's compacted events are their EARLIEST N"** —
+//    whatever `in_base` a caller supplies MUST be a causal PREFIX of
+//    every single agent's own timeline, not an arbitrary per-event
+//    subset (`compactGraph`'s `new_graph.add` asserts on it otherwise).
+//    TextDoc's `in_base` (the whole causal past of `s`) is automatically
+//    such a prefix; the moment `in_base` here excludes SOME op kinds but
+//    not others, it is NOT automatically a prefix anymore — an agent
+//    could interleave an excluded (map/list) and an included (text)
+//    event in either order (creating a text object, then editing it, is
+//    the single most common such interleaving). `compact` below
+//    EXPLICITLY VALIDATES the prefix property per agent after computing
+//    `in_base`, rejecting (`error.NotCompactable`) rather than silently
+//    violating it — this is what makes "just exclude map/list, compact
+//    text" honest rather than a ticking assertion failure. This check is
+//    PER AGENT and structural; it does NOT by itself rule out the
+//    cross-agent hazard in reason 2's third bullet below — that needs
+//    its own, separate guard.
+// 2. **Even where the prefix holds, folding away a `map_set`/`map_del`
+//    (or `list_ins`/`list_del`) would break three things a text-only base
+//    doesn't have to solve:**
+//    - Object identity: `objects_state.Walker` (the replay/apply driver
+//      every local edit and merge goes through) dispatches every op by
+//      resolving its object reference to a CURRENT `Lv` via
+//      `self.history.lvOf` and keys its own per-object state
+//      (`Walker.seqs`/`Walker.maps`) by that same `Lv` — there is no
+//      compacted-object registry it consults instead. Folding away a
+//      `map_set`/`list_ins` that CREATED an object still being edited
+//      would make it permanently unaddressable for any FUTURE local edit
+//      or merge (`ObjectDoc.zig`'s own `obj_index`, EventId-keyed,
+//      already solves this for READS — `objId`/`ref`/`mapGet` — but
+//      `objects_state.Walker`'s internals are a separate, harder piece
+//      not touched here).
+//    - Bootstrap: a fresh replica reconstructing the document PURELY
+//      from `serialize`d bytes has no way to learn a compacted-away
+//      SCALAR map value either — unlike text (`jw.TextBase`/
+//      `SeqWalker.initBase`), nothing here materializes "the current
+//      live value of every map key" into a base a bootstrap can read.
+//      (Confirmed the hard way: an earlier version of this function DID
+//      fold away non-object-creating `map_set`s, and "serialize/open
+//      round-trip" silently lost every scalar field set before the
+//      compaction point — exactly the failure mode this doc comment
+//      warns future changes away from.)
+//    - MV-register conflict resolution needs every RETAINED write's true
+//      causal relationship to every OTHER retained write to survive —
+//      see the cross-agent guard below, and its own doc comment, for the
+//      concrete failure this closes (found by review, not designed for
+//      up front: compacting text content between two retained map writes
+//      can silently sever the causal edge PROVING one supersedes the
+//      other, making them look concurrent instead).
+//    Building either of the first two — a stable non-`Lv` object key for
+//    `objects_state.Walker`, or a map-content base — is real, tractable
+//    follow-up work, deliberately not attempted here.
+//
+// List STRUCTURE (`list_ins`/`list_del`) is ALSO refused outright if any
+// exists in the causal past of `s` (`error.NotCompactable`) — even though
+// it's excluded from `in_base` just like map ops, a list's FugueMax
+// ordering has no base-materialization story the way `SeqWalker.initBase`
+// gives text for free (building one — correctly representing an
+// arbitrary-length list of values including nested-object references —
+// is real, tractable follow-up work; delta 2b, above). A document with
+// list content simply can't compact PAST the point that content was last
+// touched; compacting an EARLIER, list-free stable point still works
+// (`TextDoc.compact`'s "mid-history" shape, mirrored in
+// `object_tests.zig`).
+//
+// Map register conflict resolution (`mapGet`/`setOrder`/
+// `mapConflictCount`) stays sound across compaction because of TWO things
+// together, not one: `map_set`/`map_del` never compact (every write stays
+// a real, resolvable event — §4.1 risk 5's hazard, about FOLDED map
+// history, therefore never arises here, because there is no map history
+// compaction to trigger it), AND `compact` refuses (below) whenever a
+// RETAINED event's causal edge into the base would have to be dropped for
+// anything other than the stable point itself — the guard that closes the
+// cross-agent hazard just named. Map history staying unfolded is
+// necessary but NOT sufficient on its own; the guard is what makes it
+// actually sound (see its doc comment for the proof-by-counterexample
+// review found, and `object_tests.zig`'s regression coverage).
+//
+// Text objects compact exactly like TextDoc's one sequence, once per
+// object, sharing `causal.compactGraph`'s graph-rebuild and
+// `SeqWalker.initBase`/`base_placeholder_lv`'s base-placeholder
+// mechanism — the generalization this step is chartered to prove out.
+pub fn compact(self: *ObjectDoc, gpa: Allocator, stable_token: []const u8) CompactError!void {
+    var heads: std.ArrayList(Lv) = .empty;
+    defer heads.deinit(gpa);
+    try self.decodeVersion(gpa, stable_token, true, &heads);
+    if (heads.items.len != 1) return error.NotCompactable;
+    const s = heads.items[0];
+
+    const n = self.history.eventCount();
+    const past_s = try gpa.alloc(bool, n);
+    defer gpa.free(past_s);
+    @memset(past_s, false);
+    {
+        var d = try self.history.diff(gpa, &.{s}, &.{});
+        defer d.deinit(gpa);
+        for (d.a_only.items) |lv| past_s[lv] = true;
+    }
+
+    // Every event OUTSIDE the causal past of `s` must be a genuine
+    // descendant of it, never concurrent — else `s` isn't a true
+    // linearization point (same check as `TextDoc.compact`).
+    for (0..n) |lv| {
+        if (past_s[lv]) continue;
+        for (self.history.parentsOf(@intCast(lv))) |p| {
+            if (past_s[p] and p != s) return error.NotCompactable;
+        }
+        // List structure inside the causal past of `s` blocks compaction
+        // entirely (see the doc comment above) — checked over the WHOLE
+        // past (not just this loop's outside-past_s events), so fold it
+        // into the same pass rather than a second one.
+    }
+    for (0..n) |lv| {
+        if (!past_s[lv]) continue;
+        switch (self.history.opOf(@intCast(lv))) {
+            .list_ins, .list_del => return error.NotCompactable,
+            else => {},
+        }
+    }
+
+    // `in_base`: the causal past of `s`, EXCLUDING every `map_set`/
+    // `map_del` event (not just object-creating ones — see the doc
+    // comment above `compact` for the two independent reasons: object
+    // identity needs a creating event's `Lv` to keep resolving, AND a
+    // fresh replica reconstructing the document from `serialize`d bytes
+    // ALONE has no other way to learn a compacted-away SCALAR map value
+    // either — unlike text, no base-content mechanism captures live map
+    // state here; see the doc comment's "what does NOT compact" note).
+    // Only `text_ins`/`text_del` compact (list ops already rejected
+    // above if present at all in the causal past of `s`).
+    const in_base = try gpa.alloc(bool, n);
+    defer gpa.free(in_base);
+    for (0..n) |lv| {
+        in_base[lv] = past_s[lv] and switch (self.history.opOf(@intCast(lv))) {
+            .text_ins, .text_del => true,
+            else => false,
+        };
+    }
+
+    // Guard against cross-agent divergence: `causal.compactGraph` drops
+    // ANY `in_base` parent edge of a retained event, unconditionally —
+    // sound only when every RETAINED event's `in_base` ancestors are
+    // exactly {} or {s}. A retained event whose only causal path to
+    // another retained event routes THROUGH a folded one would silently
+    // lose that edge otherwise. Concretely: retained `map_set` P, folded
+    // `text_ins` T (T causally between P and Q), retained `map_set` Q,
+    // where Q's supersede-edge back to P routes ONLY through T — each
+    // AGENT's own timeline can independently satisfy the prefix property
+    // below even though this cross-agent shape is unsound, so this check
+    // is separate from (and must run in addition to) that one. Dropping
+    // T's edge would make Q's parent list lose the P dependency entirely,
+    // so after compaction Q and P look CONCURRENT instead of
+    // Q-supersedes-P — `mapConflictCount`/`mapGet`'s deterministic winner
+    // both silently diverge from what they were before compacting (and
+    // from a fresh replica that reopens the ORIGINAL uncompacted history).
+    // Confirmed with an actual probe before this guard existed:
+    // `object_tests.zig`'s "compact: refuses when a retained write's only
+    // path to another retained write is through a folded text edit"
+    // reproduces exactly this. `causal.compactGraph` itself also asserts
+    // this invariant now (a second, cheaper line of defense — see its
+    // doc comment) but cannot enforce it (it doesn't have the causal-past
+    // reachability information to do so); this is the real check.
+    for (0..n) |lv| {
+        if (in_base[lv]) continue; // only retained events' edges survive
+        for (self.history.parentsOf(@intCast(lv))) |p| {
+            if (in_base[p] and p != s) return error.NotCompactable;
+        }
+    }
+
+    // `causal.compactGraph`'s per-agent watermark can only represent
+    // "this agent's compacted events are their EARLIEST N" — `in_base`
+    // MUST be a causal PREFIX of every single agent's own timeline (see
+    // the doc comment above `compact`). This holds automatically when
+    // `in_base == past_s` (TextDoc's exact case); excluding creation
+    // events on top does NOT hold automatically — an agent could create
+    // an object (excluded) and later edit it (included) in either order.
+    // Detect and reject rather than silently violate the watermark. This
+    // is a DIFFERENT check from the one just above: that one is about
+    // whether folding `in_base` loses information ANY retained event
+    // needs (cross-agent); this one is about whether `in_base` is even
+    // representable by `compactGraph`'s single-watermark-per-agent model
+    // at all (single-agent, structural).
+    for (self.history.agents.items) |a| {
+        var seen_retained = false;
+        for (a.lv_by_seq.items) |lv| {
+            if (in_base[lv]) {
+                if (seen_retained) return error.NotCompactable;
+            } else {
+                seen_retained = true;
+            }
+        }
+    }
+
+    // Everything below is built FRESH and only swapped into `self` once
+    // every fallible step has succeeded (the "Commit" block at the
+    // bottom, which does no allocation) — `self` itself stays untouched
+    // until then, matching `TextDoc.compact`'s discipline.
+
+    // Materialize every touched text object's alive-as-of-`s` scalar
+    // content — same ordering discipline as `TextDoc.compact`
+    // (`materializeAt` before the graph rebuild). Keyed by the object's
+    // portable `EventId`, so no re-keying is needed after `compactGraph`
+    // renumbers `Lv`s below (unlike `Lv`-keyed state — see `node_of`).
+    var new_bases = try self.materializeTextBasesAt(gpa, past_s);
+    errdefer freeTextBases(gpa, &new_bases);
+
+    var result = try causal.compactGraph(gpa, &self.history, in_base, s);
+    errdefer result.graph.deinit(gpa);
+    defer gpa.free(result.lv_map);
+
+    const new_base_version = try gpa.dupe(u8, stable_token);
+    errdefer gpa.free(new_base_version);
+
+    // Merge the new bases into a fresh table — no re-keying needed
+    // (`EventId`-keyed, see above). An object re-compacted a second time
+    // replaces its prior (smaller) base; one untouched this round keeps
+    // its prior base unchanged. Every entry is `fetchRemove`d out of
+    // whichever of `self.text_bases`/`new_bases` it came from as it's
+    // transferred, so at any point (including mid-failure) each base's
+    // bytes are owned by exactly one of {`self.text_bases`, `new_bases`,
+    // `merged_bases`} — never aliased across two of them.
+    var merged_bases: jw.TextBaseMap = .empty;
+    errdefer freeTextBases(gpa, &merged_bases);
+    {
+        var old_keys: std.ArrayList(EventId) = .empty;
+        defer old_keys.deinit(gpa);
+        var kit = self.text_bases.keyIterator();
+        while (kit.next()) |k| try old_keys.append(gpa, k.*);
+        for (old_keys.items) |key| {
+            if (new_bases.fetchRemove(key)) |kv| {
+                gpa.free(self.text_bases.fetchRemove(key).?.value.bytes); // superseded
+                errdefer gpa.free(kv.value.bytes); // `put` below can still fail (OOM)
+                try merged_bases.put(gpa, key, kv.value);
+            } else {
+                const kv = self.text_bases.fetchRemove(key).?;
+                errdefer gpa.free(kv.value.bytes);
+                try merged_bases.put(gpa, key, kv.value);
+            }
+        }
+        var new_keys: std.ArrayList(EventId) = .empty;
+        defer new_keys.deinit(gpa);
+        var nkit = new_bases.keyIterator();
+        while (nkit.next()) |k| try new_keys.append(gpa, k.*);
+        for (new_keys.items) |key| {
+            const kv = new_bases.fetchRemove(key).?;
+            errdefer gpa.free(kv.value.bytes);
+            try merged_bases.put(gpa, key, kv.value);
+        }
+    }
+    new_bases.deinit(gpa); // drained above; nothing left to free
+    new_bases = .empty; // the still-armed `errdefer` above must see a valid,
+    // empty (no-op-to-free) map if anything below still fails — it isn't
+    // cancelled just because we've already freed this manually here.
+
+    // `node_of` is the one remaining `Lv`-keyed piece of state (a
+    // transient, replay-scoped index — see its doc comment); rebuild it
+    // against the new `Lv` space. `self.nodes`/`self.obj_index` need no
+    // rewriting at all: every identity they hold is already `EventId`,
+    // stable across this renumbering by construction (see `Node`'s doc
+    // comment).
+    var new_node_of: std.ArrayList(u32) = .empty;
+    errdefer new_node_of.deinit(gpa);
+    try new_node_of.appendNTimes(gpa, no_node, result.graph.eventCount());
+    for (self.node_of.items, 0..) |idx, old_lv| {
+        if (idx == no_node) continue;
+        new_node_of.items[result.lv_map[old_lv]] = idx;
+    }
+
+    // Commit — infallible from here on.
+    const head_id = self.history.idOf(s);
+    self.node_of.deinit(gpa);
+    self.node_of = new_node_of;
+    self.history.deinit(gpa);
+    self.history = result.graph;
+    gpa.free(self.base_version);
+    self.base_version = new_base_version;
+    self.base_head = head_id;
+    self.text_bases.deinit(gpa); // drained above; nothing left to free
+    self.text_bases = merged_bases;
+}
+
+fn freeTextBases(gpa: Allocator, bases: *jw.TextBaseMap) void {
+    var it = bases.valueIterator();
+    while (it.next()) |b| gpa.free(b.bytes);
+    bases.deinit(gpa);
+}
+
+/// Adopt a bootstrap batch's text bases into `self.text_bases`. Called
+/// from `merge` only when `bootstrap` is true (this doc was entirely
+/// empty). Keyed directly by the wire entry's portable identity — no
+/// `lvOf` resolution needed at all (see `jw.TextBaseMap`'s doc comment),
+/// though `Decoder.validate` already confirmed the creating event is
+/// either known or present in this very batch, so the object is real.
+fn adoptTextBases(self: *ObjectDoc, gpa: Allocator, base: Decoder.BaseSection, aids: []const AgentId) MergeError!void {
+    for (base.text_bases) |tb| {
+        const id: EventId = .{ .agent = aids[tb.obj.agent_idx], .seq = tb.obj.seq };
+        // Build the fully-owned replacements BEFORE touching
+        // `self.text_bases`/`self.nodes` at all: `getOrPut` inserts the
+        // KEY unconditionally, before any value is known, so if a value
+        // is computed only AFTER that (the original shape of this
+        // function), a later allocation failure leaves a hashmap entry
+        // pointing at uninitialized memory — `deinit`'s free-every-value
+        // loop then crashes on it. Fallible work first, commit last.
+        const bytes_owned = try gpa.dupe(u8, tb.bytes);
+        errdefer gpa.free(bytes_owned);
+        // `text_bases` is metadata for FUTURE replay (`SeqWalker.initBase`
+        // seeding) — it does not, by itself, make this content readable.
+        // On a true bootstrap the node was JUST created (empty rope, by
+        // `makeValueNode` during this same `historyPhase`'s `.map_add`
+        // effect) — materialize its base content now, exactly as
+        // `TextDoc.merge`'s bootstrap sets `self.rope` from `btext`.
+        var rope = try Rope.fromSlice(gpa, tb.bytes);
+        errdefer rope.deinit(gpa);
+
+        const gop = try self.text_bases.getOrPut(gpa, id);
+        if (gop.found_existing) gpa.free(gop.value_ptr.bytes); // defensive; unreachable on a true bootstrap
+        gop.value_ptr.* = .{ .bytes = bytes_owned, .scalars = tb.scalars };
+        const node_idx = self.obj_index.get(id).?;
+        self.nodes.items[node_idx].text.rope.deinit(gpa);
+        self.nodes.items[node_idx].text.rope = rope;
+    }
+}
+
+/// Materialize the alive-as-of-`past_s` scalar content of every text
+/// object touched within `past_s`, keyed by their PORTABLE creation
+/// identity. Seeds from any EXISTING `self.text_bases` entries first
+/// (progressive re-compaction: a second `compact()` call extends, rather
+/// than replaces from scratch, an already-compacted object's base).
+fn materializeTextBasesAt(self: *const ObjectDoc, gpa: Allocator, past_s: []const bool) Allocator.Error!jw.TextBaseMap {
+    // Decode every EXISTING base's bytes to scalars once, up front — a
+    // still-alive base placeholder's arena index is exactly its position
+    // in that decoded array (see `Sequence.initBase`: placeholders are
+    // appended in order, arena 0..count-1, and arena identity never
+    // changes even if some are later toggled dead).
+    var old_decoded: std.AutoHashMapUnmanaged(EventId, []u21) = .empty;
+    defer {
+        var it = old_decoded.valueIterator();
+        while (it.next()) |d| gpa.free(d.*);
+        old_decoded.deinit(gpa);
+    }
+    {
+        var it = self.text_bases.iterator();
+        while (it.next()) |e| {
+            try old_decoded.put(gpa, e.key_ptr.*, try decodeUtf8Scalars(gpa, e.value_ptr.bytes));
+        }
+    }
+
+    var w = Walker.initWithBases(&self.history, self.strings.items, &self.text_bases);
+    defer w.deinit(gpa);
+    var sink: std.ArrayList(Effect) = .empty;
+    defer sink.deinit(gpa);
+    const n: Lv = @intCast(self.history.eventCount());
+    // Silent (first_new == n: nothing emits) and filtered to `past_s` —
+    // this reconstructs per-object `SeqWalker` state as of `s` without
+    // walking anything strictly after it.
+    w.replayAll(gpa, n, &sink, past_s) catch |e| switch (e) {
+        error.Corrupt => unreachable, // trusted local history
+        else => |err| return err,
+    };
+    assert(sink.items.len == 0);
+
+    var out: jw.TextBaseMap = .empty;
+    errdefer freeTextBases(gpa, &out);
+    var seq_it = w.seqs.iterator();
+    while (seq_it.next()) |entry| {
+        const obj_lv = entry.key_ptr.*;
+        if (self.objKind(obj_lv) != .text) continue; // lists: never based
+        const obj_id = self.history.idOf(obj_lv);
+        const sw = entry.value_ptr;
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(gpa);
+        var scalars: usize = 0;
+        var buf: [4]u8 = undefined;
+        var it = sw.s.aliveIterator();
+        while (it.next()) |alive| {
+            const ch = if (alive.lv == seq_walker.base_placeholder_lv)
+                old_decoded.get(obj_id).?[alive.arena]
+            else
+                self.history.opOf(alive.lv).text_ins.ch;
+            const len = std.unicode.utf8Encode(ch, &buf) catch unreachable;
+            try bytes.appendSlice(gpa, buf[0..len]);
+            scalars += 1;
+        }
+        const owned = try bytes.toOwnedSlice(gpa);
+        errdefer gpa.free(owned); // `out.put` below can still fail (OOM)
+        try out.put(gpa, obj_id, .{ .bytes = owned, .scalars = scalars });
+    }
+    return out;
+}
+
+fn decodeUtf8Scalars(gpa: Allocator, bytes: []const u8) Allocator.Error![]u21 {
+    var out: std.ArrayList(u21) = .empty;
+    errdefer out.deinit(gpa);
+    var it = (std.unicode.Utf8View.init(bytes) catch unreachable).iterator();
+    while (it.nextCodepoint()) |ch| try out.append(gpa, ch);
+    return out.toOwnedSlice(gpa);
+}
+
+const ObjKind = enum { map, list, text };
+
+fn objKind(self: *const ObjectDoc, creation_lv: Lv) ObjKind {
+    const val: ValPayload = switch (self.history.opOf(creation_lv)) {
+        .map_set => |m| m.val,
+        .list_ins => |l| l.val,
+        else => unreachable,
+    };
+    return switch (val) {
+        .new_map => .map,
+        .new_list => .list,
+        .new_text => .text,
+        else => unreachable,
+    };
+}
+
 fn historyPhase(
     self: *ObjectDoc,
     gpa: Allocator,
@@ -851,7 +1444,11 @@ fn historyPhase(
         defer parent_lvs.deinit(gpa);
         for (dec.parentsOf(ev)) |pref| {
             const pid: EventId = .{ .agent = aids[pref.agent_idx], .seq = pref.seq };
-            try parent_lvs.append(gpa, self.history.lvOf(pid).?);
+            if (self.history.lvOf(pid)) |plv| {
+                try parent_lvs.append(gpa, plv);
+            }
+            // else: validated (`Decoder.validate`) to be this doc's base
+            // head — implicit, same discipline as `TextDoc.historyPhase`.
         }
         const op = try self.internOp(gpa, ev, aids);
         _ = try self.history.add(gpa, id, parent_lvs.items, op);
@@ -859,9 +1456,9 @@ fn historyPhase(
     }
     if (!any_new) return false;
 
-    var w = Walker.init(&self.history, self.strings.items);
+    var w = Walker.initWithBases(&self.history, self.strings.items, &self.text_bases);
     defer w.deinit(gpa);
-    try w.replayAll(gpa, first_new, effects);
+    try w.replayAll(gpa, first_new, effects, null);
     return true;
 }
 
@@ -901,18 +1498,33 @@ fn internVal(self: *ObjectDoc, gpa: Allocator, v: Decoder.RawVal) Allocator.Erro
 }
 
 // ── Wire format ─────────────────────────────────────────────────────
-// "stj" 0x01: uv agent_count, per agent (uv name_len, name);
+// v1 "stj" 0x01: uv agent_count, per agent (uv name_len, name);
 // uv event_count, per event: uv agent_idx, uv seq, uv parent_count,
 // parents (uv agent_idx, uv seq); u8 op tag; obj ref (u8 0 = root,
 // 1 + uv agent_idx + uv seq); op-specific fields. Ints are zigzag'd.
+// v2 "stj" 0x02 (emitted only once compacted — see `object_magic_v2`):
+//   uv agent_count, per agent: uv name_len, name, uv seq_base   (v1 +
+//     seq_base per agent; 0 for an agent with nothing compacted)
+//   uv base_version_len, base_version bytes                     (a
+//     `version()`-shaped token — self-contained, no table needed)
+//   uv text_base_count, per entry: uv agent_idx, uv seq,        (the
+//     text object's creation event — always present as a real event in
+//     THIS SAME batch or already known to the receiver, see
+//     `Decoder.validate`'s bootstrap check)
+//     uv scalars, uv bytes_len, bytes                           (its
+//     compacted pre-history, UTF-8 — `jw.TextBase`)
+//   uv event_count, per event: same as v1 (map/list events are NEVER
+//     compacted — see `compact`'s doc comment — so nothing about the
+//     event stream itself changes shape between v1 and v2)
 
 const OpTag = enum(u8) { map_set = 0, map_del = 1, list_ins = 2, list_del = 3, text_ins = 4, text_del = 5 };
 const ValTag = enum(u8) { null_ = 0, false_ = 1, true_ = 2, int = 3, float = 4, str = 5, new_map = 6, new_list = 7, new_text = 8 };
 
 fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocator.Error![]u8 {
+    const compacted = self.base_version.len > 0;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, object_magic);
+    try out.appendSlice(gpa, if (compacted) object_magic_v2 else object_magic_v1);
 
     var table: std.ArrayList(AgentId) = .empty;
     defer table.deinit(gpa);
@@ -921,11 +1533,39 @@ fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocat
         for (self.history.parentsOf(lv)) |p| try tableAdd(gpa, &table, self.history.idOf(p).agent);
         if (opObj(self.history.opOf(lv))) |o| try tableAdd(gpa, &table, o.agent);
     }
+    if (compacted) {
+        var bit = self.text_bases.keyIterator();
+        while (bit.next()) |k| try tableAdd(gpa, &table, k.agent);
+        // A bootstrapping receiver needs to resolve `base_head`'s agent
+        // (`versionSingleEntry(base_version).name`) BEFORE any event or
+        // text-base entry has registered it for them — e.g. when `s` is
+        // authored by an agent whose every event got folded into another
+        // object's base (nothing else in the batch would ever mention
+        // them). Mirrors `TextDoc.encodeEvents`'s identical `base_head`
+        // table entry.
+        if (self.base_head) |h| try tableAdd(gpa, &table, h.agent);
+    }
     try putUv(gpa, &out, table.items.len);
     for (table.items) |aid| {
         const name = self.history.agentName(aid);
         try putUv(gpa, &out, name.len);
         try out.appendSlice(gpa, name);
+        if (compacted) try putUv(gpa, &out, self.history.agents.items[@intFromEnum(aid)].seq_base);
+    }
+
+    if (compacted) {
+        try putUv(gpa, &out, self.base_version.len);
+        try out.appendSlice(gpa, self.base_version);
+        try putUv(gpa, &out, self.text_bases.count());
+        var it = self.text_bases.iterator();
+        while (it.next()) |e| {
+            const id = e.key_ptr.*;
+            try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
+            try putUv(gpa, &out, id.seq);
+            try putUv(gpa, &out, e.value_ptr.scalars);
+            try putUv(gpa, &out, e.value_ptr.bytes.len);
+            try out.appendSlice(gpa, e.value_ptr.bytes);
+        }
     }
 
     try putUv(gpa, &out, lvs.len);
@@ -1051,8 +1691,22 @@ const Decoder = struct {
         ch: u21 = 0,
         val: ?RawVal = null,
     };
+    /// One decoded `jw.TextBase` wire entry — `obj` names its text
+    /// object's creation event (by batch table index; resolved to an
+    /// `Lv` only after `historyPhase` has added it, see
+    /// `ObjectDoc.adoptTextBases`). `bytes` borrows from the input.
+    const TextBaseRef = struct { obj: ObjRef, scalars: usize, bytes: []const u8 };
+    const BaseSection = struct {
+        version: []const u8, // borrowed — a `version()`-shaped token
+        text_bases: []const TextBaseRef,
+    };
 
     names: std.ArrayList([]const u8) = .empty,
+    /// Per agent, `0` for v1 batches (never compacted) or an uncompacted
+    /// agent in a v2 batch.
+    seq_bases: std.ArrayList(u64) = .empty,
+    base: ?BaseSection = null,
+    text_base_pool: std.ArrayList(TextBaseRef) = .empty,
     events: std.ArrayList(Event) = .empty,
     parents_pool: std.ArrayList(ObjRef) = .empty,
 
@@ -1062,6 +1716,8 @@ const Decoder = struct {
 
     fn deinit(self: *Decoder, gpa: Allocator) void {
         self.names.deinit(gpa);
+        self.seq_bases.deinit(gpa);
+        self.text_base_pool.deinit(gpa);
         self.events.deinit(gpa);
         self.parents_pool.deinit(gpa);
     }
@@ -1070,8 +1726,10 @@ const Decoder = struct {
         var self: Decoder = .{};
         errdefer self.deinit(gpa);
         var cur: []const u8 = bytes;
-        if (!std.mem.startsWith(u8, cur, object_magic)) return error.Corrupt;
-        cur = cur[object_magic.len..];
+        if (cur.len < object_magic_v1.len or !std.mem.startsWith(u8, cur, "stj")) return error.Corrupt;
+        const wire_version = cur[3];
+        if (wire_version < 1 or wire_version > 2) return error.Corrupt;
+        cur = cur[object_magic_v1.len..];
 
         const agent_count = try getUv(&cur);
         if (agent_count > 1 << 20) return error.Corrupt;
@@ -1079,6 +1737,39 @@ const Decoder = struct {
             const name = try getBytes(&cur, 4096);
             if (name.len == 0) return error.Corrupt;
             try self.names.append(gpa, name);
+            try self.seq_bases.append(gpa, if (wire_version == 2) try getUv(&cur) else 0);
+        }
+
+        if (wire_version == 2) {
+            const vlen = try getUv(&cur);
+            if (vlen == 0 or vlen > cur.len) return error.Corrupt;
+            const vtoken = cur[0..vlen];
+            cur = cur[vlen..];
+            _ = try versionSingleEntry(vtoken); // must be a single head
+
+            const tb_count = try getUv(&cur);
+            if (tb_count > 1 << 20) return error.Corrupt;
+            const tb_start: u32 = @intCast(self.text_base_pool.items.len);
+            for (0..tb_count) |_| {
+                const oaidx = try getUv(&cur);
+                if (oaidx >= self.names.items.len) return error.Corrupt;
+                const oseq = try getUv(&cur);
+                const scalars = try getUv(&cur);
+                const blen = try getUv(&cur);
+                if (blen > cur.len) return error.Corrupt;
+                const tbytes = cur[0..blen];
+                cur = cur[blen..];
+                if (!std.unicode.utf8ValidateSlice(tbytes)) return error.Corrupt;
+                if ((std.unicode.utf8CountCodepoints(tbytes) catch return error.Corrupt) != scalars) {
+                    return error.Corrupt;
+                }
+                try self.text_base_pool.append(gpa, .{
+                    .obj = .{ .agent_idx = @intCast(oaidx), .seq = oseq },
+                    .scalars = @intCast(scalars),
+                    .bytes = tbytes,
+                });
+            }
+            self.base = .{ .version = vtoken, .text_bases = self.text_base_pool.items[tb_start..] };
         }
 
         const event_count = try getUv(&cur);
@@ -1168,11 +1859,27 @@ const Decoder = struct {
         };
     }
 
-    fn validate(self: *const Decoder, doc: *const ObjectDoc, aids: []const AgentId) error{MissingDependency}!void {
+    /// Whole-batch causal validation before any graph mutation. `eff_base`
+    /// is each batch agent's PROSPECTIVE watermark (its current stored
+    /// one, unless this is a bootstrap adopting the batch's own — see
+    /// `ObjectDoc.merge`): duplicate/compacted detection must use it
+    /// instead of `doc.history`'s not-yet-updated watermark, exactly like
+    /// `TextDoc.Decoder.validate`. `batch_head` (this doc's own base
+    /// boundary, or the batch's if bootstrapping) is the one compacted
+    /// reference a parent ref may name without being separately known or
+    /// batch-local — same discipline as `TextDoc`'s.
+    fn validate(
+        self: *const Decoder,
+        doc: *const ObjectDoc,
+        aids: []const AgentId,
+        eff_base: []const u64,
+        batch_head: ?EventId,
+    ) error{MissingDependency}!void {
         for (self.events.items, 0..) |ev, i| {
             const id: EventId = .{ .agent = aids[ev.agent_idx], .seq = ev.seq };
-            if (doc.history.isKnown(id)) continue;
-            const next = doc.history.nextSeq(id.agent);
+            const stored = doc.history.agents.items[@intFromEnum(id.agent)].lv_by_seq.items.len;
+            const next = eff_base[ev.agent_idx] + stored;
+            if (ev.seq < next) continue; // duplicate or compacted
             const contiguous = ev.seq == next or
                 (ev.seq > 0 and self.seenEarlier(i, ev.agent_idx, ev.seq - 1));
             if (!contiguous) return error.MissingDependency;
@@ -1180,6 +1887,17 @@ const Decoder = struct {
                 const pid: EventId = .{ .agent = aids[pref.agent_idx], .seq = pref.seq };
                 if (doc.history.lvOf(pid) != null) continue;
                 if (self.seenEarlier(i, pref.agent_idx, pref.seq)) continue;
+                if (batch_head) |h| {
+                    if (h.agent == pid.agent and h.seq == pid.seq) continue;
+                }
+                return error.MissingDependency;
+            }
+        }
+        if (self.base) |b| {
+            for (b.text_bases) |tb| {
+                const id: EventId = .{ .agent = aids[tb.obj.agent_idx], .seq = tb.obj.seq };
+                if (doc.history.lvOf(id) != null) continue;
+                if (self.seenEarlier(self.events.items.len, tb.obj.agent_idx, tb.obj.seq)) continue;
                 return error.MissingDependency;
             }
         }

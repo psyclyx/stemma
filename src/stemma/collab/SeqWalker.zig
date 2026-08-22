@@ -224,12 +224,16 @@ pub const AnchorError = Allocator.Error || error{ Corrupt, MissingDependency, Co
 
 /// Sentinel `lv` `SeqWalker.initBase`'s placeholder items carry (pre-history
 /// collapsed into a compacted base snapshot — see `TextDoc.compact`).
-/// `anchorAt` reports these as `error.Compacted`. `ObjectDoc` has no
-/// compaction yet (its header ledger) and never calls `initBase` on a
-/// per-object walker, so this branch is unreachable from `ObjectDoc`
-/// today — it stays part of the shared machinery, not TextDoc-only, so
-/// ObjectDoc's eventual compaction (stemma-unification.md's delta 2) needs
-/// neither a new error variant nor a signature change here.
+/// `anchorAt` reports these as `error.Compacted`. Reachable from `ObjectDoc`
+/// too, as of delta 2 (`stemma-unification.md` §3 step 4,
+/// `ObjectDoc.compact`): a compacted text object's per-object `SeqWalker`
+/// gets `initBase`'d from `jw.TextBase` the same way TextDoc's does, so an
+/// `objectAnchorAt`/`resolveObjectAnchors` call into compacted-away text
+/// content hits this same branch and reports `error.Compacted` (tested in
+/// `object_tests.zig`, "compact: identity anchors into compacted text
+/// become error.Compacted") — no new error variant or signature change was
+/// needed here, exactly as anticipated when this sentinel was added ahead
+/// of delta 2 landing.
 pub const base_placeholder_lv: Lv = std.math.maxInt(Lv);
 
 /// Identity anchor for the item at scalar index `target_index` among a

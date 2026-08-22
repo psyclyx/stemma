@@ -296,6 +296,150 @@ pub fn EventGraph(comptime Op: type) type {
     };
 }
 
+// ── Compaction: graph-level rebuild ─────────────────────────────────────
+// The part of "collapse pre-history into a frozen base" that is pure
+// `EventGraph(Op)` shape — raising per-agent watermarks and renumbering
+// retained events — with NO knowledge of what `Op` means. Originally
+// written once, inline, in `TextDoc.compact` (see
+// `app/weft/doc/stemma-unification.md` §3 step 4); extracted here verbatim
+// (same agents-loop, same lv_map loop) because it never inspected `TextOp`,
+// only graph shape (`parentsOf`, `add`, per-agent `lv_by_seq`). Lives in
+// `causal.zig`, not `SeqWalker.zig`: it has nothing to do with sequences —
+// `ObjectDoc.compact` (below) calls it too, over its own (non-sequence)
+// `ObjectOp` graph, and `causal.zig` is already "the shared
+// `EventGraph(Op)` implementation, including whichever of its own
+// operations are op-agnostic" (compare `diff`/`missingFrom`, also here).
+//
+// `TextDoc.compact`'s discipline (`in_base` = the ENTIRE causal past of the
+// stable point `s`, nothing else retained from before `s`) is the ONE
+// case this was designed against, and `compactGraph` reproduces it exactly
+// when called that way: zero behavior change, `text_tests.zig`'s
+// compaction battery is the gate.
+//
+// `ObjectDoc.compact` (delta 2, stemma-unification.md §3 step 4) calls the
+// SAME function with a DIFFERENT, narrower `in_base`: only `text_ins`/
+// `text_del` events in the causal past of `s` — `map_set`/`map_del`/
+// `list_ins`/`list_del` are excluded even when causally before `s` (see
+// `ObjectDoc.zig`'s compaction doc comment for the two independent reasons
+// why, discovered only while implementing: `compactGraph`'s own per-agent
+// watermark constraint, described next, and two things a text-only base
+// doesn't have to solve — object identity and bootstrap-from-serialize).
+// This is why `compactGraph` takes `in_base` as a caller-supplied array
+// rather than computing it from a single diff against `s` itself: the two
+// callers disagree about what "in the base" means, but agree completely
+// about how to rebuild the graph once that predicate is decided.
+//
+// Two invariants `compactGraph` needs to be sound — callers must establish
+// BOTH before calling in, and `compactGraph` now enforces the first one
+// itself (a `std.debug.assert`, not merely documentation — see below):
+// 1. Every RETAINED event's in_base ancestors must be exactly {} or {s}
+//    (the stable point) — never any OTHER `in_base` event. This is NOT
+//    the same as "nothing outside `in_base` is causally concurrent to the
+//    cut" (TextDoc's and ObjectDoc's `compact` each check that too, over
+//    the causal-past-of-`s` set, before calling in) — it is a SEPARATE,
+//    sharper requirement, and conflating the two was a real bug found by
+//    review: a RETAINED event strictly inside the causal past of `s` (not
+//    "outside" anything) can still reach another retained event ONLY
+//    THROUGH a folded one — e.g. retained `map_set` P, folded `text_ins`
+//    T, retained `map_set` Q, where Q's only causal edge back to P routes
+//    through T. Dropping T's edge (the rule below) silently drops Q's
+//    dependency on P too — Q and P then look CONCURRENT instead of
+//    Q-supersedes-P, corrupting MV-register conflict resolution with no
+//    error raised anywhere. `ObjectDoc.compact` now guards this
+//    explicitly (checked over `in_base`, catching exactly this shape);
+//    this `assert` is the second, cheaper line of defense — it fires if
+//    ANY caller (this one or a future one) ever calls in with an
+//    `in_base` that violates the invariant, so the failure is loud
+//    (a crash, this file's own responsibility) rather than the silent
+//    causal corruption above. It cannot do the caller's job for it
+//    (proving the invariant holds requires the same reachability walk
+//    the caller already did — `compactGraph` doesn't have `s`'s
+//    causal-past set, only `in_base` and `s` themselves), only catch
+//    violations of it.
+// 2. For EVERY agent, `in_base` restricted to that agent's own events must
+//    be a PREFIX (their earliest N, nothing after) — this is how
+//    `new_graph.agents[i].seq_base` gets raised, and `new_graph.add`
+//    asserts on it. TextDoc's `in_base` (the whole causal past of `s`) is
+//    automatically such a prefix for every agent; ObjectDoc's narrower
+//    `in_base` is NOT automatic — `ObjectDoc.compact` explicitly
+//    validates it per agent and rejects (`error.NotCompactable`) rather
+//    than violating it.
+pub fn CompactResult(comptime Graph: type) type {
+    return struct {
+        graph: Graph,
+        /// Old `Lv` → new `Lv`, valid only for indices where `in_base` was
+        /// false (an `in_base` event has no successor — it was folded away).
+        /// Sized to the OLD event count. Caller-owned.
+        lv_map: []Lv,
+
+        pub fn deinit(self: *@This(), gpa: Allocator) void {
+            self.graph.deinit(gpa);
+            gpa.free(self.lv_map);
+        }
+    };
+}
+
+/// Rebuild `history` keeping only the events where `in_base[lv]` is false:
+/// same agents in the same order (so an `AgentId` obtained before compaction
+/// stays valid after), each retained agent's `seq_base` raised by its own
+/// share of `in_base`, retained events re-added in causal (ascending `Lv`)
+/// order with their parent lists rewritten through `lv_map`. `s` is the
+/// stable point every `in_base` event is (by the caller's own proof)
+/// reachable from — a retained event's parent may be `in_base` ONLY when
+/// that parent IS `s` itself (dropped: implicit "depends on the base");
+/// any OTHER `in_base` parent asserts (see the module doc comment above —
+/// this is the caller-verified invariant, checked here as a second line
+/// of defense, not derived). `in_base.len` must equal
+/// `history.eventCount()`. Never inspects `Op`.
+pub fn compactGraph(
+    gpa: Allocator,
+    history: anytype, // *const EventGraph(Op)
+    in_base: []const bool,
+    s: Lv,
+) Allocator.Error!CompactResult(@TypeOf(history.*)) {
+    const Graph = @TypeOf(history.*);
+    const n = history.eventCount();
+    assert(in_base.len == n);
+
+    var new_graph: Graph = .empty;
+    errdefer new_graph.deinit(gpa);
+    for (history.agents.items, 0..) |a, i| {
+        const name = history.names.items[a.name_start..][0..a.name_len];
+        const aid = try new_graph.registerAgent(gpa, name);
+        assert(@intFromEnum(aid) == i);
+        var compacted: u64 = 0;
+        for (a.lv_by_seq.items) |lv| {
+            if (in_base[lv]) compacted += 1;
+        }
+        new_graph.agents.items[i].seq_base = a.seq_base + compacted;
+    }
+
+    const lv_map = try gpa.alloc(Lv, n);
+    errdefer gpa.free(lv_map);
+    var parent_buf: std.ArrayList(Lv) = .empty;
+    defer parent_buf.deinit(gpa);
+    for (0..n) |old_lv| {
+        if (in_base[old_lv]) continue;
+        parent_buf.clearRetainingCapacity();
+        for (history.parentsOf(@intCast(old_lv))) |p| {
+            if (in_base[p]) {
+                // Implicit: depends on the base. Sound ONLY when p == s —
+                // see the module doc comment's invariant 1. The caller
+                // must have already guaranteed this; this assert exists
+                // so a caller that didn't gets a loud crash here instead
+                // of a silently corrupted graph.
+                assert(p == s);
+                continue;
+            }
+            try parent_buf.append(gpa, lv_map[p]);
+        }
+        const e = history.events.items[old_lv];
+        lv_map[old_lv] = try new_graph.add(gpa, e.id, parent_buf.items, e.op);
+    }
+
+    return .{ .graph = new_graph, .lv_map = lv_map };
+}
+
 /// Minimal binary max-heap of Lvs (duplicates tolerated; callers skip
 /// already-resolved entries).
 const Heap = struct {

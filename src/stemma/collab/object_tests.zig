@@ -613,3 +613,482 @@ fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
 test "fuzz: mutated json wire bytes never crash, rejects are atomic" {
     try std.testing.fuzz({}, fuzzWire, .{});
 }
+
+// ── Compaction (delta 2, stemma-unification.md §3 step 4) ──────────────
+// Whole-doc, one linearization point. Object-creating `map_set`/`list_ins`
+// events (and, for lists, ANY `list_ins`/`list_del`) are never compacted —
+// see `ObjectDoc.compact`'s doc comment for why, and for the per-agent
+// PREFIX requirement `causal.compactGraph`'s watermark imposes: a given
+// agent's own retained (never-compacted) events must all come AFTER all of
+// that same agent's compacted ones. Every scenario below is built to
+// respect this on purpose (a dedicated "founder" agent creates structure
+// and does nothing else; other agents do all the compactable editing) —
+// this is a REAL constraint on real usage, not just test plumbing, so
+// exercising it honestly here (rather than routing around it) is part of
+// the coverage. `ObjId`s are also doc-local: every cross-replica use below
+// re-resolves via `root().mapGet(...).?.objId()` on the RECEIVING replica.
+
+test "compact: text history collapses, map/text content unchanged, collaboration (incl. lists) continues" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    _ = try founder.mapSet(gpa, null, "title", .{ .str = "doc" }); // compactable
+    _ = try founder.mapSet(gpa, null, "body", .text); // retained (creation)
+    // founder never touches the document again. No list content yet —
+    // ANY list_ins/list_del in the causal past of the stable point blocks
+    // compaction entirely (see `ObjectDoc.compact`'s doc comment); lists
+    // get created AFTER the stable point instead, below.
+
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try bob.setAgent(gpa, "bob");
+    try syncOne(gpa, &founder, &alice);
+    try syncOne(gpa, &founder, &bob);
+
+    const alice_body = alice.root().mapGet("body").?.objId().?;
+    _ = try alice.textInsert(gpa, alice_body, 0, "hello world");
+    try syncOne(gpa, &alice, &founder);
+    try syncOne(gpa, &alice, &bob);
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    const before = try founder.toJson(gpa);
+    defer gpa.free(before);
+    const events_before = founder.history.eventCount();
+
+    try founder.compact(gpa, stable);
+    try bob.compact(gpa, stable);
+    // Text content compacted (the doc's bulk); creation events remain, so
+    // this shrinks but does not zero out, unlike TextDoc's all-text case.
+    try t.expect(founder.history.eventCount() < events_before);
+    try t.expect(founder.history.eventCount() > 0);
+    const after = try founder.toJson(gpa);
+    defer gpa.free(after);
+    try t.expectEqualStrings(before, after);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &bob });
+
+    // Editing (text AND structural — a list created AFTER the compaction
+    // point) and syncing continue across the shared compaction point.
+    const bob_body = bob.root().mapGet("body").?.objId().?;
+    _ = try bob.textInsert(gpa, bob_body, 0, "A");
+    const bob_tags = (try bob.mapSet(gpa, null, "tags", .list)).?;
+    _ = try bob.listInsert(gpa, bob_tags, 0, .{ .str = "b" });
+    try syncOne(gpa, &bob, &founder);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &bob });
+}
+
+test "compact: mid-history point keeps later events working" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+
+    var carol: ObjectDoc = .empty;
+    defer carol.deinit(gpa);
+    try carol.setAgent(gpa, "carol");
+    try syncOne(gpa, &founder, &carol);
+    const carol_body = carol.root().mapGet("body").?.objId().?;
+    _ = try carol.textInsert(gpa, carol_body, 0, "early work");
+    try syncOne(gpa, &carol, &founder);
+
+    const mid = try founder.version(gpa);
+    defer gpa.free(mid);
+
+    _ = try carol.textInsert(gpa, carol_body, carol.ref(carol_body).textRope().byteLen(), " later work");
+    _ = try carol.textDelete(gpa, carol_body, .{ .start = 0, .end = 6 });
+    try syncOne(gpa, &carol, &founder);
+
+    const text_now = try bodyText(gpa, &founder, body);
+    defer gpa.free(text_now);
+
+    try founder.compact(gpa, mid);
+    try t.expect(founder.history.eventCount() > 0); // later events retained
+    const text_after = try bodyText(gpa, &founder, body);
+    defer gpa.free(text_after);
+    try t.expectEqualStrings(text_now, text_after);
+}
+
+test "compact: rejects multiple heads" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.mapSet(gpa, null, "a", .{ .int = 1 });
+    try syncBoth(gpa, &alice, &bob);
+    _ = try alice.mapSet(gpa, null, "b", .{ .int = 2 });
+    _ = try bob.mapSet(gpa, null, "c", .{ .int = 3 });
+    try syncBoth(gpa, &alice, &bob);
+
+    const two_heads = try alice.version(gpa);
+    defer gpa.free(two_heads);
+    try t.expectError(error.NotCompactable, alice.compact(gpa, two_heads));
+
+    // Doc still fully functional after the rejection.
+    _ = try alice.mapSet(gpa, null, "d", .{ .int = 4 });
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
+}
+
+test "compact: rejects a single head that still leaves a concurrent remainder" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    _ = try alice.mapSet(gpa, null, "a", .{ .int = 1 });
+    try syncBoth(gpa, &alice, &bob);
+    _ = try alice.mapSet(gpa, null, "b", .{ .int = 2 }); // the later, would-be-stable head
+    const stale_head = try alice.version(gpa);
+    defer gpa.free(stale_head);
+    // Concurrent to "b": bob's parent is only "a".
+    _ = try bob.mapSet(gpa, null, "c", .{ .int = 3 });
+    try syncBoth(gpa, &alice, &bob);
+
+    try t.expectError(error.NotCompactable, alice.compact(gpa, stale_head));
+    _ = try alice.mapSet(gpa, null, "d", .{ .int = 4 });
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
+}
+
+test "compact: rejects a stable point whose causal past still has list structure" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const tags = (try founder.mapSet(gpa, null, "tags", .list)).?;
+    _ = try founder.listInsert(gpa, tags, 0, .{ .str = "a" });
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+
+    try t.expectError(error.NotCompactable, founder.compact(gpa, stable));
+    // Doc still fully functional after the rejection.
+    _ = try founder.listInsert(gpa, tags, 1, .{ .str = "b" });
+    try t.expectEqual(@as(usize, 2), founder.root().mapGet("tags").?.listLen());
+}
+
+test "compact: identity anchors into compacted text become error.Compacted" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+
+    var carol: ObjectDoc = .empty;
+    defer carol.deinit(gpa);
+    try carol.setAgent(gpa, "carol");
+    try syncOne(gpa, &founder, &carol);
+    const carol_body = carol.root().mapGet("body").?.objId().?;
+    _ = try carol.textInsert(gpa, carol_body, 0, "hello");
+    try syncOne(gpa, &carol, &founder);
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    try founder.compact(gpa, stable);
+
+    try t.expectError(error.Compacted, founder.objectAnchorAt(gpa, body, 3, .before));
+
+    // Post-compaction content still anchors fine.
+    _ = try founder.textInsert(gpa, body, 5, "!");
+    const a = try founder.objectAnchorAt(gpa, body, 5, .before);
+    defer gpa.free(a.agent);
+    var off: [1]usize = undefined;
+    try founder.resolveObjectAnchors(gpa, body, &.{a}, &off);
+    try t.expectEqual(@as(usize, 5), off[0]);
+}
+
+test "compact: serialize/open round-trip preserves compacted content and keeps collaborating" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    _ = try founder.mapSet(gpa, null, "title", .{ .str = "doc" });
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+
+    var carol: ObjectDoc = .empty;
+    defer carol.deinit(gpa);
+    try carol.setAgent(gpa, "carol");
+    try syncOne(gpa, &founder, &carol);
+    const carol_body = carol.root().mapGet("body").?.objId().?;
+    _ = try carol.textInsert(gpa, carol_body, 0, "hello world");
+    try syncOne(gpa, &carol, &founder);
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    try founder.compact(gpa, stable);
+
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+    var reopened = try ObjectDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &reopened });
+    _ = body;
+
+    try reopened.setAgent(gpa, "editor");
+    const reopened_body = reopened.root().mapGet("body").?.objId().?;
+    _ = try reopened.textInsert(gpa, reopened_body, 0, "X");
+    try syncOne(gpa, &reopened, &founder);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &reopened });
+}
+
+test "resume sync after compact: uncompacted peer is rejected until it compacts to the same point, then converges" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+
+    var carol: ObjectDoc = .empty;
+    defer carol.deinit(gpa);
+    try carol.setAgent(gpa, "carol");
+    try syncOne(gpa, &founder, &carol);
+    const carol_body = carol.root().mapGet("body").?.objId().?;
+    _ = try carol.textInsert(gpa, carol_body, 0, "shared history");
+    try syncOne(gpa, &carol, &founder);
+
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try bob.setAgent(gpa, "bob");
+    try syncOne(gpa, &founder, &bob); // bob catches up fully BEFORE compaction
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    try founder.compact(gpa, stable);
+    _ = try founder.textInsert(gpa, body, 0, "x");
+
+    // Bob is causally caught up to the stable point, but has NOT compacted
+    // locally — still rejected, the loud documented behavior (mirrors
+    // `TextDoc`'s "uncompacted peer cannot merge a based batch").
+    const vb = try bob.version(gpa);
+    defer gpa.free(vb);
+    const batch = try founder.eventsSince(gpa, vb);
+    defer gpa.free(batch);
+    try t.expectError(error.MissingDependency, bob.merge(gpa, batch));
+
+    // After compacting to the same point, sync works again.
+    try bob.compact(gpa, stable);
+    try syncOne(gpa, &founder, &bob);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &bob });
+}
+
+test "compact: map register conflict resolution stays correct for a late concurrent peer" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+    _ = body;
+
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try bob.setAgent(gpa, "bob");
+    try syncOne(gpa, &founder, &alice);
+    try syncOne(gpa, &founder, &bob);
+
+    // Alice edits body's text; founder takes its stable point RIGHT THERE
+    // — before alice's map write to "k" — so `s` is alice's own last
+    // (foldable) `text_ins`, and every retained event's `in_base` parent
+    // is exactly `s` (see "compact: refuses when a retained write's only
+    // path to another retained write is through a folded text edit" for
+    // what goes wrong if a retained write's causal path to `s` — or to
+    // another retained write — crosses a folded edit instead).
+    const alice_body = alice.root().mapGet("body").?.objId().?;
+    _ = try alice.textInsert(gpa, alice_body, 0, "hello world");
+    try syncOne(gpa, &alice, &founder);
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    try founder.compact(gpa, stable);
+
+    // Alice's write to "k" (retained: map ops never compact) and bob's
+    // concurrent one both happen AFTER the stable point — alice's parent
+    // resolves through founder's `base_head` (the implicit-base-parent
+    // path `merge` already handles for a non-based, ordinary batch from a
+    // peer who's caught up to the compaction point).
+    _ = try alice.mapSet(gpa, null, "k", .{ .str = "v1" });
+    _ = try bob.mapSet(gpa, null, "k", .{ .str = "v2" });
+    try syncOne(gpa, &alice, &founder);
+
+    // Bob's still-unsynced, causally-concurrent write to "k" arrives AFTER
+    // compaction.
+    const vf = try founder.version(gpa);
+    defer gpa.free(vf);
+    const batch = try bob.eventsSince(gpa, vf);
+    defer gpa.free(batch);
+    const changes = try founder.merge(gpa, batch);
+    gpa.free(changes);
+
+    try t.expectEqual(@as(usize, 2), founder.root().mapConflictCount("k"));
+    var saw_v1 = false;
+    var saw_v2 = false;
+    for (0..2) |i| {
+        const v = founder.root().mapConflictAt("k", i).asStr();
+        if (std.mem.eql(u8, v, "v1")) saw_v1 = true;
+        if (std.mem.eql(u8, v, "v2")) saw_v2 = true;
+    }
+    try t.expect(saw_v1 and saw_v2);
+}
+
+// Regression coverage for a real, review-caught soundness bug: the FIRST
+// version of `ObjectDoc.compact` accepted a stable point whose only
+// retained event proving Q-supersedes-P routed through a folded text
+// edit — `causal.compactGraph`'s blanket "drop any in_base parent" then
+// silently dropped that edge, and a fresh replica reopening the SAME
+// compacted bytes computed a DIFFERENT winner for "k" than the compacting
+// replica had (proven empirically before the fix: conflictCount and the
+// agent-name tiebreak both diverged). The fix is refusal, not repair —
+// `ObjectDoc.compact` now rejects this shape outright
+// (`error.NotCompactable`); see its doc comment and
+// `causal.compactGraph`'s own defensive `assert` for the two lines of
+// defense.
+
+test "compact: refuses when a retained write's only path to another retained write is through a folded text edit" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    _ = try founder.mapSet(gpa, null, "body", .text);
+
+    var zzz: ObjectDoc = .empty;
+    defer zzz.deinit(gpa);
+    try zzz.setAgent(gpa, "zzz");
+    var aaa: ObjectDoc = .empty;
+    defer aaa.deinit(gpa);
+    try aaa.setAgent(gpa, "aaa");
+    try syncOne(gpa, &founder, &zzz);
+
+    // P: zzz writes "k" first.
+    _ = try zzz.mapSet(gpa, null, "k", .{ .str = "P-zzz" });
+    // T: zzz then edits body's text — zzz's own local frontier chains
+    // P -> T directly, so T is the sole causal link out of P for anyone
+    // who only saw zzz's history up through T.
+    const zzz_body = zzz.root().mapGet("body").?.objId().?;
+    _ = try zzz.textInsert(gpa, zzz_body, 0, "hi");
+
+    // aaa catches up to T (and, transitively, P) — her own frontier is
+    // exactly {T}, never {P} directly.
+    try syncOne(gpa, &zzz, &aaa);
+    // Q: aaa's write supersedes P — she has SEEN it (via T).
+    _ = try aaa.mapSet(gpa, null, "k", .{ .str = "Q-aaa" });
+
+    try syncOne(gpa, &aaa, &founder);
+    try t.expectEqual(@as(usize, 1), founder.root().mapConflictCount("k"));
+    try t.expectEqualStrings("Q-aaa", founder.root().mapGet("k").?.asStr());
+
+    // The stable point is Q itself: Q's ONLY causal path back to P routes
+    // through the now-foldable T. Compacting here would make
+    // `causal.compactGraph` drop T's edge (T is in_base, T != s == Q),
+    // silently losing Q's dependency on P — refused instead.
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    try t.expectError(error.NotCompactable, founder.compact(gpa, stable));
+
+    // The refusal is a no-op, not a partial mutation: content is exactly
+    // as it was, and stays correct across a real merge/serialize round
+    // trip too (uncompacted, since compaction never happened).
+    try t.expectEqual(@as(usize, 1), founder.root().mapConflictCount("k"));
+    try t.expectEqualStrings("Q-aaa", founder.root().mapGet("k").?.asStr());
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+    var reopened = try ObjectDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try t.expectEqual(@as(usize, 1), reopened.root().mapConflictCount("k"));
+    try t.expectEqualStrings("Q-aaa", reopened.root().mapGet("k").?.asStr());
+}
+
+test "compact: still succeeds when a retained write's path to another retained write doesn't cross a folded edit" {
+    const gpa = t.allocator;
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    _ = try founder.mapSet(gpa, null, "body", .text);
+    // founder never touches the document again — same reason as every
+    // other test in this file (the per-agent PREFIX constraint:
+    // `causal.compactGraph`'s watermark needs a given agent's compactable
+    // events to be their EARLIEST, never interleaved with retained ones —
+    // see `ObjectDoc.compact`'s doc comment).
+
+    var zzz: ObjectDoc = .empty;
+    defer zzz.deinit(gpa);
+    try zzz.setAgent(gpa, "zzz");
+    var aaa: ObjectDoc = .empty;
+    defer aaa.deinit(gpa);
+    try aaa.setAgent(gpa, "aaa");
+    var carol: ObjectDoc = .empty;
+    defer carol.deinit(gpa);
+    try carol.setAgent(gpa, "carol");
+    try syncOne(gpa, &founder, &zzz);
+
+    // Same P/Q shape as the regression test above, but WITHOUT a text
+    // edit sitting between them: aaa's frontier is exactly {P} when she
+    // writes Q, a direct edge.
+    _ = try zzz.mapSet(gpa, null, "k", .{ .str = "P-zzz" });
+    try syncOne(gpa, &zzz, &aaa);
+    _ = try aaa.mapSet(gpa, null, "k", .{ .str = "Q-aaa" });
+    try syncOne(gpa, &aaa, &founder);
+
+    // Unrelated text content from a THIRD agent (carol), whose own
+    // timeline is entirely compactable text edits — no retained events of
+    // her own to interleave with, so she can't violate the per-agent
+    // prefix either. Synced from founder AFTER Q, so her edit's frontier
+    // includes Q (no concurrent second head).
+    try syncOne(gpa, &founder, &carol);
+    const carol_body = carol.root().mapGet("body").?.objId().?;
+    _ = try carol.textInsert(gpa, carol_body, 0, "hello");
+    try syncOne(gpa, &carol, &founder);
+
+    try t.expectEqual(@as(usize, 1), founder.root().mapConflictCount("k"));
+    try t.expectEqualStrings("Q-aaa", founder.root().mapGet("k").?.asStr());
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    try founder.compact(gpa, stable);
+
+    try t.expectEqual(@as(usize, 1), founder.root().mapConflictCount("k"));
+    try t.expectEqualStrings("Q-aaa", founder.root().mapGet("k").?.asStr());
+}
+
+fn compactOomScript(gpa: std.mem.Allocator) !void {
+    var founder: ObjectDoc = .empty;
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "founder");
+    const body = (try founder.mapSet(gpa, null, "body", .text)).?;
+    _ = body;
+
+    var carol: ObjectDoc = .empty;
+    defer carol.deinit(gpa);
+    try carol.setAgent(gpa, "carol");
+    try syncOne(gpa, &founder, &carol);
+    const carol_body = carol.root().mapGet("body").?.objId().?;
+    _ = try carol.textInsert(gpa, carol_body, 0, "compact under pressure");
+    try syncOne(gpa, &carol, &founder);
+
+    const stable = try founder.version(gpa);
+    defer gpa.free(stable);
+    _ = try carol.textInsert(gpa, carol_body, 0, "x");
+    try syncOne(gpa, &carol, &founder);
+
+    try founder.compact(gpa, stable);
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+    var re = try ObjectDoc.open(gpa, bytes);
+    defer re.deinit(gpa);
+}
+
+test "OOM: compaction paths are leak-free under every allocation failure" {
+    try std.testing.checkAllAllocationFailures(t.allocator, compactOomScript, .{});
+}
