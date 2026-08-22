@@ -1381,6 +1381,147 @@ test "openFromContent: bulk load, then edit, sync, and compact — interplay wit
     try expectConverged(&[_]*ObjectDoc{ &founder, &peer });
 }
 
+// ── ADDPEER_BOOTSTRAP_HAZARD: base + live edits in one bootstrap batch ──
+// weft's own name (W7a report) for the ordering bug this battery pins: a
+// SINGLE `merge()` call that both bootstraps a fresh (entirely empty)
+// replica from a compacted base AND carries live `text_ins`/`text_del`
+// for that same base's object needs the base adopted in TWO separate
+// respects, both before the live edits can be trusted:
+//   1. METADATA (bytes + scalar count) into `self.text_bases`, BEFORE
+//      `historyPhase` replays a single event — `objects_state.Walker.
+//      getSeqWalker` seeds an object's FugueMax placeholder items from
+//      `self.text_bases` the first time replay touches it, and replay is
+//      what computes every live effect's POSITION relative to those
+//      placeholders. Miss this and a real (non-empty) base corrupts
+//      every position computed against it — `error.Corrupt`, not a
+//      clobber; a trivial empty base hides the bug (nothing to anchor
+//      into, so zero seeded placeholders is accidentally correct).
+//   2. ROPE bytes into the object's node, once that node exists (its
+//      creation effect, in the tree-application loop) — miss ONLY this
+//      (metadata seeded correctly, rope seeded too late/wrong) and
+//      positions resolve fine but the live edits' rope surgery lands on
+//      an empty rope, then gets silently overwritten by the base bytes
+//      alone once a deferred, end-of-batch rope-seed finally runs.
+// `openFromContent`'s own founder base is trivially empty (bulk-loading
+// "" — exactly weft's `Document.init` shape), so the very first keystroke
+// past `init` already reproduces failure mode 2 — not an edge case; the
+// second test below (a real, non-empty founder base) reproduces mode 1.
+
+test "merge: a single bootstrap batch carrying a base and live edits beyond it keeps the edits (ADDPEER_BOOTSTRAP_HAZARD)" {
+    const gpa = t.allocator;
+    // `openFromContent`'s own founder shape: a trivial (empty) base under
+    // a synthetic agent, then real typing by a SEPARATE, ordinary agent —
+    // exactly `Document.init` + `Document.insert`.
+    var founder = try ObjectDoc.openFromContent(gpa, "", "body");
+    defer founder.deinit(gpa);
+    const body = founder.root().mapGet("body").?.objId().?;
+    try founder.setAgent(gpa, "user");
+    _ = try founder.textInsert(gpa, body, 0, "hello world");
+
+    // One `serialize()` batch carries BOTH the (trivial) base section AND
+    // "user"'s live text_ins events — `open`/`merge` on a totally blank
+    // replica is exactly the naive one-call bootstrap `Document.addPeer`
+    // used before discovering this hazard.
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+    var fresh = try ObjectDoc.open(gpa, bytes);
+    defer fresh.deinit(gpa);
+
+    const text = try bodyText(gpa, &fresh, body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("hello world", text);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &fresh });
+}
+
+test "merge: a single bootstrap batch carrying a NON-EMPTY base and live edits past it converges (ADDPEER_BOOTSTRAP_HAZARD, real base)" {
+    const gpa = t.allocator;
+    // Real (non-empty) base content this time: bulk-load "aaa" as the
+    // founder's own base (unlike the previous test's trivial ""), then a
+    // SEPARATE agent inserts "X" in the middle — a live edit whose
+    // position (scalar 1, mid-base) can only resolve correctly if replay
+    // actually seeded 3 base placeholders for this object BEFORE
+    // computing it (failure mode 1 above; the empty-base test above
+    // can't distinguish "seeded 0 placeholders" from "seeded correctly"
+    // since both give the same answer when there's nothing to anchor
+    // into).
+    var founder = try ObjectDoc.openFromContent(gpa, "aaa", "body");
+    defer founder.deinit(gpa);
+    const body = founder.root().mapGet("body").?.objId().?;
+    try founder.setAgent(gpa, "user");
+    _ = try founder.textInsert(gpa, body, 1, "X");
+
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+    var fresh = try ObjectDoc.open(gpa, bytes);
+    defer fresh.deinit(gpa);
+
+    const text = try bodyText(gpa, &fresh, body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("aXaa", text);
+    try expectConverged(&[_]*ObjectDoc{ &founder, &fresh });
+}
+
+// Rollback discipline for the METADATA seed added above: `merge` now
+// mutates `self.text_bases` BEFORE `historyPhase` (and everything after
+// it) has had a chance to fail — a rejected bootstrap must leave `self`
+// exactly as it started, `text_bases` included, not just "no leaked
+// bytes" (a doc discarded via its own `deinit` right after a failed
+// `merge`, e.g. `ObjectDoc.open`'s `errdefer doc.deinit(gpa)`, would
+// free a leftover entry fine either way — that shape can't tell "rolled
+// back" apart from "leaked but then swept up regardless"). This script
+// merges into a replica it keeps using (and inspecting) after a failure
+// instead, which is the shape that actually depends on the rollback:
+// stray `text_bases` metadata surviving a failed bootstrap would
+// silently corrupt a LATER retry on the same replica (`getOrPut` finding
+// a "existing" entry nothing in `self.history`/`self.obj_index` actually
+// backs).
+fn bootstrapRealBaseRollbackScript(gpa: std.mem.Allocator) !void {
+    var founder = try ObjectDoc.openFromContent(gpa, "aaa", "body");
+    defer founder.deinit(gpa);
+    try founder.setAgent(gpa, "user");
+    const body = founder.root().mapGet("body").?.objId().?;
+    _ = try founder.textInsert(gpa, body, 1, "X");
+    const bytes = try founder.serialize(gpa);
+    defer gpa.free(bytes);
+
+    var fresh: ObjectDoc = .empty;
+    defer fresh.deinit(gpa);
+    if (fresh.merge(gpa, bytes)) |changes| {
+        gpa.free(changes);
+    } else |err| switch (err) {
+        // `checkAllAllocationFailures` only ever injects OOM; any other
+        // error here would mean the batch itself is somehow invalid.
+        // The harness requires the injected failure to still propagate
+        // (it tracks which allocation indices got exercised) — check the
+        // invariant, then re-raise rather than swallowing it.
+        error.OutOfMemory => {
+            // Scoped to `historyPhase`'s OWN atomic boundary, not the
+            // whole of `merge`: once `historyPhase` has actually
+            // succeeded, a LATER OOM (committing `base_version`, or
+            // partway through tree application) can legitimately leave a
+            // partial-but-internally-consistent doc — the SAME
+            // documented allowance `TextDoc`'s own module doc comment
+            // makes ("the rope may reflect a prefix of the batch —
+            // recover by rebuilding from serialize"), not a regression
+            // `seeded_bases` needs to plug. While `self.history` is
+            // still EMPTY, though (`historyPhase` rolled all the way
+            // back, or never got that far), `self.text_bases` must be
+            // too — a leftover entry there would name an object that
+            // doesn't exist anywhere in the graph, exactly the hazard
+            // `seeded_bases`'s errdefer exists to prevent.
+            if (fresh.history.eventCount() == 0) {
+                try t.expectEqual(@as(usize, 0), fresh.text_bases.count());
+            }
+            return err;
+        },
+        else => |e| return e,
+    }
+}
+
+test "OOM: a failed bootstrap (real base) leaves self.text_bases empty, not just leak-free" {
+    try std.testing.checkAllAllocationFailures(t.allocator, bootstrapRealBaseRollbackScript, .{});
+}
+
 test "materializeAt: time travel to any known version, scoped to one text object" {
     const gpa = t.allocator;
     var d: ObjectDoc = .empty;
@@ -1860,6 +2001,107 @@ test "partial: eventsSince stays usable while holey via a version-only base; an 
     var blank: ObjectDoc = .empty;
     defer blank.deinit(gpa);
     try t.expectError(error.MissingDependency, blank.merge(gpa, batch));
+}
+
+// ── openPartial from a REAL (post-edit) compaction boundary ─────────────
+// `OPENPARTIAL_FOUNDER_ONLY_GAP` (weft's W7a report name for this): every
+// `partialPair`-based test above builds its host via `openFromContent`
+// alone, so `base_head` always names the founder's OWN (never-folded)
+// creation event — `openPartial`'s original `head.seq != seq_base` check
+// happens to hold in exactly that one degenerate shape. A document that
+// was actually TYPED INTO and THEN `compact`ed at the resulting head (the
+// ordinary "edit, then compact" shape, not a bulk load) folds the
+// EDITING agent's events, raising ITS `seq_base` to `head.seq + 1` — the
+// check as originally written rejected this real, common boundary
+// outright with `error.Corrupt`. See `openPartial`'s doc comment for the
+// full invariant this battery pins.
+
+/// Founder creates `key` (bulk-loaded as `initial`, `openFromContent`'s
+/// own founder shape) and never touches it again; `editor` (a SEPARATE
+/// agent — required, `compact`'s per-agent-prefix guard: the founder
+/// itself could never both create and later fold) types `typed` at the
+/// end and the doc is `compact`ed at the resulting head — the exact
+/// "type content, compact at head" shape a real editor produces.
+fn editedThenCompacted(gpa: std.mem.Allocator, initial: []const u8, key: []const u8, typed: []const u8) !ObjectDoc {
+    var host = try ObjectDoc.openFromContent(gpa, initial, key);
+    errdefer host.deinit(gpa);
+    var editor: ObjectDoc = .empty;
+    defer editor.deinit(gpa);
+    try editor.setAgent(gpa, "editor");
+    try syncOne(gpa, &host, &editor);
+    const editor_body = editor.root().mapGet(key).?.objId().?;
+    _ = try editor.textInsert(gpa, editor_body, editor.ref(editor_body).textRope().byteLen(), typed);
+    try syncOne(gpa, &editor, &host);
+
+    const stable = try host.version(gpa);
+    defer gpa.free(stable);
+    try host.compact(gpa, stable);
+    return host;
+}
+
+test "partial: openPartial bootstraps from a real edited-then-compacted boundary (not just the founder's own creation)" {
+    const gpa = t.allocator;
+    var host = try editedThenCompacted(gpa, "", "body", "hello world");
+    defer host.deinit(gpa);
+    const body = host.root().mapGet("body").?.objId().?;
+
+    // `base_head` names the EDITOR's folded last event, not the
+    // founder's creation — exactly the shape the old check rejected.
+    try t.expect(host.base_head.?.agent != @as(ObjectDoc.AgentId, @enumFromInt(0)));
+    const wm = try host.agentWatermarks(gpa);
+    defer gpa.free(wm);
+    try t.expectEqual(@as(u64, 11), wm[@intFromEnum(host.base_head.?.agent)].seq_base);
+    try t.expectEqual(host.base_head.?.seq + 1, wm[@intFromEnum(host.base_head.?.agent)].seq_base);
+
+    const base = host.text_bases.get(body).?.bytes;
+    var part = try ObjectDoc.openPartial(gpa, host.base_version, wm, "body", &.{
+        .{ .content = base[0..2] },
+        .{ .hole = .{ .bytes = 5, .scalars = 5 } }, // "llo w"
+        .{ .content = base[7..] },
+    });
+    defer part.deinit(gpa);
+
+    // The event graph (hence the object's identity) is complete from the
+    // start, holes or not: versions agree, and future syncing with the
+    // real host works — the whole point of getting the creator identity
+    // right instead of fabricating one under the editor's name.
+    const hv = try host.version(gpa);
+    defer gpa.free(hv);
+    const pv = try part.version(gpa);
+    defer gpa.free(pv);
+    try t.expectEqualStrings(hv, pv);
+    try t.expect(!part.baseRealized(body));
+
+    // realizeBase.
+    const h = part.unrealizedBase(body)[0];
+    try part.realizeBase(gpa, body, h.base_offset, base[2..7]);
+    try t.expect(part.baseRealized(body));
+    const text = try bodyText(gpa, &part, body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("hello world", text);
+
+    // merge live tail: the host keeps editing PAST the compaction point;
+    // that batch merges into the partial replica like any ordinary sync.
+    var editor2: ObjectDoc = .empty;
+    defer editor2.deinit(gpa);
+    try editor2.setAgent(gpa, "editor2");
+    try syncOne(gpa, &host, &editor2);
+    const editor2_body = editor2.root().mapGet("body").?.objId().?;
+    _ = try editor2.textInsert(gpa, editor2_body, editor2.ref(editor2_body).textRope().byteLen(), "!");
+    try syncOne(gpa, &editor2, &host);
+    try syncOne(gpa, &host, &part);
+    try expectConverged(&[_]*ObjectDoc{ &host, &part });
+}
+
+test "partial: openPartial still accepts the founder's own degenerate creation (unaffected by the real-boundary fix)" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try t.expectEqual(p.host.base_head.?, p.part.root().mapGet("body").?.objId().?);
+    const text = try bodyText(gpa, &p.host, p.body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("aaaHHHHbbb", text);
 }
 
 // ── Structural ops (F3, delta 6 — the move op) ──────────────────────────

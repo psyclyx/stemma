@@ -1422,17 +1422,49 @@ pub fn agentWatermarks(self: *const ObjectDoc, gpa: Allocator) Allocator.Error![
 /// Bootstrap a partially realized replica of a compacted document: same
 /// degenerate one-root-map-one-text-key shape as `openFromContent`, with
 /// `chunks` allowed to carry holes (see the section doc comment above for
-/// full scope). `base_version` (a single-head token) names the text
-/// object's OWN creation event — also this document's whole `base_head`,
-/// mirroring `openFromContent`'s invariant that its one retained event
-/// serves both roles — and `agents` supplies every watermark the host
-/// reports (`agentWatermarks`). `error.Corrupt`: duplicate agent names,
-/// the named head's agent is not among `agents`, the head's `seq` is not
-/// EXACTLY that agent's registered `seq_base` (the creation event must be
-/// the very next event that agent would emit — anything else means the
-/// host and the supplied watermarks disagree about this object's
-/// identity), or a malformed chunk. Sync works immediately; content
-/// inside holes waits for `realizeBase`.
+/// full scope). `base_version` (a single-head token) names this
+/// document's whole `base_head` — the stable point `ObjectDoc.compact`
+/// (or `openFromContent`'s born-compacted shape) was last taken at — and
+/// `agents` supplies every watermark the host reports (`agentWatermarks`).
+/// `error.Corrupt`: duplicate agent names, the named head's agent is not
+/// among `agents`, the head's `seq` is newer than that agent's registered
+/// `seq_base` could ever have produced (see below), or a malformed chunk.
+/// Sync works immediately; content inside holes waits for `realizeBase`.
+///
+/// INVARIANT (the reasoning ported from `TextDoc.openPartial`'s own
+/// check — `if (head.seq >= seq_base) return error.Corrupt`, i.e. it
+/// REJECTS `head.seq >= seq_base` and so only ever ACCEPTS `head.seq <
+/// seq_base` — see its doc comment for why): `head.seq` must name an
+/// event `head_agent` has ALREADY produced as far as `seq_base` is
+/// concerned, i.e. accept `head.seq <= seq_base`, reject `head.seq >
+/// seq_base` — the latter would name an event `head_agent` hasn't gotten
+/// to yet, which can never be a valid compaction boundary. The accepted
+/// range is one wider than `TextDoc`'s (`<=`, not `<`) because `TextDoc`
+/// never adds a single graph event for its base — `seq_base` alone fully
+/// describes it, so `<` is the tight bound — while `ObjectDoc`'s base
+/// ALSO needs one real, live event: the `map_set` that
+/// mints `key`'s text object (never itself foldable — `compact`'s own
+/// doc comment). Two regimes fall out of the same `<=`, not one:
+///  - `head.seq == seq_base`: NOTHING of `head_agent`'s has ever folded
+///    (the founder's own degenerate creation, `openFromContent`'s shape,
+///    where `base_head` names that very `map_set`) — `head_agent` IS the
+///    creator, and `head` names its creation event exactly.
+///  - `head.seq < seq_base`: real editing happened and this doc was
+///    `compact`ed at the resulting head, folding `head_agent`'s events up
+///    through `head.seq` (`causal.compactGraph` raises `seq_base` to
+///    `head.seq + 1` in exactly this case) — `head_id` now names a
+///    FOLDED `text_ins`/`text_del`, not a creation event, and it can
+///    never be re-added (`EventGraph.add`'s own precondition, `id.seq ==
+///    nextSeq(id.agent)`, makes a lower-than-`seq_base` seq permanently
+///    unreachable). `ObjectDoc.compact`'s per-agent-prefix guard (its own
+///    doc comment: "a SINGLE agent that both creates a text object AND
+///    later edits it... is error.NotCompactable") proves `head_agent`,
+///    having folded anything at all, can therefore NEVER be `key`'s
+///    creator — so in this regime the creator is a DIFFERENT agent, and
+///    for this function's degenerate one-object scope (nothing else can
+///    exist in the document before its one object is created, same as
+///    `openFromContent`) that agent is unambiguously whichever one
+///    registered FIRST: `agents[0]`.
 pub fn openPartial(
     gpa: Allocator,
     base_version: []const u8,
@@ -1451,21 +1483,33 @@ pub fn openPartial(
 
     const head = try versionSingleEntry(base_version);
     const head_agent = doc.history.findAgent(head.name) orelse return error.Corrupt;
-    if (head.seq != doc.history.agents.items[@intFromEnum(head_agent)].seq_base) {
-        return error.Corrupt; // not this agent's next event given the supplied watermark
+    const head_seq_base = doc.history.agents.items[@intFromEnum(head_agent)].seq_base;
+    if (head.seq > head_seq_base) {
+        return error.Corrupt; // names an event `head_agent` hasn't produced
     }
+    const founder_creation = head.seq == head_seq_base;
     const head_id: EventId = .{ .agent = head_agent, .seq = head.seq };
 
-    // The one retained event: exactly `openFromContent`'s `mapSet` call,
-    // except its (agent, seq) is fixed by `head_id` rather than chosen by
-    // `addLocal`'s auto-numbering — which it still IS, transparently:
-    // `head_agent`'s freshly-registered `lv_by_seq` is empty, so
-    // `addLocal`'s `nextSeq` computes exactly `seq_base`, which the check
-    // above already pinned to `head.seq`.
-    doc.agent = head_agent;
+    // The one retained event: exactly `openFromContent`'s `mapSet` call.
+    // `founder_creation` (see the doc comment above): its (agent, seq) is
+    // fixed by `head_id` — `head_agent`'s freshly-registered `lv_by_seq`
+    // is empty, so `addLocal`'s `nextSeq` computes exactly `seq_base`,
+    // which the check above already pinned to `head.seq`. Otherwise
+    // (`head_id` names a folded, non-creation event — unreachable via
+    // `addLocal` at all) the creator is `agents[0]` instead.
+    const creator: AgentId = if (founder_creation) head_agent else @enumFromInt(0);
+    // Loud, not silent: `compact`'s per-agent-prefix guard (see the doc
+    // comment above) PROVES `head_agent` can never be `agents[0]` once
+    // it's folded anything — if a caller's `base_version`/`agents` pair
+    // violates that (a self-inconsistent or malicious combination), mint
+    // the wrong identity under a match here anyway would be a silent
+    // correctness bug (a partial replica quietly diverging from the real
+    // document's object identity) rather than a crash. Crash.
+    if (!founder_creation) assert(@intFromEnum(head_agent) != @intFromEnum(creator));
+    doc.agent = creator;
     const obj = (try doc.mapSet(gpa, null, key, .text)).?;
     doc.agent = null;
-    assert(std.meta.eql(obj, head_id));
+    if (founder_creation) assert(std.meta.eql(obj, head_id));
 
     var total_bytes: usize = 0;
     var total_scalars: usize = 0;
@@ -1653,6 +1697,57 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
         }
     }
 
+    // Adopt the bootstrap's per-object base METADATA (bytes + scalar
+    // count) into `self.text_bases` BEFORE `historyPhase` runs — not
+    // just before its own effect fires. `historyPhase`'s replay
+    // (`objects_state.Walker.getSeqWalker`) seeds a text object's
+    // FugueMax placeholder items from `self.text_bases` the FIRST time
+    // replay touches that object, and it's replay that computes every
+    // `text_ins`/`text_del` EFFECT's position relative to that
+    // placeholder-seeded sequence. A base adopted only afterward (this
+    // function's older bug: it moved the ROPE seed to the object's
+    // creation effect but left the METADATA seed there too) makes
+    // replay treat the object as having ZERO base scalars — for a
+    // TRIVIAL (empty) base this happens to be harmless (there's nothing
+    // to anchor into), but for a REAL, non-empty base it corrupts every
+    // position computed against it, surfacing as `error.Corrupt` deep in
+    // `Sequence.applyInsert`/`applyDelete`, not a content clobber.
+    // `self.text_bases` is necessarily empty before a true bootstrap (no
+    // events yet ⇒ no objects yet ⇒ no bases), so a rejected batch must
+    // remove exactly the entries THIS call adds — `seeded_bases` tracks
+    // them and the `errdefer` below unwinds them on ANY later failure in
+    // this function (`historyPhase`, tree application, allocation),
+    // same "leave `self` untouched on rejection" discipline as every
+    // other error path here. Rope materialization stays where it was:
+    // at the object's creation effect, in the tree-application loop
+    // below (`adoptTextBaseRope`) — the node (and `obj_index` entry)
+    // only exists once `makeValueNode` has run for it, which happens
+    // there, not in `historyPhase`.
+    var seeded_bases: std.ArrayList(EventId) = .empty;
+    defer seeded_bases.deinit(gpa);
+    errdefer for (seeded_bases.items) |id| {
+        if (self.text_bases.fetchRemove(id)) |kv| gpa.free(kv.value.bytes);
+    };
+    if (bootstrap) {
+        for (dec.base.?.text_bases) |tb| {
+            const id: EventId = .{ .agent = aids[tb.obj.agent_idx], .seq = tb.obj.seq };
+            // Record intent BEFORE mutating `self.text_bases`, not after:
+            // if `adoptTextBaseMetadata` itself fails partway (its own
+            // `gpa.dupe`/`getOrPut` calls), it's guaranteed to have left
+            // `self.text_bases` untouched for `id` (traced in its own
+            // doc comment) — so an `id` appended here that never actually
+            // got adopted is harmless (the `errdefer` above's
+            // `fetchRemove` simply misses). The REVERSE order is the
+            // real bug: appending AFTER a successful adopt leaves a
+            // window where `self.text_bases` already has the entry but
+            // `seeded_bases` doesn't yet know about it — an OOM on the
+            // append itself would then orphan it, invisible to the
+            // rollback (caught by this file's own OOM battery).
+            try seeded_bases.append(gpa, id);
+            try self.adoptTextBaseMetadata(gpa, id, tb);
+        }
+    }
+
     // Graph phase with wholesale rollback (including interned strings).
     var effects: std.ArrayList(Effect) = .empty;
     defer effects.deinit(gpa);
@@ -1660,11 +1755,7 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
 
     // A bootstrap's base fields (`base_version`/`base_head`) commit
     // regardless of `any_new` (a compacted-but-otherwise-idle doc's
-    // serialize() can legitimately carry zero pending events); adopting
-    // the text bases' CONTENT is deferred to after tree application below
-    // — each entry names its object by its creation event, whose node
-    // (and `obj_index` entry) only exists once `makeValueNode` has run
-    // for it, which happens there, not in `historyPhase`.
+    // serialize() can legitimately carry zero pending events).
     if (bootstrap) {
         gpa.free(self.base_version);
         self.base_version = try gpa.dupe(u8, dec.base.?.version);
@@ -1672,7 +1763,14 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
     }
 
     if (!any_new) {
-        if (bootstrap) try self.adoptTextBases(gpa, dec.base.?, aids);
+        // Base METADATA is already adopted (above); there is no ROPE to
+        // seed here — zero new events means the tree-application loop
+        // below never runs, so no node exists yet for any object this
+        // batch's base section could name (a fresh bootstrap's base
+        // section always names an object created by SOME event in the
+        // very same batch — see the tree-application loop's own comment
+        // on this — so a batch reaching this branch has no text bases to
+        // begin with; `seeded_bases` is empty here in practice).
         return try gpa.alloc(Change, 0);
     }
 
@@ -1687,6 +1785,18 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
             .map_add => |e| {
                 const map_node = self.nodeOfObjLv(e.obj orelse root_key);
                 const value_node = try self.makeValueNode(gpa, e.val, e.set_lv);
+                // `ADDPEER_BOOTSTRAP_HAZARD` — see `adoptTextBaseRope`'s
+                // doc comment: materialize a freshly-created text
+                // object's rope from its (already `merge`-seeded, see
+                // above) base bytes HERE, right after its creation
+                // effect, so any LATER effect in this same batch
+                // targeting it (`.text_ins`/`.text_del`, necessarily
+                // later in causal/Lv order) lands on the seeded rope
+                // instead of an empty one.
+                if (bootstrap and e.val == .new_text) {
+                    const id = self.history.idOf(e.set_lv);
+                    if (self.text_bases.contains(id)) try self.adoptTextBaseRope(gpa, id);
+                }
                 const slot = try self.treeSlot(gpa, map_node, e.key);
                 try slot.values.append(gpa, .{ .set_id = self.history.idOf(e.set_lv), .node = value_node });
                 try changes.append(gpa, .{ .map = .{ .obj = self.objIdOf(e.obj), .key = self.str(e.key) } });
@@ -1706,6 +1816,12 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
             .list_ins => |e| {
                 const list_node = self.nodeOfObjLv(e.obj);
                 const value_node = try self.makeValueNode(gpa, e.val, e.lv);
+                // See the identical hook in `.map_add` above — a text
+                // object can equally be created as a list element.
+                if (bootstrap and e.val == .new_text) {
+                    const id = self.history.idOf(e.lv);
+                    if (self.text_bases.contains(id)) try self.adoptTextBaseRope(gpa, id);
+                }
                 try self.nodes.items[list_node].list.elems.insert(gpa, @intCast(e.index), value_node);
                 try changes.append(gpa, .{ .list_ins = .{ .obj = self.history.idOf(e.obj), .index = @intCast(e.index) } });
             },
@@ -1782,7 +1898,19 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
             },
         }
     }
-    if (bootstrap) try self.adoptTextBases(gpa, dec.base.?, aids);
+    // No deferred rope-adoption sweep here: every `base.text_bases`
+    // entry names an object created by SOME `.map_add`/`.list_ins`
+    // effect in the loop just run (`Decoder.validate` confirmed each
+    // entry's creating event is known or present in this very batch;
+    // "known" is impossible on a true bootstrap, since `self` started
+    // entirely empty) — the inline `adoptTextBaseRope` hooks in those
+    // two effect arms above already materialized every one of them,
+    // each right at its own creation, which is what makes any subsequent
+    // `.text_ins`/`.text_del` for that object in this same loop land on
+    // the seeded rope instead of clobbering it afterward
+    // (`ADDPEER_BOOTSTRAP_HAZARD`). The METADATA half of every entry was
+    // already adopted before `historyPhase` ran at all (see above) —
+    // this loop only ever does the ROPE half.
     return changes.toOwnedSlice(gpa);
 }
 
@@ -2396,40 +2524,67 @@ fn freeTextBases(gpa: Allocator, bases: *jw.TextBaseMap) void {
     bases.deinit(gpa);
 }
 
-/// Adopt a bootstrap batch's text bases into `self.text_bases`. Called
-/// from `merge` only when `bootstrap` is true (this doc was entirely
-/// empty). Keyed directly by the wire entry's portable identity — no
-/// `lvOf` resolution needed at all (see `jw.TextBaseMap`'s doc comment),
-/// though `Decoder.validate` already confirmed the creating event is
-/// either known or present in this very batch, so the object is real.
-fn adoptTextBases(self: *ObjectDoc, gpa: Allocator, base: Decoder.BaseSection, aids: []const AgentId) MergeError!void {
-    for (base.text_bases) |tb| {
-        const id: EventId = .{ .agent = aids[tb.obj.agent_idx], .seq = tb.obj.seq };
-        // Build the fully-owned replacements BEFORE touching
-        // `self.text_bases`/`self.nodes` at all: `getOrPut` inserts the
-        // KEY unconditionally, before any value is known, so if a value
-        // is computed only AFTER that (the original shape of this
-        // function), a later allocation failure leaves a hashmap entry
-        // pointing at uninitialized memory — `deinit`'s free-every-value
-        // loop then crashes on it. Fallible work first, commit last.
-        const bytes_owned = try gpa.dupe(u8, tb.bytes);
-        errdefer gpa.free(bytes_owned);
-        // `text_bases` is metadata for FUTURE replay (`SeqWalker.initBase`
-        // seeding) — it does not, by itself, make this content readable.
-        // On a true bootstrap the node was JUST created (empty rope, by
-        // `makeValueNode` during this same `historyPhase`'s `.map_add`
-        // effect) — materialize its base content now, exactly as
-        // `TextDoc.merge`'s bootstrap sets `self.rope` from `btext`.
-        var rope = try Rope.fromSlice(gpa, tb.bytes);
-        errdefer rope.deinit(gpa);
+/// Adopt ONE bootstrap batch text-base entry's METADATA (bytes + scalar
+/// count) into `self.text_bases`. Called from `merge`, for every entry,
+/// BEFORE `historyPhase` runs at all — this is the piece
+/// `objects_state.Walker.getSeqWalker` reads (`self.text_bases.get(obj)`)
+/// the FIRST time replay touches an object, to seed its FugueMax
+/// sequence's placeholder items; every `text_ins`/`text_del` EFFECT
+/// `historyPhase`'s replay computes for that object is a position
+/// relative to those placeholders. Seed this too late (e.g. only once
+/// the object's node exists, at its creation effect, which is what an
+/// earlier version of this function did) and replay sees ZERO base
+/// scalars for the object — for a trivial (empty) base this is
+/// harmless, but for a real, non-empty base it corrupts every position
+/// computed against it, surfacing as `error.Corrupt` inside
+/// `Sequence.applyInsert`/`applyDelete`, not merely a content clobber.
+/// Does NOT touch `self.nodes`/any rope — the node this entry's `id`
+/// names does not exist yet at the point `merge` calls this (nothing
+/// has been added to the graph, let alone the tree, until AFTER this
+/// runs); materializing the rope is `adoptTextBaseRope`'s job, run later
+/// once the node exists. Keyed directly by the wire entry's portable
+/// identity — no `lvOf` resolution needed at all (see `jw.TextBaseMap`'s
+/// doc comment).
+fn adoptTextBaseMetadata(self: *ObjectDoc, gpa: Allocator, id: EventId, tb: Decoder.TextBaseRef) Allocator.Error!void {
+    // Build the fully-owned replacement BEFORE touching `self.text_bases`
+    // at all: `getOrPut` inserts the KEY unconditionally, before any
+    // value is known, so if a value is computed only AFTER that, a later
+    // allocation failure leaves a hashmap entry pointing at uninitialized
+    // memory — `deinit`'s free-every-value loop then crashes on it.
+    // Fallible work first, commit last.
+    const bytes_owned = try gpa.dupe(u8, tb.bytes);
+    errdefer gpa.free(bytes_owned);
+    const gop = try self.text_bases.getOrPut(gpa, id);
+    if (gop.found_existing) gpa.free(gop.value_ptr.bytes); // defensive; unreachable on a true bootstrap
+    gop.value_ptr.* = .{ .bytes = bytes_owned, .scalars = tb.scalars };
+}
 
-        const gop = try self.text_bases.getOrPut(gpa, id);
-        if (gop.found_existing) gpa.free(gop.value_ptr.bytes); // defensive; unreachable on a true bootstrap
-        gop.value_ptr.* = .{ .bytes = bytes_owned, .scalars = tb.scalars };
-        const node_idx = self.obj_index.get(id).?;
-        self.nodes.items[node_idx].text.rope.deinit(gpa);
-        self.nodes.items[node_idx].text.rope = rope;
-    }
+/// Materialize `id`'s already-adopted base bytes (`adoptTextBaseMetadata`
+/// must have already run for `id` — always true here: `merge` seeds
+/// METADATA for every batch base entry before `historyPhase` runs at
+/// all, see its own doc comment) into its just-created node's rope.
+///
+/// `ADDPEER_BOOTSTRAP_HAZARD` (weft's own name for this, W7a report):
+/// this must run for `id` BEFORE any `.text_ins`/`.text_del` effect
+/// targeting `id` is applied to its rope — a single bootstrap batch can
+/// legitimately carry both a base AND live edits authored past it (e.g.
+/// `serialize()` of a doc whose founder base is trivial but has since
+/// been typed into), and those edits' rope offsets are computed against
+/// a rope that STARTS FROM the seeded base, not an empty one. Calling
+/// this from `merge`'s tree-application loop right after the object's
+/// creation effect (`.map_add`/`.list_ins` with `.new_text`) — rather
+/// than once, deferred, after the whole effects list has already run —
+/// is what guarantees that ordering: creation and its rope-seed are
+/// adjacent, so every subsequent effect for `id` in the (causally
+/// ordered) effects list necessarily lands on the seeded rope, never the
+/// reverse.
+fn adoptTextBaseRope(self: *ObjectDoc, gpa: Allocator, id: EventId) Allocator.Error!void {
+    const tb = self.text_bases.get(id).?;
+    var rope = try Rope.fromSlice(gpa, tb.bytes);
+    errdefer rope.deinit(gpa);
+    const node_idx = self.obj_index.get(id).?;
+    self.nodes.items[node_idx].text.rope.deinit(gpa);
+    self.nodes.items[node_idx].text.rope = rope;
 }
 
 /// Materialize the alive-as-of-`past_s` scalar content of every text
