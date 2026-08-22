@@ -242,7 +242,7 @@ pub const empty: TextDoc = .{};
 
 pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency, Unrealized };
 pub const CompactError = MergeError || error{NotCompactable};
-pub const AnchorError = Allocator.Error || error{ Corrupt, MissingDependency, Compacted };
+pub const AnchorError = seq_walker.AnchorError;
 
 pub fn deinit(self: *TextDoc, gpa: Allocator) void {
     self.rope.deinit(gpa);
@@ -706,15 +706,26 @@ fn decodeBaseScalars(self: *const TextDoc, gpa: Allocator) Allocator.Error![]u21
 // presence/remote-cursor positions; resolve against any replica that
 // has seen the event. Resolution is O(history) — batch with
 // `resolveAnchors` (one replay for the whole set).
+//
+// The machinery itself (walking `Replay`'s `Sequence` + `history`'s
+// `idOf`/`agentName`/`findAgent`/`lvOf`/`isKnown`/`opOf`) is generic over
+// any `EventGraph(Op)` + `SeqWalker` pair — nothing here is TextDoc-
+// specific — so it lives once in `SeqWalker.zig` (`anchorAt`/
+// `resolveAnchors`, `EventAnchor`, `AnchorSide`) and `ObjectDoc` calls the
+// same functions per text object (`objectAnchorAt`/`resolveObjectAnchors`,
+// stemma-unification.md §3 step 3, delta 3). What stays here: the
+// boundary short-circuit (an anchor at the very start/end needs no
+// replay), and byte↔scalar conversion via `self.rope` — both are
+// TextDoc's own rope's job, not the shared layer's.
 
-pub const AnchorSide = enum { before, after };
+pub const AnchorSide = seq_walker.AnchorSide;
+pub const EventAnchor = seq_walker.EventAnchor;
 
-pub const EventAnchor = struct {
-    /// Inserting agent's name; empty = document boundary. Owned by the
-    /// caller (`anchorAt` allocates it; free with `gpa.free`).
-    agent: []const u8 = "",
-    seq: u64 = 0,
-    side: AnchorSide = .before,
+/// Anchors only ever name an INSERT event — `resolveAnchors`'s `ctx`.
+const AnchorCtx = struct {
+    pub fn isInsert(_: @This(), op: TextOp) bool {
+        return op == .ins;
+    }
 };
 
 /// An identity anchor for the position `byte_offset`. `stickiness`
@@ -741,20 +752,7 @@ pub fn anchorAt(
 
     var w = try self.silentReplay(gpa);
     defer w.deinit(gpa);
-    var it = w.sw.s.aliveIterator();
-    var i: usize = 0;
-    while (it.next()) |alive| : (i += 1) {
-        if (i == target_index) {
-            if (alive.lv == base_lv) return error.Compacted;
-            const id = self.history.idOf(alive.lv);
-            return .{
-                .agent = try gpa.dupe(u8, self.history.agentName(id.agent)),
-                .seq = id.seq,
-                .side = stickiness,
-            };
-        }
-    }
-    unreachable; // target_index < alive count by construction
+    return seq_walker.anchorAt(gpa, &self.history, &w.sw, target_index, stickiness);
 }
 
 /// Resolve identity anchors to current byte offsets. Deleted targets
@@ -769,39 +767,10 @@ pub fn resolveAnchors(
     assert(anchors.len == out.len);
     var w = try self.silentReplay(gpa);
     defer w.deinit(gpa);
-
-    // One pass: per-arena count of alive items strictly before it.
-    const alive_before = try gpa.alloc(u64, w.sw.s.items.items.len);
-    defer gpa.free(alive_before);
-    var count: u64 = 0;
-    var order = w.sw.s.allIterator();
-    while (order.next()) |arena| {
-        alive_before[@intCast(arena)] = count;
-        if (w.sw.s.items.items[@intCast(arena)].effect_visible) count += 1;
-    }
-
-    for (anchors, out) |a, *o| {
-        if (a.agent.len == 0) {
-            o.* = switch (a.side) {
-                .before => 0,
-                .after => self.rope.byteLen(),
-            };
-            continue;
-        }
-        const agent = self.history.findAgent(a.agent) orelse return error.MissingDependency;
-        const id: EventId = .{ .agent = agent, .seq = a.seq };
-        const lv = self.history.lvOf(id) orelse {
-            return if (self.history.isKnown(id)) error.Compacted else error.MissingDependency;
-        };
-        if (self.history.opOf(lv) != .ins) return error.Corrupt;
-        // `lv` was visited by the full silent replay above, so `arenaOf`
-        // is guaranteed populated — no separate liveness assert needed.
-        const arena = w.sw.arenaOf(lv);
-        const item = &w.sw.s.items.items[@intCast(arena)];
-        var scalar = alive_before[@intCast(arena)];
-        if (item.effect_visible and a.side == .after) scalar += 1;
-        o.* = self.rope.scalarToOffset(scalar);
-    }
+    try seq_walker.resolveAnchors(gpa, &self.history, &w.sw, AnchorCtx{}, anchors, out);
+    // The shared layer returns SCALAR positions; convert to bytes in place
+    // (usize both — no separate buffer needed).
+    for (out) |*o| o.* = self.rope.scalarToOffset(o.*);
 }
 
 /// Full silent replay of the whole graph (current state). Its own

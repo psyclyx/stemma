@@ -32,6 +32,7 @@ const causal = @import("causal.zig");
 const jw = @import("objects_state.zig");
 const core = @import("core.zig");
 const wire = @import("wire.zig");
+const seq_walker = @import("SeqWalker.zig");
 const rope_mod = @import("../rope.zig");
 const geometry = @import("../geometry.zig");
 
@@ -45,6 +46,7 @@ const ObjectOp = jw.ObjectOp;
 const ValPayload = jw.ValPayload;
 const Str = jw.Str;
 const Effect = jw.Effect;
+const SeqWalker = jw.SeqWalker;
 const Rope = rope_mod.Rope;
 const Range = geometry.Range;
 const Edit = geometry.Edit;
@@ -96,6 +98,16 @@ pub const empty: ObjectDoc = .{};
 
 pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency };
 pub const VersionOrder = causal.VersionOrder;
+
+// Identity anchors (delta 3, stemma-unification.md §3 step 3): same
+// portable shape as `TextDoc.EventAnchor` (agent name + seq + side), same
+// shared machinery (`SeqWalker.zig`'s `anchorAt`/`resolveAnchors`), one
+// per-text-object `SeqWalker` instantiation instead of TextDoc's one
+// whole-document instantiation. See `objectAnchorAt`/`resolveObjectAnchors`
+// below.
+pub const AnchorSide = seq_walker.AnchorSide;
+pub const EventAnchor = seq_walker.EventAnchor;
+pub const AnchorError = seq_walker.AnchorError;
 
 const ScalarNode = union(enum) { null_, bool_: bool, int: i64, float: f64, str: Str };
 const TreeVal = struct { set_lv: Lv, node: u32 };
@@ -691,6 +703,117 @@ fn appendTextChange(gpa: Allocator, changes: *std.ArrayList(Change), obj: ObjId,
         }
     }
     try changes.append(gpa, .{ .text = .{ .obj = obj, .edit = edit } });
+}
+
+// ── Identity anchors ────────────────────────────────────────────────
+// Text objects only (list anchors would need an element-index rather than
+// byte-offset shape; the study that scoped this delta names it as falling
+// out "for free" if wanted, but does not require it — not built here).
+
+/// `resolveObjectAnchors`'s `ctx`: an anchor is valid for `obj` iff its
+/// event is a `.text_ins` targeting `obj` specifically — `ObjectDoc`'s
+/// graph is a tree shared by every object, so (unlike `TextDoc`, where
+/// every event is the one sequence's) the op tag alone isn't enough.
+const TextInsertCtx = struct {
+    graph: *const Graph,
+    obj: Lv,
+
+    pub fn isInsert(self: @This(), op: ObjectOp) bool {
+        return switch (op) {
+            .text_ins => |x| (self.graph.lvOf(x.obj) orelse return false) == self.obj,
+            else => false,
+        };
+    }
+};
+
+/// Full silent replay of the whole graph (current state), handing back
+/// only `obj`'s own `SeqWalker` — every other object's/register's replay
+/// state is discarded. Walking the WHOLE graph (not just `obj`'s events)
+/// is required for FugueMax correctness, not a missed optimization: an
+/// event's insert/delete position is relative to the prepare state at
+/// ITS OWN causal frontier, which `Walker.replayAll`'s retreat/advance
+/// discipline (`seq_walker.movePrepareTo`) computes in one global Lv-order
+/// pass — there is no cheaper per-object walk to do instead. Same cost
+/// profile as `TextDoc.silentReplay` (also an unscoped, throwaway
+/// per-call walker — a candidate for a persistent per-object cache, left
+/// for later, same as TextDoc's `merge_walk` is for its own single
+/// sequence).
+fn silentObjectReplay(self: *const ObjectDoc, gpa: Allocator, obj_lv: Lv) Allocator.Error!SeqWalker {
+    var w = Walker.init(&self.history, self.strings.items);
+    defer w.deinit(gpa);
+    var sink: std.ArrayList(Effect) = .empty;
+    defer sink.deinit(gpa);
+    const n: Lv = @intCast(self.history.eventCount());
+    w.replayAll(gpa, n, &sink) catch |e| switch (e) {
+        error.Corrupt => unreachable, // trusted local history
+        else => |err| return err,
+    };
+    assert(sink.items.len == 0); // first_new == n: nothing emits
+    // Detach `obj`'s walker before `w.deinit` below frees every object's
+    // and register's state — an object with zero ins/del events (a
+    // freshly created, still-empty text node) never got a `seqs` entry.
+    if (w.seqs.fetchRemove(obj_lv)) |kv| return kv.value;
+    return SeqWalker.empty;
+}
+
+/// An identity anchor for the position `byte_offset` inside text object
+/// `obj`. Same contract as `TextDoc.anchorAt` (`stickiness` picks
+/// `.before`/`.after`); the returned `agent` slice is gpa-owned.
+/// `error.Compacted` is part of the shared error set as an honest
+/// reservation for `ObjectDoc`'s own eventual compaction (not yet built —
+/// unreachable from here today; see `seq_walker.base_placeholder_lv`).
+pub fn objectAnchorAt(
+    self: *const ObjectDoc,
+    gpa: Allocator,
+    obj: ObjId,
+    byte_offset: usize,
+    stickiness: AnchorSide,
+) AnchorError!EventAnchor {
+    const node_idx = self.resolveObjNode(obj);
+    assert(self.nodes.items[node_idx] == .text);
+    const rope = &self.nodes.items[node_idx].text.rope;
+    const scalar = rope.offsetToScalar(byte_offset);
+    const total = rope.scalarLen();
+    switch (stickiness) {
+        .before => if (scalar == total) return .{ .agent = "", .side = .after },
+        .after => if (scalar == 0) return .{ .agent = "", .side = .before },
+    }
+    const target_index = switch (stickiness) {
+        .before => scalar,
+        .after => scalar - 1,
+    };
+
+    const obj_lv = self.history.lvOf(obj).?;
+    var sw = try self.silentObjectReplay(gpa, obj_lv);
+    defer sw.deinit(gpa);
+    return seq_walker.anchorAt(gpa, &self.history, &sw, target_index, stickiness);
+}
+
+/// Resolve identity anchors into text object `obj` to current byte
+/// offsets. Deleted targets collapse to their deletion point. An anchor
+/// naming an event outside `obj` (wrong object, or not a text insert at
+/// all) is `error.Corrupt` — see `TextInsertCtx`. Same batching contract
+/// as `TextDoc.resolveAnchors`: one replay amortized over the whole set.
+pub fn resolveObjectAnchors(
+    self: *const ObjectDoc,
+    gpa: Allocator,
+    obj: ObjId,
+    anchors: []const EventAnchor,
+    out: []usize,
+) AnchorError!void {
+    assert(anchors.len == out.len);
+    const node_idx = self.resolveObjNode(obj);
+    assert(self.nodes.items[node_idx] == .text);
+
+    const obj_lv = self.history.lvOf(obj).?;
+    var sw = try self.silentObjectReplay(gpa, obj_lv);
+    defer sw.deinit(gpa);
+    const ctx: TextInsertCtx = .{ .graph = &self.history, .obj = obj_lv };
+    try seq_walker.resolveAnchors(gpa, &self.history, &sw, ctx, anchors, out);
+    // The shared layer returns SCALAR positions; convert to bytes in
+    // place (usize both — no separate buffer needed).
+    const rope = &self.nodes.items[node_idx].text.rope;
+    for (out) |*o| o.* = rope.scalarToOffset(o.*);
 }
 
 fn historyPhase(

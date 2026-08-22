@@ -3,7 +3,7 @@
 //! object inside `ObjectDoc`'s tree (see `Sequence.zig` for the FugueMax
 //! ordering itself, `causal.zig` for the graph this walks).
 //!
-//! Two pieces, usable independently:
+//! Three pieces, usable independently:
 //! - `movePrepareTo`: the diff-based retreat/advance loop — retreat
 //!   (newest-first) events no longer causally included, advance
 //!   (oldest-first) newly-included ones. Generic over `history` (needs
@@ -16,18 +16,32 @@
 //!   retreat/advance its events by global `Lv` — the reusable unit
 //!   `TextDoc` instantiates once (its one sequence) and `ObjectDoc`
 //!   instantiates once per list/text object.
+//! - `anchorAt`/`resolveAnchors`: portable identity positions (agent name
+//!   + seq + side) over an already-caught-up `SeqWalker` instance —
+//!   `TextDoc.anchorAt`/`resolveAnchors` are thin call-throughs against
+//!   its one `SeqWalker`; `ObjectDoc.objectAnchorAt`/`resolveObjectAnchors`
+//!   call the same functions against one per-text-object `SeqWalker`
+//!   (delta 3, `app/weft/doc/stemma-unification.md` §3 step 3).
 //!
-//! Neither piece touches `Op`: the graph is passed in generically, and
-//! callers already know (from their own op tag) which of a `SeqWalker`
-//! instance's methods to call and at what position — that dispatch is
-//! irreducibly caller-specific (TextDoc: always yes, the one sequence;
-//! ObjectDoc: `Walker.resolveObj` + op tag).
+//! Neither `movePrepareTo` nor `SeqWalker` touches `Op`: the graph is
+//! passed in generically, and callers already know (from their own op
+//! tag) which of a `SeqWalker` instance's methods to call and at what
+//! position — that dispatch is irreducibly caller-specific (TextDoc:
+//! always yes, the one sequence; ObjectDoc: `Walker.resolveObj` + op
+//! tag). `resolveAnchors` needs one caller-specific bit `movePrepareTo`
+//! doesn't: given an `Op`, is it THIS `SeqWalker`'s own insert kind (for
+//! `TextDoc`, any `.ins`; for `ObjectDoc`, a `.text_ins`/`.list_ins`
+//! targeting *this* object, not some other node sharing the same graph)
+//! — supplied via `ctx.isInsert(op) bool`, the same anytype-duck-typed
+//! shape `movePrepareTo`'s `ctx` already uses.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 
 const causal = @import("causal.zig");
 const Lv = causal.Lv;
+const EventId = causal.EventId;
 const Sequence = @import("Sequence.zig");
 
 /// Move `prep_frontier` to `target`: diff the two, retreat (newest-first)
@@ -184,6 +198,130 @@ pub fn SeqWalker(comptime storage: Storage) type {
             self.s.toggleDelete(self.arenaOf(lv), on);
         }
     };
+}
+
+// ── Identity anchors ────────────────────────────────────────────────
+// Portable positions that survive *concurrent* edits: an anchor names the
+// inserting event of a character (agent name + seq — globally stable,
+// never a replica-local id) plus a side. Ported verbatim from
+// `TextDoc.zig`'s original `anchorAt`/`resolveAnchors` (delta 3,
+// `app/weft/doc/stemma-unification.md` §3 step 3) — the only things that
+// moved are byte↔scalar conversion (stays with the caller's own rope) and
+// the boundary short-circuit in `anchorAt` (stays with the caller, so a
+// start/end anchor costs no replay at all, exactly as before).
+
+pub const AnchorSide = enum { before, after };
+
+pub const EventAnchor = struct {
+    /// Inserting agent's name; empty = document/object boundary. Owned by
+    /// the caller (`anchorAt` allocates it; free with `gpa.free`).
+    agent: []const u8 = "",
+    seq: u64 = 0,
+    side: AnchorSide = .before,
+};
+
+pub const AnchorError = Allocator.Error || error{ Corrupt, MissingDependency, Compacted };
+
+/// Sentinel `lv` `SeqWalker.initBase`'s placeholder items carry (pre-history
+/// collapsed into a compacted base snapshot — see `TextDoc.compact`).
+/// `anchorAt` reports these as `error.Compacted`. `ObjectDoc` has no
+/// compaction yet (its header ledger) and never calls `initBase` on a
+/// per-object walker, so this branch is unreachable from `ObjectDoc`
+/// today — it stays part of the shared machinery, not TextDoc-only, so
+/// ObjectDoc's eventual compaction (stemma-unification.md's delta 2) needs
+/// neither a new error variant nor a signature change here.
+pub const base_placeholder_lv: Lv = std.math.maxInt(Lv);
+
+/// Identity anchor for the item at scalar index `target_index` among a
+/// fully-caught-up `sw`'s alive items (document/object order). Callers own
+/// the boundary cases (`target_index` must be a valid alive-item index —
+/// `0 <= target_index < alive count`): an anchor at the very start/end of
+/// the content needs no replay at all (see `TextDoc.anchorAt`), so that
+/// short-circuit stays in the caller, not here. `side` is stamped onto the
+/// result unchanged (the caller's stickiness). `history` needs `idOf`/
+/// `agentName` (any `causal.EventGraph(Op)`); `sw` is a `SeqWalker(_)`
+/// already advanced to the state being anchored against. The returned
+/// `agent` slice is gpa-owned.
+pub fn anchorAt(
+    gpa: Allocator,
+    history: anytype,
+    sw: anytype,
+    target_index: u64,
+    side: AnchorSide,
+) AnchorError!EventAnchor {
+    var it = sw.s.aliveIterator();
+    var i: u64 = 0;
+    while (it.next()) |alive| : (i += 1) {
+        if (i == target_index) {
+            if (alive.lv == base_placeholder_lv) return error.Compacted;
+            const id = history.idOf(alive.lv);
+            return .{
+                .agent = try gpa.dupe(u8, history.agentName(id.agent)),
+                .seq = id.seq,
+                .side = side,
+            };
+        }
+    }
+    unreachable; // target_index < alive count by construction
+}
+
+/// Resolve identity anchors to current scalar positions within `sw`'s
+/// object. Deleted targets collapse to their deletion point. One
+/// O(sw's item count) pass amortized over the whole batch (plus one
+/// `findAgent`/`lvOf` lookup per non-boundary anchor). `out[i]` is a
+/// SCALAR position (document/object-local, not bytes) — convert with the
+/// caller's own rope (`TextDoc`'s or one `ObjectDoc` text node's).
+///
+/// `ctx.isInsert(op) bool` decides whether `lv`'s op is this `SeqWalker`'s
+/// own insert kind: `TextDoc`'s graph is entirely one sequence (`op ==
+/// .ins` suffices); `ObjectDoc`'s is a tree sharing one graph across every
+/// object, so its `ctx` also checks the op's `obj` matches `sw`'s own
+/// object — rejecting a wrong-kind or wrong-object anchor as
+/// `error.Corrupt` up front, instead of trusting `sw.arenaOf` (which
+/// assumes its argument was already applied to *this* `sw` and does not
+/// re-check).
+pub fn resolveAnchors(
+    gpa: Allocator,
+    history: anytype,
+    sw: anytype,
+    ctx: anytype,
+    anchors: []const EventAnchor,
+    out: []usize,
+) AnchorError!void {
+    assert(anchors.len == out.len);
+
+    // One pass: per-arena count of alive items strictly before it.
+    const alive_before = try gpa.alloc(usize, sw.s.items.items.len);
+    defer gpa.free(alive_before);
+    var count: usize = 0;
+    var order = sw.s.allIterator();
+    while (order.next()) |arena| {
+        alive_before[@intCast(arena)] = count;
+        if (sw.s.items.items[@intCast(arena)].effect_visible) count += 1;
+    }
+
+    for (anchors, out) |a, *o| {
+        if (a.agent.len == 0) {
+            o.* = switch (a.side) {
+                .before => 0,
+                .after => count,
+            };
+            continue;
+        }
+        const agent = history.findAgent(a.agent) orelse return error.MissingDependency;
+        const id: EventId = .{ .agent = agent, .seq = a.seq };
+        const lv = history.lvOf(id) orelse {
+            return if (history.isKnown(id)) error.Compacted else error.MissingDependency;
+        };
+        if (!ctx.isInsert(history.opOf(lv))) return error.Corrupt;
+        // `lv` passed `ctx.isInsert`, so it was applied to `sw` — `arenaOf`
+        // is guaranteed populated.
+        const arena = sw.arenaOf(lv);
+        const item = &sw.s.items.items[@intCast(arena)];
+        var scalar = alive_before[@intCast(arena)];
+        if (item.effect_visible and a.side == .after) scalar += 1;
+        o.* = scalar;
+    }
 }
 
 const testing = std.testing;
@@ -412,6 +550,119 @@ test "SeqWalker: movePrepareTo retreats and advances several events in one call"
     // Advance the same two events back in ONE call — oldest-first.
     try movePrepareTo(gpa, &g, &h.prep_frontier, &.{lvs[3]}, &h);
     try testing.expectEqual(@as(usize, 4), prepVisibleCount(&h.sw.s));
+}
+
+// ── Identity anchors: generic-function-level coverage ──────────────
+// `TextDoc`'s and `ObjectDoc`'s own test batteries (text_tests.zig,
+// object_tests.zig) are the facade-level gate; these pin the SHARED
+// `anchorAt`/`resolveAnchors` correctness directly against the harness,
+// independent of either facade — same insurance role as the
+// `movePrepareTo`/`SeqWalker` tests above.
+
+const IsIns = struct {
+    pub fn isInsert(_: @This(), op: TestOp) bool {
+        return op == .ins;
+    }
+};
+
+test "generic anchors: identity survives a concurrent insert landing before the target" {
+    const gpa = testing.allocator;
+    var g: TestGraph = .empty;
+    defer g.deinit(gpa);
+    const a = try g.registerAgent(gpa, "a");
+
+    var h: Harness(.dense) = .{};
+    defer h.deinit(gpa);
+
+    const e0 = try g.addLocal(gpa, a, .{ .ins = .{ .pos = 0, .ch = 'x' } });
+    try h.apply(gpa, &g, e0, true);
+    const e1 = try g.addLocal(gpa, a, .{ .ins = .{ .pos = 1, .ch = 'y' } });
+    try h.apply(gpa, &g, e1, true);
+
+    // Anchor names e1's insertion identity — the item currently at index 1.
+    const anchor = try anchorAt(gpa, &g, &h.sw, 1, .before);
+    defer gpa.free(anchor.agent);
+    try testing.expectEqualStrings("a", anchor.agent);
+    try testing.expectEqual(@as(u64, 1), anchor.seq);
+
+    // A concurrent event from agent "AAA" (< "a" by the name tiebreak, so
+    // it wins) branches from e0 at the SAME prepare position e1 saw — it
+    // lands BEFORE 'y' in the final order, shifting 'y' from index 1 to 2.
+    const other = try g.registerAgent(gpa, "AAA");
+    const e2 = try g.add(gpa, .{ .agent = other, .seq = 0 }, &.{e0}, .{ .ins = .{ .pos = 1, .ch = 'w' } });
+    try h.apply(gpa, &g, e2, true);
+    const got = try h.content(&g, gpa);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u21, &.{ 'x', 'w', 'y' }, got);
+
+    // The SAME anchor (agent+seq — nothing about it changed) now resolves
+    // to index 2: it names the CHARACTER, not the offset it was minted at.
+    var out: [1]usize = undefined;
+    try resolveAnchors(gpa, &g, &h.sw, IsIns{}, &.{anchor}, &out);
+    try testing.expectEqual(@as(usize, 2), out[0]);
+}
+
+test "generic anchors: resolveAnchors collapses a deleted target to its deletion point" {
+    const gpa = testing.allocator;
+    var g: TestGraph = .empty;
+    defer g.deinit(gpa);
+    const a = try g.registerAgent(gpa, "a");
+
+    var h: Harness(.dense) = .{};
+    defer h.deinit(gpa);
+
+    const e0 = try g.addLocal(gpa, a, .{ .ins = .{ .pos = 0, .ch = 'x' } });
+    try h.apply(gpa, &g, e0, true);
+    const e1 = try g.addLocal(gpa, a, .{ .ins = .{ .pos = 1, .ch = 'y' } });
+    try h.apply(gpa, &g, e1, true);
+
+    const anchor = try anchorAt(gpa, &g, &h.sw, 1, .before);
+    defer gpa.free(anchor.agent);
+
+    var before_off: [1]usize = undefined;
+    try resolveAnchors(gpa, &g, &h.sw, IsIns{}, &.{anchor}, &before_off);
+
+    const del_lv = try g.addLocal(gpa, a, .{ .del = 1 });
+    try h.apply(gpa, &g, del_lv, true);
+
+    var after_off: [1]usize = undefined;
+    try resolveAnchors(gpa, &g, &h.sw, IsIns{}, &.{anchor}, &after_off);
+    try testing.expectEqual(before_off[0], after_off[0]);
+}
+
+test "generic anchors: resolveAnchors rejects an anchor naming a delete event" {
+    const gpa = testing.allocator;
+    var g: TestGraph = .empty;
+    defer g.deinit(gpa);
+    const a = try g.registerAgent(gpa, "a");
+
+    var h: Harness(.dense) = .{};
+    defer h.deinit(gpa);
+    const e0 = try g.addLocal(gpa, a, .{ .ins = .{ .pos = 0, .ch = 'x' } });
+    try h.apply(gpa, &g, e0, true);
+    // del_lv is (agent "a", seq 1) — a delete event, never a valid anchor.
+    const del_lv = try g.addLocal(gpa, a, .{ .del = 0 });
+    try h.apply(gpa, &g, del_lv, true);
+
+    const bad: EventAnchor = .{ .agent = "a", .seq = 1, .side = .before };
+    var out: [1]usize = undefined;
+    try testing.expectError(error.Corrupt, resolveAnchors(gpa, &g, &h.sw, IsIns{}, &.{bad}, &out));
+}
+
+test "generic anchors: resolveAnchors reports MissingDependency for an unknown agent" {
+    const gpa = testing.allocator;
+    var g: TestGraph = .empty;
+    defer g.deinit(gpa);
+    const a = try g.registerAgent(gpa, "a");
+
+    var h: Harness(.dense) = .{};
+    defer h.deinit(gpa);
+    const e0 = try g.addLocal(gpa, a, .{ .ins = .{ .pos = 0, .ch = 'x' } });
+    try h.apply(gpa, &g, e0, true);
+
+    const bad: EventAnchor = .{ .agent = "ghost", .seq = 0, .side = .before };
+    var out: [1]usize = undefined;
+    try testing.expectError(error.MissingDependency, resolveAnchors(gpa, &g, &h.sw, IsIns{}, &.{bad}, &out));
 }
 
 test {

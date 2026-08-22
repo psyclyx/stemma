@@ -220,6 +220,223 @@ test "nested text objects: concurrent editing converges; changes are valid edits
     try t.expectEqualStrings("[a] shared text!", txt);
 }
 
+// ── Identity anchors (delta 3: stemma-unification.md §3 step 3) ─────
+// Mirrors TextDoc's own anchor battery (text_tests.zig, "identity
+// anchors: survive concurrent merges across replicas") one object at a
+// time, plus what's genuinely new for a TREE of objects sharing one
+// graph: cross-object isolation and portability across a fresh,
+// wire-bootstrapped replica.
+
+fn bodyText(gpa: std.mem.Allocator, d: *const ObjectDoc, body: ObjectDoc.ObjId) ![]u8 {
+    return d.ref(body).textRope().toOwnedSlice(gpa);
+}
+
+test "object anchors: survive concurrent merges across replicas, track the character not the offset" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    const body = (try alice.mapSet(gpa, null, "body", .text)).?;
+    _ = try alice.textInsert(gpa, body, 0, "hello World");
+    try syncBoth(gpa, &alice, &bob);
+    const bob_body = bob.root().mapGet("body").?.objId().?;
+
+    // Alice anchors before the 'W'.
+    const a = try alice.objectAnchorAt(gpa, body, 6, .before);
+    defer gpa.free(a.agent);
+
+    // Divergent concurrent edits on both sides, ahead of AND behind 'W'.
+    _ = try alice.textInsert(gpa, body, 0, ">>> ");
+    _ = try bob.textInsert(gpa, bob_body, 5, ", cruel");
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
+
+    // Both replicas resolve the SAME anchor (portable: name+seq) and land
+    // on 'W', wherever it now lives in each doc.
+    for ([_]struct { d: *ObjectDoc, o: ObjectDoc.ObjId }{
+        .{ .d = &alice, .o = body },
+        .{ .d = &bob, .o = bob_body },
+    }) |c| {
+        var off: [1]usize = undefined;
+        try c.d.resolveObjectAnchors(gpa, c.o, &.{a}, &off);
+        const txt = try bodyText(gpa, c.d, c.o);
+        defer gpa.free(txt);
+        try t.expectEqual(@as(u8, 'W'), txt[off[0]]);
+    }
+}
+
+test "object anchors: deleting the target collapses the anchor to the deletion point" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "hello World");
+    const a = try d.objectAnchorAt(gpa, body, 6, .before); // before 'W'
+    defer gpa.free(a.agent);
+
+    var off_before: [1]usize = undefined;
+    try d.resolveObjectAnchors(gpa, body, &.{a}, &off_before);
+    _ = try d.textDelete(gpa, body, .{ .start = off_before[0], .end = off_before[0] + 5 }); // "World"
+    var off_after: [1]usize = undefined;
+    try d.resolveObjectAnchors(gpa, body, &.{a}, &off_after);
+    try t.expectEqual(off_before[0], off_after[0]);
+}
+
+test "object anchors: boundary anchors resolve to the object's start/end" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "hello");
+    const start = try d.objectAnchorAt(gpa, body, 0, .after);
+    const end = try d.objectAnchorAt(gpa, body, d.ref(body).textRope().byteLen(), .before);
+    var offs: [2]usize = undefined;
+    try d.resolveObjectAnchors(gpa, body, &.{ start, end }, &offs);
+    try t.expectEqual(@as(usize, 0), offs[0]);
+    try t.expectEqual(d.ref(body).textRope().byteLen(), offs[1]);
+}
+
+test "object anchors: stickiness sides diverge exactly at the insertion point" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "ac"); // anchor point sits between 'a' and 'c'
+    const before = try d.objectAnchorAt(gpa, body, 1, .before); // rides with 'c'
+    defer gpa.free(before.agent);
+    const after = try d.objectAnchorAt(gpa, body, 1, .after); // rides with 'a'
+    defer gpa.free(after.agent);
+
+    // Insert 'b' exactly at the anchor point: "ac" -> "abc".
+    _ = try d.textInsert(gpa, body, 1, "b");
+    var offs: [2]usize = undefined;
+    try d.resolveObjectAnchors(gpa, body, &.{ before, after }, &offs);
+    const txt = try bodyText(gpa, &d, body);
+    defer gpa.free(txt);
+    // `before` stayed attached to 'c' (pushed to index 2 by the insert);
+    // `after` stayed attached to 'a' (untouched, still index 1).
+    try t.expectEqual(@as(u8, 'c'), txt[offs[0]]);
+    try t.expectEqual(@as(usize, 1), offs[1]);
+}
+
+test "object anchors: cross-object isolation — heavy concurrent edits to a sibling object don't perturb an anchor" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: ObjectDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    const body_a = (try alice.mapSet(gpa, null, "a", .text)).?;
+    const body_b = (try alice.mapSet(gpa, null, "b", .text)).?;
+    _ = try alice.textInsert(gpa, body_a, 0, "target text");
+    try syncBoth(gpa, &alice, &bob);
+    const bob_b = bob.root().mapGet("b").?.objId().?;
+
+    // Anchor into A, before the 't' of "text" (offset 7).
+    const anchor = try alice.objectAnchorAt(gpa, body_a, 7, .before);
+    defer gpa.free(anchor.agent);
+    var off_before: [1]usize = undefined;
+    try alice.resolveObjectAnchors(gpa, body_a, &.{anchor}, &off_before);
+
+    // Heavy, purely concurrent editing of the SIBLING object B, from both
+    // replicas, sharing the SAME event graph as A.
+    for (0..20) |i| {
+        var buf: [8]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+        _ = try alice.textInsert(gpa, body_b, 0, s);
+        _ = try bob.textInsert(gpa, bob_b, 0, s);
+    }
+    try syncBoth(gpa, &alice, &bob);
+    try expectConverged(&[_]*ObjectDoc{ &alice, &bob });
+
+    // A is completely untouched: same content, anchor resolves to the
+    // exact same offset it did before any of B's edits happened.
+    var off_after: [1]usize = undefined;
+    try alice.resolveObjectAnchors(gpa, body_a, &.{anchor}, &off_after);
+    try t.expectEqual(off_before[0], off_after[0]);
+    const txt = try bodyText(gpa, &alice, body_a);
+    defer gpa.free(txt);
+    try t.expectEqualStrings("target text", txt);
+    try t.expectEqual(@as(u8, 't'), txt[off_after[0]]);
+}
+
+test "object anchors: portable across a fresh, wire-bootstrapped replica" {
+    const gpa = t.allocator;
+    var alice: ObjectDoc = .empty;
+    defer alice.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+
+    const body = (try alice.mapSet(gpa, null, "body", .text)).?;
+    _ = try alice.textInsert(gpa, body, 0, "hello World");
+    const a = try alice.objectAnchorAt(gpa, body, 6, .before); // before 'W'
+    defer gpa.free(a.agent);
+
+    // A brand-new replica, seeded ONLY from wire bytes — never merged
+    // incrementally, never shared in-process state with alice.
+    const bytes = try alice.serialize(gpa);
+    defer gpa.free(bytes);
+    var fresh = try ObjectDoc.open(gpa, bytes);
+    defer fresh.deinit(gpa);
+    const fresh_body = fresh.root().mapGet("body").?.objId().?;
+
+    // The anchor (agent name + seq) resolves correctly purely from the
+    // portable identity — no doc-local id ever crossed the wire.
+    var off: [1]usize = undefined;
+    try fresh.resolveObjectAnchors(gpa, fresh_body, &.{a}, &off);
+    const txt = try bodyText(gpa, &fresh, fresh_body);
+    defer gpa.free(txt);
+    try t.expectEqual(@as(u8, 'W'), txt[off[0]]);
+}
+
+test "object anchors: an anchor naming a non-text-insert event is rejected as Corrupt" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const body_a = (try d.mapSet(gpa, null, "a", .text)).?;
+    const body_b = (try d.mapSet(gpa, null, "b", .text)).?;
+    _ = try d.textInsert(gpa, body_a, 0, "aaa");
+    _ = try d.textInsert(gpa, body_b, 0, "bbb");
+
+    // The map_set that created "a" itself: not a text insert at all.
+    const map_set_anchor: ObjectDoc.EventAnchor = .{ .agent = "solo", .seq = 0, .side = .before };
+    var out: [1]usize = undefined;
+    try t.expectError(error.Corrupt, d.resolveObjectAnchors(gpa, body_a, &.{map_set_anchor}, &out));
+
+    // A real text insert, but into the WRONG object (b's first char,
+    // resolved against a).
+    const wrong_object_anchor = try d.objectAnchorAt(gpa, body_b, 1, .before);
+    defer gpa.free(wrong_object_anchor.agent);
+    try t.expectError(error.Corrupt, d.resolveObjectAnchors(gpa, body_a, &.{wrong_object_anchor}, &out));
+}
+
+test "object anchors: resolving an unknown agent's anchor is MissingDependency" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const body = (try d.mapSet(gpa, null, "body", .text)).?;
+    _ = try d.textInsert(gpa, body, 0, "hi");
+
+    const ghost: ObjectDoc.EventAnchor = .{ .agent = "ghost", .seq = 0, .side = .before };
+    var out: [1]usize = undefined;
+    try t.expectError(error.MissingDependency, d.resolveObjectAnchors(gpa, body, &.{ghost}, &out));
+}
+
 test "serialize/open roundtrip; compareVersions over json docs" {
     const gpa = t.allocator;
     var d: ObjectDoc = .empty;

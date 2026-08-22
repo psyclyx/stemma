@@ -20,8 +20,10 @@ const seq_walker = @import("SeqWalker.zig");
 // Each object's SeqWalker sits over a `Lv` space shared with every other
 // object and every map register in the tree — a dense array would cost
 // memory proportional to the WHOLE document, once per object (see
-// `SeqWalker.Storage`).
-const SeqWalker = seq_walker.SeqWalker(.sparse);
+// `SeqWalker.Storage`). `pub`: `ObjectDoc`'s identity-anchor machinery
+// (`objectAnchorAt`/`resolveObjectAnchors`) needs to name this exact type
+// to pull one object's already-replayed `SeqWalker` out of `Walker.seqs`.
+pub const SeqWalker = seq_walker.SeqWalker(.sparse);
 const Lv = causal.Lv;
 const EventId = causal.EventId;
 const none = Sequence.none;
