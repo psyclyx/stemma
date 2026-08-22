@@ -4,7 +4,39 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-08-22
+
+### Added
+
+- **The move op** — parent-register structure in `ObjectDoc` (the design
+  validated by the 0.2.0 sketch, now production): `structCreate` /
+  `structMove` / `structDelete` give nodes an identity-preserving
+  parent register with fractional sibling order keys; deletion is a
+  move to `.trash` (non-recursive, subtree-preserving, resurrectable);
+  a structural node doubles as an ordinary map object. Cross-node
+  cycles are broken by a replica-portable global canonical order
+  (Lamport, then agent name, then seq) with per-write cycle rejection —
+  a **second conflict-resolution rule** beside the map registers'
+  causally-maximal-antichain rule, documented at the API boundary: the
+  effective winner of `structParent` can sit *outside* the conflict
+  set reported by `structConflictCount` (in the limit, the create)
+  when every dominant write would cycle; `structCycleBroken` surfaces
+  exactly that, on every replica identically.
+- Structural reads: `structParent`, `structChildren` (order-key
+  sorted), `structOrderKey`, `structConflictCount`, `structCycleBroken`.
+- Wire: additive structural op tags; pre-0.3.0 bytes decode unchanged;
+  a doc with no structural ops emits byte-identical wire to 0.2.0.
+- Order keys are capped symmetrically (refused at origination with
+  `error.OrderKeyTooLong` in every build mode, and at decode) so an
+  un-round-trippable doc cannot be constructed; sibling-key
+  rebalancing remains future work and is the cap's eventual fix.
+
+### Known limits
+
+- Structural ops in the causal past of a stable point refuse
+  compaction (same as list content) until list/structure bases land.
+- Struct-free replay pays nothing: the cycle-break machinery is
+  computed only when structural events exist.
 
 ## [0.2.0] — 2026-08-22
 

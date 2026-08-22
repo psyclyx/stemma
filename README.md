@@ -83,7 +83,12 @@ Two materializers share the graph, the wire format, and the sync protocol:
   inline scalars, and text nodes (each a full sequence CRDT with the same
   ordering). Map reads return a deterministic winner plus the honest
   multi-value conflict set — concurrent writes both survive, resolved by
-  caller policy.
+  caller policy. A structural forest rides alongside: parent-register
+  nodes with identity-preserving `structMove`, fractional sibling order,
+  trash-as-another-parent deletion (subtrees survive, resurrectable),
+  and deterministic cross-node cycle-breaking whose
+  winner-outside-the-conflict-set edge is surfaced
+  (`structCycleBroken`), never silent.
 
 Both share:
 
@@ -120,15 +125,15 @@ sessions — with all replicas byte-identical and every merge's edit stream
 validated. Transport, presence payloads, and collaborative undo policy are
 the caller's.
 
-Not yet, and ledgered as such: an identity-preserving move/reparent op
-(parent-register design validated in a test-only sketch), list-content
-compaction bases and list-object anchors for `ObjectDoc`, `ObjectDoc`
-partial checkout, Peritext-style rich-text marks, and incremental
-persistence.
+Not yet, and ledgered as such: list-content and structural compaction
+bases plus list-object anchors for `ObjectDoc`, sibling order-key
+rebalancing (keys grow ~N/8 under adversarial same-locus reordering;
+origination refuses past the wire cap), `ObjectDoc` partial checkout,
+Peritext-style rich-text marks, and incremental persistence.
 
 ## Status
 
-v0.2.0. The rope and both collaboration materializers are implemented,
+v0.3.0. The rope and both collaboration materializers are implemented,
 tested, and benchmarked (see [BENCHMARKS.md](BENCHMARKS.md)). Headlines on
 a Ryzen 9 5950X: ~20 ns/keystroke bare, ~60 ns through `TextDoc` (the
 collab tax is event bookkeeping, no CRDT work on the local path), ~2 ns
