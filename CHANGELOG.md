@@ -4,7 +4,34 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] — 2026-08-22
+
+`ObjectDoc` reaches API parity with `TextDoc` on everything a text
+editor's document layer consumes short of partial checkout — the
+groundwork for hosting a text document as a degenerate one-node graph
+doc.
+
+### Added
+
+- `eventsBetween(gpa, from, to)` on `ObjectDoc` — the bounded batch
+  slice `TextDoc` already had (lenient `from`, strict `to`), for
+  mirror-to-a-past-version sync flows.
+- **Bulk load**: `ObjectDoc.openFromContent(gpa, content, key)` opens
+  root map + one text node over a compacted base — ONE retained event
+  regardless of content size. Deterministic identity: independent
+  loads of the same `(key, content)` share a history root and sync;
+  any difference in either is a loud `error.MissingDependency`, never
+  a silent conflation (the synthetic agent digest covers both,
+  length-prefixed). Emits wire v2 from birth (v2's two producers —
+  `compact` and bulk load — are both documented).
+- `materializeAt(gpa, obj, version_token)` on `ObjectDoc` —
+  object-scoped time travel, cross-checked byte-for-byte against what
+  `compact` freezes into a base at the same point. Tokens naming
+  compacted-away events fail loud (`error.MissingDependency`), a
+  limitation shared with `TextDoc`.
+- Public `eventCount()` on both docs (consumers stop reaching through
+  the private history field) and `EventAnchor`/`AnchorSide` exported
+  once at the package root (the shared type both docs alias).
 
 ## [0.3.0] — 2026-08-22
 

@@ -110,8 +110,11 @@ register history is deliberately retained, and a stable point with list
 content in its causal past refuses rather than risk re-ordering register
 supersession).
 
-`TextDoc` additionally carries **`materializeAt`** (time travel to any
-known version), **partial bases** (`openPartial` / `realizeBase` — a
+Both carry **`materializeAt`** (time travel to any known version —
+object-scoped on `ObjectDoc`) and a **bulk load** path
+(`openFromContent`: a large file opens as a compacted base, one retained
+event, not content-length events). `TextDoc` additionally carries
+**partial bases** (`openPartial` / `realizeBase` — a
 replica of a huge document fetches only the base spans it touches; a
 merge into an unrealized span rejects whole with `error.Unrealized`,
 realize-then-retry), and a **wasm32 target** (`zig build wasm`) so
@@ -133,7 +136,7 @@ Peritext-style rich-text marks, and incremental persistence.
 
 ## Status
 
-v0.3.0. The rope and both collaboration materializers are implemented,
+v0.4.0. The rope and both collaboration materializers are implemented,
 tested, and benchmarked (see [BENCHMARKS.md](BENCHMARKS.md)). Headlines on
 a Ryzen 9 5950X: ~20 ns/keystroke bare, ~60 ns through `TextDoc` (the
 collab tax is event bookkeeping, no CRDT work on the local path), ~2 ns
