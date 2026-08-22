@@ -95,16 +95,22 @@ Both share:
 - **Persistence** — `serialize` / `open` store the event graph, which is
   the document of record; the materialized value is derived from it.
 
+Both also carry **identity anchors** (portable positions that survive
+concurrent edits — `anchorAt` / `resolveAnchors` on `TextDoc`;
+`objectAnchorAt` / `resolveObjectAnchors` per text object on `ObjectDoc`,
+isolated per object) and **`compact`** (collapse all-peers-stable history
+into a frozen base, so graph growth tracks post-base activity, not
+document lifetime — on `ObjectDoc`, text history folds while map/list
+register history is deliberately retained, and a stable point with list
+content in its causal past refuses rather than risk re-ordering register
+supersession).
+
 `TextDoc` additionally carries **`materializeAt`** (time travel to any
-known version), **identity anchors** (`anchorAt` / `resolveAnchors` —
-portable positions for remote cursors that survive concurrent edits),
-**`compact`** (collapse all-peers-stable history into a frozen base, so
-graph growth tracks post-base activity, not document lifetime), **partial
-bases** (`openPartial` / `realizeBase` — a replica of a huge document
-fetches only the base spans it touches; a merge into an unrealized span
-rejects whole with `error.Unrealized`, realize-then-retry), and a
-**wasm32 target** (`zig build wasm`) so browser peers speak the same
-protocol.
+known version), **partial bases** (`openPartial` / `realizeBase` — a
+replica of a huge document fetches only the base spans it touches; a
+merge into an unrealized span rejects whole with `error.Unrealized`,
+realize-then-retry), and a **wasm32 target** (`zig build wasm`) so
+browser peers speak the same protocol.
 
 Hostile input cannot crash a replica: malformed and malicious batches
 (including out-of-range positions) are rejected atomically and leave the
@@ -114,8 +120,11 @@ sessions — with all replicas byte-identical and every merge's edit stream
 validated. Transport, presence payloads, and collaborative undo policy are
 the caller's.
 
-Not yet, and ledgered as such: compaction and identity anchors inside
-`ObjectDoc`, Peritext-style rich-text marks, and incremental persistence.
+Not yet, and ledgered as such: an identity-preserving move/reparent op
+(parent-register design validated in a test-only sketch), list-content
+compaction bases and list-object anchors for `ObjectDoc`, `ObjectDoc`
+partial checkout, Peritext-style rich-text marks, and incremental
+persistence.
 
 ## Status
 
