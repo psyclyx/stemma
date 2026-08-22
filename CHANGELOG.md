@@ -4,7 +4,37 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] — 2026-08-22
+
+### Added
+
+- **Partial checkout for `ObjectDoc`** — per-object: `openPartial`
+  (zero-filled hole ranges over the bulk-load shape), `realizeBase` /
+  `unrealizedBase` / `baseRealized`, `agentWatermarks`. Local edits
+  into a hole are refused; a merge whose effects land inside a hole is
+  refused whole-batch (`error.Unrealized`) with the document provably
+  untouched — realize, then retry. Hole positions are tracked in
+  current-scalar space as same-batch effects land, so multi-effect
+  batches near holes are judged correctly in both shift directions.
+  `compact` and `serialize` refuse while any hole is open.
+- **Wire v3** (`stj\x03`): the version-only batch a holey replica
+  emits — carries the base version but no base content, and can never
+  bootstrap an empty peer (loud `error.MissingDependency`, never a
+  silent empty adoption). Hole-free docs never emit it; old decoders
+  refuse it loudly.
+- `MergeError` gains `Unrealized`. Additive to the type; callers doing
+  exhaustive switches over the old set need a new arm.
+
+### Fixed
+
+- **Identity anchors near holes resolved to the wrong character** — in
+  BOTH docs. `TextDoc.anchorAt`/`resolveAnchors` (shipped since 0.1.0)
+  and the `ObjectDoc` port converted byte↔scalar with realized-only
+  rope metrics while the sequence space counts unrealized base scalars,
+  so an anchor positioned after a hole silently named the wrong
+  element. Both now account for holes at anchor and resolve time —
+  exact no-ops on hole-free documents; anchors created before
+  realization resolve to the same character after it.
 
 ## [0.4.0] — 2026-08-22
 

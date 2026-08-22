@@ -113,11 +113,11 @@ supersession).
 Both carry **`materializeAt`** (time travel to any known version —
 object-scoped on `ObjectDoc`) and a **bulk load** path
 (`openFromContent`: a large file opens as a compacted base, one retained
-event, not content-length events). `TextDoc` additionally carries
-**partial bases** (`openPartial` / `realizeBase` — a
-replica of a huge document fetches only the base spans it touches; a
-merge into an unrealized span rejects whole with `error.Unrealized`,
-realize-then-retry), and a **wasm32 target** (`zig build wasm`) so
+event, not content-length events) and **partial bases** (`openPartial` /
+`realizeBase` — a replica of a huge document fetches only the base spans
+it touches; a merge into an unrealized span rejects whole with
+`error.Unrealized`, realize-then-retry; per-object on `ObjectDoc`).
+`TextDoc` additionally carries a **wasm32 target** (`zig build wasm`) so
 browser peers speak the same protocol.
 
 Hostile input cannot crash a replica: malformed and malicious batches
@@ -131,12 +131,12 @@ the caller's.
 Not yet, and ledgered as such: list-content and structural compaction
 bases plus list-object anchors for `ObjectDoc`, sibling order-key
 rebalancing (keys grow ~N/8 under adversarial same-locus reordering;
-origination refuses past the wire cap), `ObjectDoc` partial checkout,
-Peritext-style rich-text marks, and incremental persistence.
+origination refuses past the wire cap), Peritext-style rich-text marks,
+and incremental persistence.
 
 ## Status
 
-v0.4.0. The rope and both collaboration materializers are implemented,
+v0.5.0. The rope and both collaboration materializers are implemented,
 tested, and benchmarked (see [BENCHMARKS.md](BENCHMARKS.md)). Headlines on
 a Ryzen 9 5950X: ~20 ns/keystroke bare, ~60 ns through `TextDoc` (the
 collab tax is event bookkeeping, no CRDT work on the local path), ~2 ns
