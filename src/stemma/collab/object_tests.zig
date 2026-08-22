@@ -71,6 +71,24 @@ test "local tree building renders canonical JSON" {
     try t.expect(d.root().mapGet("done") == null);
 }
 
+test "ref: resolves an ObjId returned by a mutator back to a navigable ValueRef" {
+    const gpa = t.allocator;
+    var d: ObjectDoc = .empty;
+    defer d.deinit(gpa);
+    try d.setAgent(gpa, "solo");
+
+    const tags = (try d.mapSet(gpa, null, "tags", .list)).?;
+    _ = try d.listInsert(gpa, tags, 0, .{ .str = "a" });
+    // `tags` came straight back from `mapSet`, never touched `root()` — `ref`
+    // is the only way to read through it without re-navigating from root.
+    try t.expectEqual(ObjectDoc.Kind.list, d.ref(tags).kind());
+    try t.expectEqual(@as(usize, 1), d.ref(tags).listLen());
+    try t.expectEqualStrings("a", d.ref(tags).listAt(0).asStr());
+
+    // `null` still resolves to the root map, same as `root()`.
+    try t.expectEqual(ObjectDoc.Kind.map, d.ref(null).kind());
+}
+
 test "concurrent map sets: both survive as conflicts, winner deterministic" {
     const gpa = t.allocator;
     var alice: ObjectDoc = .empty;

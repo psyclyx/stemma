@@ -338,6 +338,21 @@ pub fn root(self: *const ObjectDoc) ValueRef {
     return .{ .doc = self, .node = 0 };
 }
 
+/// A `ValueRef` for `obj` (`null` = root map) — the inverse of `ValueRef.
+/// objId`. Every mutator (`mapSet`/`listInsert`/…) hands back an `ObjId`
+/// naming a freshly created object with no way back into `ValueRef`
+/// navigation short of re-walking from `root()`; callers that keep an
+/// `ObjId` around (a graph facade's typed node handles, an identity
+/// anchor) need to resolve it back to a readable value without that walk.
+/// O(1): an `ObjId` is already validated causal identity, so this is a
+/// lookup of its materialized tree node, same trust contract as every
+/// mutator that takes `obj: ?ObjId` (caller passes an id of the right
+/// kind; wrong-kind access hits the same `nodePtr()`-shaped assumptions
+/// `ValueRef`'s accessors already make).
+pub fn ref(self: *const ObjectDoc, obj: ?ObjId) ValueRef {
+    return .{ .doc = self, .node = self.resolveObjNode(obj) };
+}
+
 pub const ValueRef = struct {
     doc: *const ObjectDoc,
     node: u32,
