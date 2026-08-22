@@ -1465,6 +1465,403 @@ test "materializeAt: agrees with what `compact` itself freezes into the base at 
     try t.expectEqualStrings(via_materialize, base.bytes);
 }
 
+// ── Partial checkout (holes) ─────────────────────────────────────────────
+// Mirrors `text_tests.zig`'s "Partial bases" battery, scoped per text
+// object (`ObjectDoc.openPartial`'s degenerate one-root-map-one-text-key
+// shape — see its doc comment for why: it mirrors `openFromContent`, not
+// `compact`'s fully general multi-event bootstrap).
+
+/// Bulk-load `content` under `key`, then build a partial replica whose
+/// `[cut1, cut2)` byte span is an unrealized hole. `host` is fully
+/// realized and can serve `base[cut1..cut2]` back to `realizeBase`.
+fn partialPair(gpa: std.mem.Allocator, content: []const u8, key: []const u8, cut1: usize, cut2: usize) !struct {
+    host: ObjectDoc,
+    part: ObjectDoc,
+    body: ObjectDoc.ObjId,
+} {
+    var host = try ObjectDoc.openFromContent(gpa, content, key);
+    errdefer host.deinit(gpa);
+    const body = host.root().mapGet(key).?.objId().?;
+    const wm = try host.agentWatermarks(gpa);
+    defer gpa.free(wm);
+    const base = host.text_bases.get(body).?.bytes;
+    const mid_scalars = try std.unicode.utf8CountCodepoints(base[cut1..cut2]);
+    var part = try ObjectDoc.openPartial(gpa, host.base_version, wm, key, &.{
+        .{ .content = base[0..cut1] },
+        .{ .hole = .{ .bytes = cut2 - cut1, .scalars = mid_scalars } },
+        .{ .content = base[cut2..] },
+    });
+    errdefer part.deinit(gpa);
+    return .{ .host = host, .part = part, .body = body };
+}
+
+test "partial: openPartial -> realizeBase round-trip; content and version agree with host throughout" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+
+    try t.expect(!p.part.baseRealized(p.body));
+    try t.expectEqual(@as(usize, 1), p.part.unrealizedBase(p.body).len);
+    // The event graph is complete from the start: versions agree even
+    // though content is only partially fetched.
+    const hv = try p.host.version(gpa);
+    defer gpa.free(hv);
+    const pv = try p.part.version(gpa);
+    defer gpa.free(pv);
+    try t.expectEqualStrings(hv, pv);
+    try t.expectEqual(
+        p.host.ref(p.body).textRope().byteLen(),
+        p.part.ref(p.body).textRope().byteLen(),
+    );
+
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    try t.expect(p.part.baseRealized(p.body));
+    try t.expectEqual(@as(usize, 0), p.part.unrealizedBase(p.body).len);
+    const text = try bodyText(gpa, &p.part, p.body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("aaaHHHHbbb", text);
+}
+
+test "partial: realizeBase validates content (Corrupt on any mismatch), nothing changes on failure" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+
+    const h = p.part.unrealizedBase(p.body)[0];
+    try t.expectError(error.Corrupt, p.part.realizeBase(gpa, p.body, h.base_offset, "toolong content"));
+    try t.expectError(error.Corrupt, p.part.realizeBase(gpa, p.body, h.base_offset, "\xff\xff\xff\xff"));
+    try t.expectError(error.Corrupt, p.part.realizeBase(gpa, p.body, h.base_offset + 1, "HHHH"));
+    // Wrong object entirely: no hole at all under a fresh, unrelated obj.
+    try t.expectError(error.Corrupt, p.part.realizeBase(gpa, p.body, 999999, "HHHH"));
+    try t.expect(!p.part.baseRealized(p.body));
+}
+
+test "partial: local edits at hole boundaries stay legal and convergent" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.host.setAgent(gpa, "host");
+    try p.part.setAgent(gpa, "part");
+
+    // Host edits right at both edges of the region the partial lacks.
+    _ = try p.host.textInsert(gpa, p.body, 3, "[");
+    _ = try p.host.textInsert(gpa, p.body, 8, "]"); // "]" lands after the shifted "H" run
+
+    // Partial edits at its own hole's edges (never touching the interior).
+    const h0 = p.part.unrealizedBase(p.body)[0];
+    _ = try p.part.textInsert(gpa, p.body, h0.cur_offset, "(");
+    const h1 = p.part.unrealizedBase(p.body)[0];
+    _ = try p.part.textInsert(gpa, p.body, h1.cur_offset + h1.bytes, ")");
+
+    try syncBoth(gpa, &p.host, &p.part);
+    try t.expectEqual(
+        p.host.ref(p.body).textRope().byteLen(),
+        p.part.ref(p.body).textRope().byteLen(),
+    );
+
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    try expectConverged(&[_]*ObjectDoc{ &p.host, &p.part });
+}
+
+test "partial: identity anchors are hole-aware — anchor/resolve around a hole names the correct character, unmoved by realize" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.host.setAgent(gpa, "host");
+
+    // Real (non-base) edits landing exactly at both edges of the hole —
+    // same shape as "partial: local edits at hole boundaries stay legal
+    // and convergent" above, giving `part` content "aaa[HHHH]bbb" with
+    // the middle span still an unrealized hole.
+    _ = try p.host.textInsert(gpa, p.body, 3, "[");
+    _ = try p.host.textInsert(gpa, p.body, 8, "]");
+    const pv = try p.part.version(gpa);
+    defer gpa.free(pv);
+    const batch = try p.host.eventsSince(gpa, pv);
+    defer gpa.free(batch);
+    const changes = try p.part.merge(gpa, batch);
+    gpa.free(changes);
+    try t.expect(!p.part.baseRealized(p.body));
+
+    // `.before` at byte 3 names '[' — right before the hole; needs no
+    // hole compensation (included for symmetry/regression, not because
+    // it alone proves the fix).
+    const at_open = try p.part.objectAnchorAt(gpa, p.body, 3, .before);
+    defer gpa.free(at_open.agent);
+    // `.before` at byte 8 names ']' — right AFTER the hole. THIS is the
+    // review's exact trace, ported: the OLD (realized-only) conversion
+    // computed scalar index 4 here (uncompensated), landing on the
+    // hole's OWN first placeholder item instead of ']' — `error.Compacted`
+    // for a position that names a perfectly resolvable REAL character.
+    const at_close = try p.part.objectAnchorAt(gpa, p.body, 8, .before);
+    defer gpa.free(at_close.agent);
+
+    var offs_pre: [2]usize = undefined;
+    try p.part.resolveObjectAnchors(gpa, p.body, &.{ at_open, at_close }, &offs_pre);
+    try t.expectEqual(@as(usize, 3), offs_pre[0]);
+    try t.expectEqual(@as(usize, 8), offs_pre[1]);
+
+    // Realizing is not an edit: neither anchor moves.
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    try t.expect(p.part.baseRealized(p.body));
+    var offs_post: [2]usize = undefined;
+    try p.part.resolveObjectAnchors(gpa, p.body, &.{ at_open, at_close }, &offs_post);
+    try t.expectEqualSlices(usize, &offs_pre, &offs_post);
+
+    // Only readable now that the object is fully realized — check the
+    // actual CHARACTER, not just the offset.
+    const text = try bodyText(gpa, &p.part, p.body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("aaa[HHHH]bbb", text);
+    try t.expectEqual(@as(u8, '['), text[offs_post[0]]);
+    try t.expectEqual(@as(u8, ']'), text[offs_post[1]]);
+}
+
+test "partial: remote merge into the hole rejects whole (error.Unrealized), doc untouched; realize-then-merge succeeds" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.host.setAgent(gpa, "host");
+
+    // Host edits INSIDE the region the partial has not fetched.
+    _ = try p.host.textInsert(gpa, p.body, 5, "xx");
+    _ = try p.host.textDelete(gpa, p.body, .{ .start = 4, .end = 5 });
+
+    const pv = try p.part.version(gpa);
+    defer gpa.free(pv);
+    const batch = try p.host.eventsSince(gpa, pv);
+    defer gpa.free(batch);
+
+    const ver_before = try p.part.version(gpa);
+    defer gpa.free(ver_before);
+    const events_before = p.part.eventCount();
+    const len_before = p.part.ref(p.body).textRope().byteLen();
+    try t.expectError(error.Unrealized, p.part.merge(gpa, batch));
+    // Whole-batch rollback: version, event count, and content all
+    // untouched — proves the errdefer rollback actually fires, not just
+    // that the merge "fails."
+    const ver_after = try p.part.version(gpa);
+    defer gpa.free(ver_after);
+    try t.expectEqualSlices(u8, ver_before, ver_after);
+    try t.expectEqual(events_before, p.part.eventCount());
+    try t.expectEqual(len_before, p.part.ref(p.body).textRope().byteLen());
+
+    // Realize the hole, merge the SAME batch again, converge.
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    const changes = try p.part.merge(gpa, batch);
+    gpa.free(changes);
+    try expectConverged(&[_]*ObjectDoc{ &p.host, &p.part });
+}
+
+test "partial: multi-effect same-object batch — an earlier effect shifting the hole TOWARD a later position turns a legal edge into a real conflict" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.host.setAgent(gpa, "host");
+
+    // Two same-agent, causally-chained local edits in ONE batch: the
+    // first (insert at 0) shifts the hole's tracked scalar start from 3
+    // to 4; the second (insert at 7) was legal against the ORIGINAL hole
+    // [3,7) (7 is the boundary, not interior) but is genuinely interior
+    // to the SHIFTED [4,8) — a naive "check against the original
+    // snapshot" implementation would wrongly ACCEPT this batch.
+    _ = try p.host.textInsert(gpa, p.body, 0, "X");
+    _ = try p.host.textInsert(gpa, p.body, 7, "Y");
+
+    const pv = try p.part.version(gpa);
+    defer gpa.free(pv);
+    const batch = try p.host.eventsSince(gpa, pv);
+    defer gpa.free(batch);
+
+    const ver_before = try p.part.version(gpa);
+    defer gpa.free(ver_before);
+    try t.expectError(error.Unrealized, p.part.merge(gpa, batch));
+    const ver_after = try p.part.version(gpa);
+    defer gpa.free(ver_after);
+    try t.expectEqualSlices(u8, ver_before, ver_after);
+
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    const changes = try p.part.merge(gpa, batch);
+    gpa.free(changes);
+    try expectConverged(&[_]*ObjectDoc{ &p.host, &p.part });
+}
+
+test "partial: multi-effect same-object batch — an earlier effect shifting the hole AWAY from a later position avoids a false-positive rejection" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.host.setAgent(gpa, "host");
+
+    // First edit (insert at 0) shifts the hole's tracked start from 3 to
+    // 4. Second edit (insert at 4) is numerically INTERIOR to the
+    // ORIGINAL hole [3,7) (3<4<7) — a naive check against the original
+    // snapshot would wrongly REJECT this batch — but lands exactly at
+    // the SHIFTED hole's [4,8) start, which is legal (inserting
+    // immediately before a hole never touches its interior).
+    _ = try p.host.textInsert(gpa, p.body, 0, "X");
+    _ = try p.host.textInsert(gpa, p.body, 4, "Y");
+
+    const pv = try p.part.version(gpa);
+    defer gpa.free(pv);
+    const batch = try p.host.eventsSince(gpa, pv);
+    defer gpa.free(batch);
+
+    // No hole conflict: succeeds directly, without ever realizing.
+    const changes = try p.part.merge(gpa, batch);
+    gpa.free(changes);
+    try t.expect(!p.part.baseRealized(p.body));
+    try t.expectEqual(
+        p.host.ref(p.body).textRope().byteLen(),
+        p.part.ref(p.body).textRope().byteLen(),
+    );
+}
+
+test "partial: holes on one text object don't affect edits or merges on another" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.host.setAgent(gpa, "host");
+
+    // Host creates and fills a SECOND, unrelated text object while
+    // `part.body` still has an active hole.
+    const other = (try p.host.mapSet(gpa, null, "other", .text)).?;
+    _ = try p.host.textInsert(gpa, other, 0, "fresh data");
+
+    const pv = try p.part.version(gpa);
+    defer gpa.free(pv);
+    const batch = try p.host.eventsSince(gpa, pv);
+    defer gpa.free(batch);
+    // Untouched by `body`'s hole: succeeds outright.
+    const changes = try p.part.merge(gpa, batch);
+    gpa.free(changes);
+    try t.expect(!p.part.baseRealized(p.body)); // body's hole is still there
+    const other_text = try p.part.ref(other).textRope().toOwnedSlice(gpa);
+    defer gpa.free(other_text);
+    try t.expectEqualStrings("fresh data", other_text);
+
+    // And a LOCAL edit on the hole-free object needs no realization either.
+    try p.part.setAgent(gpa, "part");
+    _ = try p.part.textInsert(gpa, other, p.part.ref(other).textRope().byteLen(), "!");
+    const other_text2 = try p.part.ref(other).textRope().toOwnedSlice(gpa);
+    defer gpa.free(other_text2);
+    try t.expectEqualStrings("fresh data!", other_text2);
+}
+
+test "partial: compact refuses while holes exist (error.Unrealized), succeeds — and still folds — after full realization" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+
+    const stable = try p.part.version(gpa);
+    defer gpa.free(stable);
+    try t.expectError(error.Unrealized, p.part.compact(gpa, stable));
+
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    try t.expect(p.part.baseRealized(p.body));
+
+    // Compact now succeeds; folding a later real edit still works too.
+    try p.part.setAgent(gpa, "part");
+    _ = try p.part.textInsert(gpa, p.body, p.part.ref(p.body).textRope().byteLen(), "!");
+    const stable2 = try p.part.version(gpa);
+    defer gpa.free(stable2);
+    try p.part.compact(gpa, stable2);
+    const text = try bodyText(gpa, &p.part, p.body);
+    defer gpa.free(text);
+    try t.expectEqualStrings("aaaHHHHbbb!", text);
+}
+
+test "partial: openPartial registers every supplied agent watermark, including ones unrelated to the creation event" {
+    const gpa = t.allocator;
+    var host = try ObjectDoc.openFromContent(gpa, "hello", "body");
+    defer host.deinit(gpa);
+    const body = host.root().mapGet("body").?.objId().?;
+    const wm = try host.agentWatermarks(gpa);
+    defer gpa.free(wm);
+    try t.expectEqual(@as(usize, 1), wm.len);
+    try t.expectEqual(@as(u64, 0), wm[0].seq_base);
+
+    const extended = [_]ObjectDoc.AgentWatermark{ wm[0], .{ .name = "ghost", .seq_base = 500 } };
+    const base = host.text_bases.get(body).?.bytes;
+    var part = try ObjectDoc.openPartial(gpa, host.base_version, &extended, "body", &.{.{ .content = base }});
+    defer part.deinit(gpa);
+
+    const part_wm = try part.agentWatermarks(gpa);
+    defer gpa.free(part_wm);
+    try t.expectEqual(@as(usize, 2), part_wm.len);
+    var found_ghost = false;
+    for (part_wm) |w| {
+        if (std.mem.eql(u8, w.name, "ghost")) {
+            try t.expectEqual(@as(u64, 500), w.seq_base);
+            found_ghost = true;
+        }
+    }
+    try t.expect(found_ghost);
+}
+
+test "partial: serialize refuses outright while holey; round-trips once fully realized" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+
+    try t.expectError(error.Unrealized, p.part.serialize(gpa));
+
+    const h = p.part.unrealizedBase(p.body)[0];
+    const host_base = p.host.text_bases.get(p.body).?.bytes;
+    try p.part.realizeBase(gpa, p.body, h.base_offset, host_base[3..7]);
+    const bytes = try p.part.serialize(gpa);
+    defer gpa.free(bytes);
+    var reopened = try ObjectDoc.open(gpa, bytes);
+    defer reopened.deinit(gpa);
+    try expectConverged(&[_]*ObjectDoc{ &p.part, &reopened });
+}
+
+test "partial: eventsSince stays usable while holey via a version-only base; an empty replica cannot bootstrap from it" {
+    const gpa = t.allocator;
+    var p = try partialPair(gpa, "aaaHHHHbbb", "body", 3, 7);
+    defer p.host.deinit(gpa);
+    defer p.part.deinit(gpa);
+    try p.part.setAgent(gpa, "part");
+    _ = try p.part.textInsert(gpa, p.body, 0, "X"); // something to actually ship
+
+    const hv = try p.host.version(gpa);
+    defer gpa.free(hv);
+    const batch = try p.part.eventsSince(gpa, hv);
+    defer gpa.free(batch);
+    // A same-base peer (host, already fully realized) merges it fine.
+    const changes = try p.host.merge(gpa, batch);
+    gpa.free(changes);
+    const host_text = try bodyText(gpa, &p.host, p.body);
+    defer gpa.free(host_text);
+    try t.expectEqualStrings("XaaaHHHHbbb", host_text);
+
+    // A genuinely empty replica cannot bootstrap from a version-only base.
+    var blank: ObjectDoc = .empty;
+    defer blank.deinit(gpa);
+    try t.expectError(error.MissingDependency, blank.merge(gpa, batch));
+}
+
 // ── Structural ops (F3, delta 6 — the move op) ──────────────────────────
 // `stemma-unification.md` §3 step 5 — parent-register + fractional order
 // keys, ported from `structure_sketch.zig` and re-targeted at ObjectDoc's

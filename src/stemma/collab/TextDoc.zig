@@ -494,7 +494,14 @@ pub const AgentWatermark = struct { name: []const u8, seq_base: u64 };
 
 /// This document's watermarks for serving `openPartial` peers. Names
 /// borrow from the document (valid until deinit); caller frees the
-/// slice only.
+/// slice only. CAVEAT: `compact` rebuilds `self.history` onto a brand
+/// new `Graph` (a fresh `names` arena via `registerAgent`, the old one
+/// freed by the old graph's `deinit`) — a `name` borrowed here and held
+/// across an intervening `compact()` call dangles, it does not merely go
+/// stale. Safe as used today (a single-threaded serve call reads,
+/// encodes, and frees the returned slice within one synchronous call,
+/// never interleaved with a `compact()`); a caller that caches this
+/// across calls must re-fetch after every `compact`.
 pub fn agentWatermarks(self: *const TextDoc, gpa: Allocator) Allocator.Error![]AgentWatermark {
     const out = try gpa.alloc(AgentWatermark, self.history.agents.items.len);
     for (out, self.history.agents.items, 0..) |*w, a, i| {
@@ -739,7 +746,8 @@ const AnchorCtx = struct {
 /// An identity anchor for the position `byte_offset`. `stickiness`
 /// chooses the attachment: `.before` attaches to the character at the
 /// offset (anchor rides in front of it), `.after` to the character
-/// preceding it. Compacted characters cannot be anchored
+/// preceding it. Compacted characters — including a still-unrealized
+/// base span (partial checkout, `openPartial`) — cannot be anchored
 /// (`error.Compacted`). The returned `agent` slice is gpa-owned.
 pub fn anchorAt(
     self: *const TextDoc,
@@ -747,8 +755,21 @@ pub fn anchorAt(
     byte_offset: usize,
     stickiness: AnchorSide,
 ) AnchorError!EventAnchor {
-    const scalar = self.rope.offsetToScalar(byte_offset);
-    const total = self.rope.scalarLen();
+    // Global scalar space (what the `SeqWalker` below indexes into)
+    // includes unrealized base-hole scalars, which `self.rope`'s own
+    // metric does NOT count (a hole leaf's summary carries zero scalars
+    // — see `Rope`'s "Lazy / unrealized content" section) —
+    // `holeScalarsThrough` compensates, exactly mirroring `insert`'s own
+    // byte→scalar step. A no-op (adds 0) for the overwhelming common
+    // case of no active holes — this was a found bug (ported into
+    // `ObjectDoc.objectAnchorAt` too, fixed there identically): every
+    // OTHER byte↔scalar boundary here (`insert`/`delete`, `merge`'s
+    // `insByteOffset`/`delByteRange`) already got hole-aware treatment;
+    // the anchor path silently didn't, so an anchor taken at or after a
+    // hole resolved against the wrong element (interior to the hole's
+    // own placeholder block instead of the real content past it).
+    const scalar = self.rope.offsetToScalar(byte_offset) + self.holeScalarsThrough(byte_offset);
+    const total = self.rope.scalarLen() + self.holeScalarsThrough(self.rope.byteLen());
     switch (stickiness) {
         .before => if (scalar == total) return .{ .agent = "", .side = .after },
         .after => if (scalar == 0) return .{ .agent = "", .side = .before },
@@ -776,9 +797,19 @@ pub fn resolveAnchors(
     var w = try self.silentReplay(gpa);
     defer w.deinit(gpa);
     try seq_walker.resolveAnchors(gpa, &self.history, &w.sw, AnchorCtx{}, anchors, out);
-    // The shared layer returns SCALAR positions; convert to bytes in place
-    // (usize both — no separate buffer needed).
-    for (out) |*o| o.* = self.rope.scalarToOffset(o.*);
+    // The shared layer returns GLOBAL SCALAR positions (base-hole-
+    // inclusive, same space `anchorAt` targets above) — map to bytes with
+    // the same hole-aware boundary mapping `merge`'s insert path uses
+    // (`insByteOffset`): a resolved identity's item can only ever sit
+    // before or after a hole's contiguous block, never interior to one
+    // (no edit is ever accepted interior to a hole —
+    // `assertOutsideHoles`/`checkHoleConflicts` both refuse that), so the
+    // insertion-point mapping is exactly the boundary mapping a READ
+    // needs too. A no-op (degenerates to plain `scalarToOffset`) when
+    // there are no active holes — the other half of `anchorAt`'s found
+    // bug: the old direct `self.rope.scalarToOffset(o.*)` silently
+    // undercounted by every preceding hole's scalars whenever one existed.
+    for (out) |*o| o.* = self.insByteOffset(@intCast(o.*));
 }
 
 /// Full silent replay of the whole graph (current state). Its own

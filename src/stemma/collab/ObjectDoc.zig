@@ -78,6 +78,15 @@ const object_magic_v1 = "stj\x01";
 /// working unchanged. See the "Wire format" section below for the exact
 /// v1/v2 layout diff.
 const object_magic_v2 = "stj\x02";
+/// v3: emitted instead of v2 whenever the sender has any active hole
+/// (`text_holes`, partial checkout — `openPartial`'s section doc comment
+/// above `openPartial` has the full wire-contract rationale). Same layout
+/// as v2 except the base section's `text_base_count` is always 0 (its
+/// entries omitted entirely, not merely empty-content) — a v3 base
+/// section carries only `base_version`, enough for a same-base peer to
+/// merge, NEVER enough to bootstrap a fresh replica. A doc that never
+/// partial-checked-out never emits v3.
+const object_magic_v3 = "stj\x03";
 const version_magic = core.version_magic;
 const no_node: u32 = std.math.maxInt(u32);
 const root_key = Walker.root_key;
@@ -158,6 +167,19 @@ base_head: ?EventId = null,
 /// text object's portable creation identity (`jw.TextBaseMap`'s doc
 /// comment).
 text_bases: jw.TextBaseMap = .empty,
+/// Per-text-object unrealized spans of `text_bases` (`openPartial` —
+/// see the "Partial checkout" section below). Keyed exactly like
+/// `text_bases` (the object's portable creation identity), NOT doc-wide:
+/// each text object's holes are its own — the per-object analog of
+/// `TextDoc.holes`. A hashmap MISS (the overwhelming common case: no
+/// object has ever gone through `openPartial`) costs one lookup, same
+/// zero-cost-when-untouched shape `text_bases` itself already has.
+/// Absent entirely for an object with no active holes (an object realized
+/// down to zero holes is REMOVED from this map, not left with an empty
+/// list — `realizeBase` and `baseRealized`/`unrealizedBase` rely on this).
+/// Each present entry's `ArrayList(BaseHole)` is ascending by
+/// `cur_offset`, same invariant as `TextDoc.holes`.
+text_holes: std.AutoHashMapUnmanaged(EventId, std.ArrayList(BaseHole)) = .empty,
 
 /// Structural parent-register placements (F3, delta 6): a node's
 /// PORTABLE creation identity → its currently RESOLVED (effective)
@@ -205,7 +227,14 @@ fn structRefEql(a: StructPlacementRef, b: StructPlacementRef) bool {
     };
 }
 
-pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency };
+/// `Unrealized` (delta: partial checkout, `openPartial`) is additive to
+/// this set — every stemma-internal call site that exhaustively `switch`es
+/// a `MergeError`-shaped catch was audited when it was added (none needed
+/// a new arm: they all either `try`-propagate or already carry a wildcard
+/// `else => |err| return err`, see `ObjectDoc.zig`'s partial-checkout
+/// section doc comment for the full list). Weft's own call sites are the
+/// orchestrator's problem at the next stemma pin bump.
+pub const MergeError = Allocator.Error || error{ Corrupt, MissingDependency, Unrealized };
 pub const CompactError = MergeError || error{NotCompactable};
 pub const VersionOrder = causal.VersionOrder;
 
@@ -258,6 +287,9 @@ pub fn deinit(self: *ObjectDoc, gpa: Allocator) void {
     var bit = self.text_bases.valueIterator();
     while (bit.next()) |b| gpa.free(b.bytes);
     self.text_bases.deinit(gpa);
+    var hit = self.text_holes.valueIterator();
+    while (hit.next()) |h| h.deinit(gpa);
+    self.text_holes.deinit(gpa);
     self.struct_parents.deinit(gpa);
     self.* = .{};
 }
@@ -462,36 +494,134 @@ pub fn listDelete(self: *ObjectDoc, gpa: Allocator, obj: ObjId, index: usize) Al
 }
 
 /// Insert UTF-8 `content` into text object `obj` at `byte_offset`.
-/// Same contract as `Rope.insert`.
+/// Same contract as `Rope.insert`. Precondition: the offset is not
+/// interior to an unrealized base span of `obj` (deterministic panic, all
+/// build modes — `realizeBase` first). Cost when `obj` has no active
+/// holes (the overwhelming common case): one `text_holes` hashmap miss.
 pub fn textInsert(self: *ObjectDoc, gpa: Allocator, obj: ObjId, byte_offset: usize, content: []const u8) Allocator.Error!Edit {
     const agent = self.agent.?;
     const text_node = self.resolveObjNode(obj);
     const t = &self.nodes.items[text_node].text;
     const edit: Edit = .{ .offset = byte_offset, .removed = 0, .inserted = content.len };
     if (content.len == 0) return edit;
-    const scalar_pos = t.rope.offsetToScalar(byte_offset);
+    self.assertOutsideHoles(obj, byte_offset, byte_offset);
+    const scalar_pos = t.rope.offsetToScalar(byte_offset) + self.holeScalarsThrough(obj, byte_offset);
     var i: u64 = 0;
     var it = (std.unicode.Utf8View.init(content) catch unreachable).iterator();
     while (it.nextCodepoint()) |ch| : (i += 1) {
         _ = try self.history.addLocal(gpa, agent, .{ .text_ins = .{ .obj = obj, .pos = scalar_pos + i, .ch = ch } });
     }
     _ = try self.nodes.items[text_node].text.rope.insert(gpa, byte_offset, content);
+    self.shiftHoles(obj, byte_offset, content.len, 0);
     return edit;
 }
 
+/// Precondition: the range does not intersect an unrealized base span of
+/// `obj` (deterministic panic, all build modes — `realizeBase` first).
 pub fn textDelete(self: *ObjectDoc, gpa: Allocator, obj: ObjId, range: Range) Allocator.Error!Edit {
     const agent = self.agent.?;
     const text_node = self.resolveObjNode(obj);
     const t = &self.nodes.items[text_node].text;
     const edit: Edit = .{ .offset = range.start, .removed = range.len(), .inserted = 0 };
     if (range.isEmpty()) return edit;
-    const scalar_start = t.rope.offsetToScalar(range.start);
-    const scalar_count = t.rope.offsetToScalar(range.end) - scalar_start;
+    self.assertOutsideHoles(obj, range.start, range.end);
+    const scalar_start = t.rope.offsetToScalar(range.start) + self.holeScalarsThrough(obj, range.start);
+    const scalar_count = t.rope.offsetToScalar(range.end) - t.rope.offsetToScalar(range.start);
     for (0..scalar_count) |_| {
         _ = try self.history.addLocal(gpa, agent, .{ .text_del = .{ .obj = obj, .pos = scalar_start } });
     }
     _ = try self.nodes.items[text_node].text.rope.delete(gpa, range);
+    self.shiftHoles(obj, range.start, 0, range.len());
     return edit;
+}
+
+/// Panic if `[start, end]` touches the interior of an unrealized base
+/// span of `obj` (or covers one). Single choke point, all build modes —
+/// mirrors `Rope`'s own hole-content panic and `TextDoc.assertOutsideHoles`,
+/// scoped per object.
+fn assertOutsideHoles(self: *const ObjectDoc, obj: ObjId, start: usize, end: usize) void {
+    const holes = self.text_holes.get(obj) orelse return;
+    for (holes.items) |h| {
+        if (end > h.cur_offset and start < h.cur_offset + h.bytes) {
+            @panic("stemma.ObjectDoc: edit touches an unrealized base span — realizeBase() first");
+        }
+    }
+}
+
+/// Scalars of `obj`'s unrealized base spans at or before `byte_offset`
+/// (spans ending exactly at the offset count; spans starting there do
+/// not) — see `TextDoc.holeScalarsThrough`.
+fn holeScalarsThrough(self: *const ObjectDoc, obj: ObjId, byte_offset: usize) u64 {
+    const holes = self.text_holes.get(obj) orelse return 0;
+    var acc: u64 = 0;
+    for (holes.items) |h| {
+        if (h.cur_offset + h.bytes <= byte_offset) acc += h.scalars;
+    }
+    return acc;
+}
+
+/// Shift `obj`'s hole positions through a byte edit at `at`. Holes never
+/// intersect edits (checked by `assertOutsideHoles`, or, for a remote
+/// merge effect, `checkHoleConflicts`), so a whole-span shift is exact —
+/// see `TextDoc.shiftHoles`.
+fn shiftHoles(self: *ObjectDoc, obj: ObjId, at: usize, inserted: usize, removed: usize) void {
+    const holes = self.text_holes.getPtr(obj) orelse return;
+    for (holes.items) |*h| {
+        if (h.cur_offset >= at) h.cur_offset = h.cur_offset + inserted - removed;
+    }
+}
+
+// ── Hole-aware scalar ⇄ byte mapping (merge application) ────────────
+// Global scalar positions count unrealized base scalars (the FugueMax
+// sequence's own space, seeded by `TextBase.scalars` — the whole count,
+// hole or not); `obj`'s rope's OWN scalar metric counts REALIZED content
+// only (a hole leaf's summary carries zero scalars — see `rope.zig`'s
+// `newLeafHole`). `checkHoleConflicts` already proved a merge effect's
+// position never lands INTERIOR to a hole, so mapping only has to
+// subtract hole scalars and pin boundary cases to the hole's edge —
+// direct per-object ports of `TextDoc.insByteOffset`/`delByteRange`.
+
+/// Byte offset for inserting at global scalar position `pos` within
+/// `obj`'s current rope. Safe to call unconditionally: degenerates to
+/// plain `rope.scalarToOffset(pos)` when `obj` has no active holes (used
+/// that way by `resolveObjectAnchors` below, not just `merge`'s
+/// holes-guarded insert path).
+fn insByteOffset(self: *const ObjectDoc, obj: ObjId, pos: u64) usize {
+    const rope = &self.nodes.items[self.obj_index.get(obj).?].text.rope;
+    const holes = self.text_holes.get(obj) orelse return rope.scalarToOffset(@intCast(pos));
+    var acc: u64 = 0; // hole scalars strictly before pos
+    for (holes.items) |h| {
+        const start = @as(u64, rope.offsetToScalar(h.cur_offset)) + acc;
+        if (pos <= start) {
+            if (pos == start) return h.cur_offset; // insert before the hole
+            break;
+        }
+        acc += h.scalars; // non-interior ⇒ pos ≥ start + scalars
+    }
+    return rope.scalarToOffset(@intCast(pos - acc));
+}
+
+/// Byte range of the (realized) scalar at global position `pos` within
+/// `obj`'s current rope, clipped so it never swallows a neighboring
+/// hole's bytes. Only ever consulted when `obj` has active holes.
+fn delByteRange(self: *const ObjectDoc, obj: ObjId, pos: u64) Range {
+    const rope = &self.nodes.items[self.obj_index.get(obj).?].text.rope;
+    const holes = self.text_holes.get(obj).?;
+    var acc: u64 = 0;
+    var clamp: ?usize = null; // first hole after the target
+    for (holes.items) |h| {
+        const start = @as(u64, rope.offsetToScalar(h.cur_offset)) + acc;
+        if (pos < start) {
+            clamp = h.cur_offset;
+            break;
+        }
+        acc += h.scalars;
+    }
+    const rs: usize = @intCast(pos - acc);
+    const start = rope.scalarToOffset(rs);
+    var end = rope.scalarToOffset(rs + 1);
+    if (clamp) |c| end = @min(end, c);
+    return .{ .start = start, .end = end };
 }
 
 // ── Structural editing (F3, delta 6 — the move op) ────────────────────
@@ -991,7 +1121,16 @@ pub fn eventsSince(self: *const ObjectDoc, gpa: Allocator, remote_version: []con
     var known: std.ArrayList(Lv) = .empty;
     defer known.deinit(gpa);
     self.decodeVersion(gpa, remote_version, false, &known) catch |e| switch (e) {
-        error.MissingDependency => unreachable,
+        error.MissingDependency => unreachable, // lenient mode
+        // `decodeVersion` is `MergeError`-shaped (it shares the alias with
+        // fns that DO need `Unrealized`), but this call site never
+        // actually produces it: `core.decodeVersion` only ever returns
+        // `Corrupt`/`MissingDependency`. Partial checkout deliberately
+        // keeps `eventsSince` sync-capable while holey (`encodeEvents`
+        // emits a version-only base — see `openPartial`'s wire-contract
+        // doc comment) rather than widening this signature for an
+        // unreachable arm.
+        error.Unrealized => unreachable,
         else => |err| return err,
     };
     var missing = try self.history.missingFrom(gpa, known.items);
@@ -1027,7 +1166,17 @@ pub fn eventsBetween(
     return self.encodeEvents(gpa, d.a_only.items);
 }
 
-pub fn serialize(self: *const ObjectDoc, gpa: Allocator) Allocator.Error![]u8 {
+/// The whole document as its event graph (plus per-object compacted
+/// bases, if any) — the durable form. Same contract as
+/// `TextDoc.serialize`: a document with ANY active hole cannot be
+/// persisted (`error.Unrealized`) — realize every span first. Unlike
+/// `eventsSince`/`eventsBetween` (which stay usable while holey via a
+/// version-only base section — see `encodeEvents`'s wire-format doc
+/// comment), `serialize` promises a SELF-CONTAINED snapshot; a
+/// version-only base can't honor that promise for any peer, including
+/// this replica reopening its own bytes later.
+pub fn serialize(self: *const ObjectDoc, gpa: Allocator) (Allocator.Error || error{Unrealized})![]u8 {
+    if (self.text_holes.count() != 0) return error.Unrealized;
     var missing = try self.history.missingFrom(gpa, &.{});
     defer missing.deinit(gpa);
     return self.encodeEvents(gpa, missing.items);
@@ -1143,6 +1292,292 @@ pub fn openFromContent(gpa: Allocator, content: []const u8, key: []const u8) (Al
     return doc;
 }
 
+// ── Partial checkout ────────────────────────────────────────────────
+// `w7-rebase.md` §1/§4 W7-1's last gap, `stemma-unification.md` §4 risk
+// 4's sibling to `TextDoc.openPartial`/`realizeBase` — a text object whose
+// compacted base is only partially fetched: realized chunks carry
+// content, holes carry (bytes, scalars) metadata, exactly like TextDoc's
+// own partial checkout, scoped PER TEXT OBJECT (`text_holes`, alongside
+// `text_bases`) rather than doc-wide, since ObjectDoc's compacted state
+// already is per-object (unlike TextDoc, which has exactly one sequence).
+// Rope-level placeholders reuse `Rope.fromUnrealized` unmodified (zero
+// rope work); the FugueMax/SeqWalker base-placeholder machinery
+// (`SeqWalker.initBase`, `objects_state.Walker.getSeqWalker`) is ALREADY
+// agnostic to whether a base scalar is a hole or fully realized content —
+// it only ever consults `TextBase.scalars` (a COUNT), never the bytes
+// themselves — so neither needed a single change for this feature.
+// EVERY byte↔scalar BOUNDARY crossing between `obj`'s rope (realized
+// content only) and the object's GLOBAL scalar space (hole-inclusive,
+// what the `SeqWalker` above actually indexes) DOES need hole-aware
+// treatment, though — this is new, and every crossing needed it, not a
+// subset: `textInsert`/`textDelete`'s local-edit preconditions above,
+// `checkHoleConflicts`/`insByteOffset`/`delByteRange` below (`merge`'s
+// effect application), AND — caught late, by review, after an initial
+// claim that they "fell out for free" turned out to be false —
+// `objectAnchorAt`/`resolveObjectAnchors` (identity anchors) below: an
+// anchor taken at or resolved to a position at-or-after a hole silently
+// landed on the wrong element without the same `holeScalarsThrough`/
+// `insByteOffset` treatment. `TextDoc.anchorAt`/`resolveAnchors` carried
+// the identical latent bug (this file's port target) and got the same
+// fix. See each function's own doc comment for the mechanism.
+//
+// SCOPE: `openPartial` mirrors `openFromContent`'s shape exactly (one
+// synthetic-identity text object under `key` in the root map) rather than
+// the fully general "partial checkout of an arbitrary already-`compact`'d
+// document with real multi-event pre-history" — that would need shipping
+// the WHOLE retained non-text event graph up front (map/list/struct
+// events never fold — see `compact`'s doc comment), which is exactly
+// `merge`'s existing v2 bootstrap path, just with the text_base content
+// made lazy; a materially larger feature than W7-1's actual need (weft's
+// `Document` is ALWAYS exactly this one-root-map-one-text-key shape,
+// `openFromContent`'s own degenerate case) and not attempted here. Given
+// that, `base_version` still comes from the HOST (unlike
+// `openFromContent`, which derives a synthetic one from a content hash —
+// impossible here, since a partial checkout by definition doesn't have
+// the pristine bytes of its holes to hash) — `agents` does too, for the
+// SAME reason `TextDoc.openPartial` needs it: a real compacted document's
+// agents may carry nonzero `seq_base` watermarks (an agent whose TEXT
+// edits folded into this or an EARLIER object's base, even though their
+// OWN `map_set`/`struct_create` events never do — see `compact`'s doc
+// comment on why only text folds) that a fresh replica has no other way
+// to learn.
+//
+// WIRE CONTRACT for a holey document (checked against TextDoc's ACTUAL
+// behavior, then deliberately narrowed — see below): `serialize` refuses
+// outright (`error.Unrealized`, same as `TextDoc.serialize`) — a durable
+// snapshot needs every byte. `eventsSince`/`eventsBetween` stay usable
+// while holey: `encodeEvents` (below) emits a THIRD wire version,
+// `object_magic_v3`, whenever the sender has any active hole — same
+// spirit as `TextDoc`'s RLE `flags: 2` ("version-only base"), scoped to
+// ObjectDoc's plain v1/v2 (no format-selection parameter) shape: v3's
+// base section carries `base_version` (so a peer sharing that exact base
+// can still validate/merge normally) but ZERO `text_base` entries — NEVER
+// enough to bootstrap a fresh replica, by construction (`merge`'s
+// bootstrap check below gates on `dec.base.?.full`, decoded false only
+// for v3). Old decoders reject v3 bytes outright (same one-directional
+// "additive" story as every other wire delta here) — never emitted
+// unless the sender itself is holey, so a doc that never partial-checked-
+// out never produces v3 bytes at all. DELIBERATE DIVERGENCE from
+// TextDoc: TextDoc additionally refuses `.unit` format specifically
+// while holey (a caller-selectable format that always carries full base
+// bytes); ObjectDoc has no such caller-selectable-format path to begin
+// with (encoding always auto-selects v1/v2/v3 from document state), so
+// there is no analogous escape hatch to close.
+
+/// Per-object counterpart to `TextDoc.BaseHole`: one unrealized span of
+/// a single text object's compacted base. `base_offset` is the fetch key
+/// (byte offset in that object's pristine base — immutable); `cur_offset`
+/// is where the span currently sits in that object's OWN rope (shifts
+/// under edits to THAT object only — see `shiftHoles`).
+pub const BaseHole = struct {
+    base_offset: usize,
+    cur_offset: usize,
+    bytes: usize,
+    scalars: usize,
+};
+
+/// Per-agent compaction watermark — same shape and purpose as
+/// `TextDoc.AgentWatermark`; see the section doc comment above for why
+/// `openPartial` needs a list of these rather than assuming just one.
+pub const AgentWatermark = struct { name: []const u8, seq_base: u64 };
+
+/// One span of a partial text-object base, in pristine-base order — same
+/// shape as `TextDoc.BaseChunk`, scoped to ONE object's base instead of
+/// the whole document.
+pub const BaseChunk = union(enum) {
+    /// Fetched content (UTF-8, copied).
+    content: []const u8,
+    /// Unfetched span of known size.
+    hole: struct { bytes: usize, scalars: usize },
+};
+
+/// This document's watermarks for serving `openPartial` peers — a direct
+/// port of `TextDoc.agentWatermarks`'s agent-table iteration (doc-wide:
+/// ObjectDoc's agents live on the shared `history`, not per text object).
+/// Names borrow from the document (valid until `deinit`); caller frees
+/// the slice only. Same CAVEAT as `TextDoc.agentWatermarks`: `compact`
+/// rebuilds `self.history` onto a brand new `Graph` (a fresh `names`
+/// arena, the old one freed) — a `name` borrowed here and held across an
+/// intervening `compact()` call dangles, it does not merely go stale.
+/// Safe as used today (a single-threaded serve call reads, encodes, and
+/// frees the returned slice within one synchronous call); a caller that
+/// caches this across calls must re-fetch after every `compact`. The
+/// serve side otherwise needs nothing beyond fields already exposed:
+/// `base_version` and `text_bases.get(obj)` (`.bytes`/`.scalars`) are the
+/// ObjectDoc analog of what `TextDoc`'s own `serveBase` reads directly
+/// off `base_bytes`/`base_version` — a future `GraphCollab.serveBase`
+/// chunks ONE object's `text_bases` entry the same way
+/// `remote_fs.serveBase` chunks `TextDoc.base_bytes` today.
+pub fn agentWatermarks(self: *const ObjectDoc, gpa: Allocator) Allocator.Error![]AgentWatermark {
+    const out = try gpa.alloc(AgentWatermark, self.history.agents.items.len);
+    for (out, self.history.agents.items, 0..) |*w, a, i| {
+        w.* = .{
+            .name = self.history.agentName(@enumFromInt(i)),
+            .seq_base = a.seq_base,
+        };
+    }
+    return out;
+}
+
+/// Bootstrap a partially realized replica of a compacted document: same
+/// degenerate one-root-map-one-text-key shape as `openFromContent`, with
+/// `chunks` allowed to carry holes (see the section doc comment above for
+/// full scope). `base_version` (a single-head token) names the text
+/// object's OWN creation event — also this document's whole `base_head`,
+/// mirroring `openFromContent`'s invariant that its one retained event
+/// serves both roles — and `agents` supplies every watermark the host
+/// reports (`agentWatermarks`). `error.Corrupt`: duplicate agent names,
+/// the named head's agent is not among `agents`, the head's `seq` is not
+/// EXACTLY that agent's registered `seq_base` (the creation event must be
+/// the very next event that agent would emit — anything else means the
+/// host and the supplied watermarks disagree about this object's
+/// identity), or a malformed chunk. Sync works immediately; content
+/// inside holes waits for `realizeBase`.
+pub fn openPartial(
+    gpa: Allocator,
+    base_version: []const u8,
+    agents: []const AgentWatermark,
+    key: []const u8,
+    chunks: []const BaseChunk,
+) (Allocator.Error || error{Corrupt})!ObjectDoc {
+    var doc: ObjectDoc = .empty;
+    errdefer doc.deinit(gpa);
+
+    for (agents) |w| {
+        const aid = try doc.history.registerAgent(gpa, w.name);
+        doc.history.agents.items[@intFromEnum(aid)].seq_base = w.seq_base;
+    }
+    if (doc.history.agents.items.len != agents.len) return error.Corrupt; // duplicate names
+
+    const head = try versionSingleEntry(base_version);
+    const head_agent = doc.history.findAgent(head.name) orelse return error.Corrupt;
+    if (head.seq != doc.history.agents.items[@intFromEnum(head_agent)].seq_base) {
+        return error.Corrupt; // not this agent's next event given the supplied watermark
+    }
+    const head_id: EventId = .{ .agent = head_agent, .seq = head.seq };
+
+    // The one retained event: exactly `openFromContent`'s `mapSet` call,
+    // except its (agent, seq) is fixed by `head_id` rather than chosen by
+    // `addLocal`'s auto-numbering — which it still IS, transparently:
+    // `head_agent`'s freshly-registered `lv_by_seq` is empty, so
+    // `addLocal`'s `nextSeq` computes exactly `seq_base`, which the check
+    // above already pinned to `head.seq`.
+    doc.agent = head_agent;
+    const obj = (try doc.mapSet(gpa, null, key, .text)).?;
+    doc.agent = null;
+    assert(std.meta.eql(obj, head_id));
+
+    var total_bytes: usize = 0;
+    var total_scalars: usize = 0;
+    for (chunks) |c| switch (c) {
+        .content => |bytes| {
+            const scalars = std.unicode.utf8CountCodepoints(bytes) catch return error.Corrupt;
+            total_bytes += bytes.len;
+            total_scalars += scalars;
+        },
+        .hole => |h| {
+            if (h.bytes == 0 or h.scalars == 0 or h.scalars > h.bytes) return error.Corrupt;
+            total_bytes += h.bytes;
+            total_scalars += h.scalars;
+        },
+    };
+
+    // Ownership of `base` transfers to `doc.text_bases` immediately (even
+    // though it's still all-zero at this point) — mirrors
+    // `TextDoc.openPartial`'s "assign to the field right after
+    // allocating" discipline: any later failure in the chunk loop below
+    // is then covered by the ALREADY-ARMED `errdefer doc.deinit(gpa)`
+    // above, which frees every `text_bases` value unconditionally.
+    const base = try gpa.alloc(u8, total_bytes);
+    @memset(base, 0);
+    try doc.text_bases.put(gpa, obj, .{ .bytes = base, .scalars = total_scalars });
+
+    const node_idx = doc.resolveObjNode(obj);
+    var offset: usize = 0;
+    for (chunks) |c| switch (c) {
+        .content => |bytes| {
+            if (bytes.len > 0) {
+                @memcpy(base[offset..][0..bytes.len], bytes);
+                var piece = try Rope.fromSlice(gpa, bytes);
+                defer piece.deinit(gpa);
+                try doc.nodes.items[node_idx].text.rope.append(gpa, &piece);
+            }
+            offset += bytes.len;
+        },
+        .hole => |h| {
+            const gop = try doc.text_holes.getOrPut(gpa, obj);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(gpa, .{
+                .base_offset = offset,
+                .cur_offset = offset,
+                .bytes = h.bytes,
+                .scalars = h.scalars,
+            });
+            var piece = try Rope.fromUnrealized(gpa, h.bytes);
+            defer piece.deinit(gpa);
+            try doc.nodes.items[node_idx].text.rope.append(gpa, &piece);
+            offset += h.bytes;
+        },
+    };
+
+    doc.base_version = try gpa.dupe(u8, base_version);
+    doc.base_head = head_id;
+
+    return doc;
+}
+
+/// Whether text object `obj`'s base is fully realized. Always true for an
+/// object that never went through `openPartial` (including one with no
+/// compacted base at all).
+pub fn baseRealized(self: *const ObjectDoc, obj: ObjId) bool {
+    const holes = self.text_holes.get(obj) orelse return true;
+    return holes.items.len == 0;
+}
+
+/// The fetch list for text object `obj`: its unrealized base spans,
+/// `base_offset` being the byte range key in ITS pristine base. Borrows
+/// from the document. Empty for an object with no active holes.
+pub fn unrealizedBase(self: *const ObjectDoc, obj: ObjId) []const BaseHole {
+    const holes = self.text_holes.get(obj) orelse return &.{};
+    return holes.items;
+}
+
+/// Supply the pristine content of one unrealized span of text object
+/// `obj`'s base (whole-span; identified by `base_offset`). Verified
+/// against the recorded byte and scalar counts (`error.Corrupt` on
+/// mismatch, or if `obj` has no matching hole — nothing changes). Not an
+/// edit: offsets, anchors, and versions are all unaffected. Same contract
+/// as `TextDoc.realizeBase`, scoped to `obj`.
+pub fn realizeBase(
+    self: *ObjectDoc,
+    gpa: Allocator,
+    obj: ObjId,
+    base_offset: usize,
+    content: []const u8,
+) (Allocator.Error || error{Corrupt})!void {
+    const holes = self.text_holes.getPtr(obj) orelse return error.Corrupt;
+    const idx = for (holes.items, 0..) |h, i| {
+        if (h.base_offset == base_offset) break i;
+    } else return error.Corrupt;
+    const h = holes.items[idx];
+    if (content.len != h.bytes) return error.Corrupt;
+    if (!std.unicode.utf8ValidateSlice(content)) return error.Corrupt;
+    if ((std.unicode.utf8CountCodepoints(content) catch unreachable) != h.scalars) return error.Corrupt;
+    const node_idx = self.resolveObjNode(obj);
+    try self.nodes.items[node_idx].text.rope.realize(gpa, h.cur_offset, content);
+    const base = self.text_bases.getPtr(obj).?;
+    // `jw.TextBase.bytes` is `[]const u8` (every OTHER writer treats a
+    // base as immutable once built); `realizeBase` is the one place that
+    // legitimately mutates it in place — we exclusively own this
+    // allocation (nothing else ever aliases a `text_bases` entry's bytes).
+    @memcpy(@constCast(base.bytes)[h.base_offset..][0..h.bytes], content);
+    _ = holes.orderedRemove(idx);
+    if (holes.items.len == 0) {
+        var removed = self.text_holes.fetchRemove(obj).?;
+        removed.value.deinit(gpa);
+    }
+}
+
 // ── Merge ───────────────────────────────────────────────────────────
 
 /// Integrate encoded remote events; returns the change stream (caller
@@ -1170,7 +1605,12 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
     var dec = try Decoder.init(gpa, bytes);
     defer dec.deinit(gpa);
 
-    const bootstrap = dec.base != null and self.base_version.len == 0 and self.history.eventCount() == 0;
+    // A version-only base section (wire v3 — a holey sender, see
+    // `openPartial`'s wire-contract doc comment) can never seed a
+    // bootstrap: it carries no text content to bootstrap FROM. Mirrors
+    // `TextDoc.merge`'s `dec.base.?.bytes != null` guard.
+    const bootstrap = dec.base != null and dec.base.?.full and
+        self.base_version.len == 0 and self.history.eventCount() == 0;
     if (dec.base) |b| {
         if (!bootstrap and !std.mem.eql(u8, self.base_version, b.version)) {
             return error.MissingDependency;
@@ -1275,20 +1715,35 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
                 try changes.append(gpa, .{ .list_del = .{ .obj = self.history.idOf(e.obj), .index = @intCast(e.index) } });
             },
             .text_ins => |e| {
+                const obj_id = self.history.idOf(e.obj);
+                const holey = self.text_holes.contains(obj_id);
                 const text_node = self.nodeOfObjLv(e.obj);
                 const t = &self.nodes.items[text_node].text;
-                const off = t.rope.scalarToOffset(e.pos);
+                const off = if (holey) self.insByteOffset(obj_id, e.pos) else t.rope.scalarToOffset(e.pos);
                 const len = std.unicode.utf8Encode(e.ch, &buf) catch unreachable;
                 _ = try self.nodes.items[text_node].text.rope.insert(gpa, off, buf[0..len]);
-                try appendTextChange(gpa, &changes, self.history.idOf(e.obj), .{ .offset = off, .removed = 0, .inserted = len });
+                // Keep `text_holes[obj_id]`'s `cur_offset` bookkeeping in
+                // sync with a REMOTE effect landing near (never inside —
+                // `checkHoleConflicts` already proved that) a hole, same
+                // as the local-edit path (`textInsert`) already does —
+                // mirrors `TextDoc.merge`'s `if (holey) self.shiftHoles(...)`.
+                if (holey) self.shiftHoles(obj_id, off, len, 0);
+                try appendTextChange(gpa, &changes, obj_id, .{ .offset = off, .removed = 0, .inserted = len });
             },
             .text_del => |e| {
+                const obj_id = self.history.idOf(e.obj);
+                const holey = self.text_holes.contains(obj_id);
                 const text_node = self.nodeOfObjLv(e.obj);
                 const t = &self.nodes.items[text_node].text;
-                const start = t.rope.scalarToOffset(e.pos);
-                const end = t.rope.scalarToOffset(e.pos + 1);
-                _ = try self.nodes.items[text_node].text.rope.delete(gpa, .{ .start = start, .end = end });
-                try appendTextChange(gpa, &changes, self.history.idOf(e.obj), .{ .offset = start, .removed = end - start, .inserted = 0 });
+                const range = if (holey) self.delByteRange(obj_id, e.pos) else Range{
+                    .start = t.rope.scalarToOffset(e.pos),
+                    .end = t.rope.scalarToOffset(e.pos + 1),
+                };
+                const start = range.start;
+                const end = range.end;
+                _ = try self.nodes.items[text_node].text.rope.delete(gpa, range);
+                if (holey) self.shiftHoles(obj_id, start, 0, end - start);
+                try appendTextChange(gpa, &changes, obj_id, .{ .offset = start, .removed = end - start, .inserted = 0 });
             },
             .struct_created => |e| {
                 // Eager, in Lv order — see the `Effect.struct_created`
@@ -1417,9 +1872,11 @@ fn silentObjectReplay(self: *const ObjectDoc, gpa: Allocator, obj_lv: Lv) Alloca
 /// An identity anchor for the position `byte_offset` inside text object
 /// `obj`. Same contract as `TextDoc.anchorAt` (`stickiness` picks
 /// `.before`/`.after`); the returned `agent` slice is gpa-owned.
-/// `error.Compacted` is part of the shared error set as an honest
-/// reservation for `ObjectDoc`'s own eventual compaction (not yet built —
-/// unreachable from here today; see `seq_walker.base_placeholder_lv`).
+/// `error.Compacted` is part of the shared error set both as an honest
+/// reservation for `ObjectDoc`'s own eventual compaction (not yet built)
+/// AND the real, reachable answer for a `byte_offset` landing on `obj`'s
+/// still-unrealized base content (partial checkout, `openPartial`) — see
+/// `seq_walker.base_placeholder_lv`.
 pub fn objectAnchorAt(
     self: *const ObjectDoc,
     gpa: Allocator,
@@ -1430,8 +1887,20 @@ pub fn objectAnchorAt(
     const node_idx = self.resolveObjNode(obj);
     assert(self.nodes.items[node_idx] == .text);
     const rope = &self.nodes.items[node_idx].text.rope;
-    const scalar = rope.offsetToScalar(byte_offset);
-    const total = rope.scalarLen();
+    // Global scalar space (what the `SeqWalker` below indexes into)
+    // includes `obj`'s unrealized base-hole scalars, which `rope`'s own
+    // metric does NOT count (a hole leaf's summary carries zero scalars —
+    // see `Rope`'s "Lazy / unrealized content" section) — `holeScalarsThrough`
+    // compensates, exactly mirroring `textInsert`'s own byte→scalar step.
+    // A no-op (adds 0) for the overwhelming common case of an object with
+    // no active holes — this was the found bug: every OTHER byte↔scalar
+    // boundary here (`textInsert`/`textDelete`, `merge`'s
+    // `insByteOffset`/`delByteRange`) already got this treatment; the
+    // anchor path silently didn't, so an anchor taken at or after a hole
+    // resolved against the wrong element (interior to the hole's own
+    // placeholder block instead of the real content past it).
+    const scalar = rope.offsetToScalar(byte_offset) + self.holeScalarsThrough(obj, byte_offset);
+    const total = rope.scalarLen() + self.holeScalarsThrough(obj, rope.byteLen());
     switch (stickiness) {
         .before => if (scalar == total) return .{ .agent = "", .side = .after },
         .after => if (scalar == 0) return .{ .agent = "", .side = .before },
@@ -1468,10 +1937,20 @@ pub fn resolveObjectAnchors(
     defer sw.deinit(gpa);
     const ctx: TextInsertCtx = .{ .graph = &self.history, .obj = obj_lv };
     try seq_walker.resolveAnchors(gpa, &self.history, &sw, ctx, anchors, out);
-    // The shared layer returns SCALAR positions; convert to bytes in
-    // place (usize both — no separate buffer needed).
-    const rope = &self.nodes.items[node_idx].text.rope;
-    for (out) |*o| o.* = rope.scalarToOffset(o.*);
+    // The shared layer returns GLOBAL SCALAR positions (base-hole-
+    // inclusive, same space `objectAnchorAt` targets above) — map to
+    // bytes with the same hole-aware boundary mapping `merge`'s
+    // insert-effect path uses (`insByteOffset`): a resolved identity's
+    // item can only ever sit before or after `obj`'s hole block, never
+    // interior to one (no edit is ever accepted interior to a hole —
+    // `assertOutsideHoles`/`checkHoleConflicts` both refuse that), so the
+    // insertion-point mapping is exactly the boundary mapping a READ
+    // needs too. A no-op (degenerates to plain `scalarToOffset`) when
+    // `obj` has no active holes — this was the other half of the found
+    // bug (see `objectAnchorAt`'s doc comment): the old direct
+    // `rope.scalarToOffset(o.*)` silently undercounted by every
+    // preceding hole's scalars whenever one existed.
+    for (out) |*o| o.* = self.insByteOffset(obj, @intCast(o.*));
 }
 
 // ── Time travel ─────────────────────────────────────────────────────
@@ -1519,6 +1998,13 @@ pub fn materializeAt(
     const obj_lv = self.history.lvOf(obj).?;
     if (!include[obj_lv]) return error.Corrupt; // not created yet at this version
     assert(self.objKind(obj_lv) == .text);
+    // Needs full base content — mirrors `TextDoc.materializeAt`'s own
+    // `self.holes.items.len != 0` guard, scoped to just this object
+    // (unlike `compact`'s whole-doc guard below: a read of ONE object's
+    // history has no reason to care about a DIFFERENT object's holes).
+    if (self.text_holes.get(obj)) |h| {
+        if (h.items.len != 0) return error.Unrealized;
+    }
 
     var w = Walker.initWithBases(&self.history, self.strings.items, &self.text_bases);
     defer w.deinit(gpa);
@@ -1951,7 +2437,18 @@ fn adoptTextBases(self: *ObjectDoc, gpa: Allocator, base: Decoder.BaseSection, a
 /// identity. Seeds from any EXISTING `self.text_bases` entries first
 /// (progressive re-compaction: a second `compact()` call extends, rather
 /// than replaces from scratch, an already-compacted object's base).
-fn materializeTextBasesAt(self: *const ObjectDoc, gpa: Allocator, past_s: []const bool) Allocator.Error!jw.TextBaseMap {
+/// `error.Unrealized` if ANY object anywhere in the document still has an
+/// active hole (`compact`'s own whole-doc-linearization-point granularity
+/// — coarser than `materializeAt`'s per-object guard, but `compact`
+/// itself only ever operates whole-doc, so there is no finer question to
+/// ask here): decoding `old_decoded`'s base-placeholder scalars below
+/// would otherwise read a hole's zero-filled placeholder bytes as if they
+/// were real pristine content — silently WRONG (still valid UTF-8: NUL
+/// codepoints), not merely unavailable, which is exactly what this guard
+/// is for. This is `compact`'s "transitive" `Unrealized` refusal — the
+/// one call site `compact` routes its materialization through.
+fn materializeTextBasesAt(self: *const ObjectDoc, gpa: Allocator, past_s: []const bool) (Allocator.Error || error{Unrealized})!jw.TextBaseMap {
+    if (self.text_holes.count() != 0) return error.Unrealized;
     // Decode every EXISTING base's bytes to scalars once, up front — a
     // still-alive base placeholder's arena index is exactly its position
     // in that decoded array (see `Sequence.initBase`: placeholders are
@@ -2087,7 +2584,80 @@ fn historyPhase(
     var w = Walker.initWithBases(&self.history, self.strings.items, &self.text_bases);
     defer w.deinit(gpa);
     try w.replayAll(gpa, first_new, effects, null);
+    // Rejects (whole-batch) any transformed text effect landing interior
+    // to an unrealized base span — rides the errdefer rollback armed at
+    // the top of this function (the tree-application loop `merge` drives
+    // over `effects` runs strictly later, in `merge` itself, after this
+    // function returns — nothing has touched `self.nodes` yet at this
+    // point, so there is nothing beyond the graph mutation above for the
+    // errdefer to undo).
+    try self.checkHoleConflicts(gpa, effects.items);
     return true;
+}
+
+/// Reject (whole-batch) any transformed `.text_ins`/`.text_del` effect
+/// that lands interior to an unrealized base span of the object it
+/// targets — the per-object analog of `TextDoc.checkHoleConflicts`,
+/// scoped to whichever objects this batch's effects touch AND have
+/// active holes (`self.text_holes` misses for every other object — free,
+/// same as every other per-object hole lookup here).
+///
+/// COORDINATE SPACE (the trap): `effects` entries carry positions in the
+/// state produced by ALL PREVIOUSLY EMITTED effects (`Effect`'s own doc
+/// comment) — i.e. each object's "current" scalar space drifts as
+/// EARLIER effects on that SAME object land. A hole's global scalar
+/// start must be tracked incrementally through the stream exactly like
+/// `TextDoc.checkHoleConflicts` tracks it for the whole document: an
+/// insert at-or-before a hole's start shifts it right by one; a delete
+/// strictly before it shifts it left by one. Ported here per object
+/// (`starts`, one entry per object that HAS active holes) instead of
+/// once for the whole document, since two different objects' holes are
+/// never affected by each other's effects.
+fn checkHoleConflicts(self: *const ObjectDoc, gpa: Allocator, effects: []const Effect) MergeError!void {
+    if (self.text_holes.count() == 0) return;
+
+    var starts: std.AutoHashMapUnmanaged(EventId, []u64) = .empty;
+    defer {
+        var it = starts.valueIterator();
+        while (it.next()) |s| gpa.free(s.*);
+        starts.deinit(gpa);
+    }
+    var hit = self.text_holes.iterator();
+    while (hit.next()) |entry| {
+        const holes = entry.value_ptr.items;
+        if (holes.len == 0) continue;
+        const node_idx = self.obj_index.get(entry.key_ptr.*).?;
+        const rope = &self.nodes.items[node_idx].text.rope;
+        const arr = try gpa.alloc(u64, holes.len);
+        var acc: u64 = 0;
+        for (holes, arr) |h, *s| {
+            s.* = @as(u64, rope.offsetToScalar(h.cur_offset)) + acc;
+            acc += h.scalars;
+        }
+        try starts.put(gpa, entry.key_ptr.*, arr);
+    }
+
+    for (effects) |eff| switch (eff) {
+        .text_ins => |x| {
+            const obj_id = self.history.idOf(x.obj);
+            const holes = self.text_holes.get(obj_id) orelse continue;
+            const s = starts.get(obj_id) orelse continue;
+            for (holes.items, s) |h, *sv| {
+                if (x.pos > sv.* and x.pos < sv.* + h.scalars) return error.Unrealized;
+                if (x.pos <= sv.*) sv.* += 1;
+            }
+        },
+        .text_del => |x| {
+            const obj_id = self.history.idOf(x.obj);
+            const holes = self.text_holes.get(obj_id) orelse continue;
+            const s = starts.get(obj_id) orelse continue;
+            for (holes.items, s) |h, *sv| {
+                if (x.pos >= sv.* and x.pos < sv.* + h.scalars) return error.Unrealized;
+                if (x.pos < sv.*) sv.* -= 1;
+            }
+        },
+        else => {},
+    };
 }
 
 /// Build the stored op from a decoded one: intern strings, resolve
@@ -2163,6 +2733,13 @@ fn internVal(self: *ObjectDoc, gpa: Allocator, v: Decoder.RawVal) Allocator.Erro
 //   uv event_count, per event: same as v1 (map/list events are NEVER
 //     compacted — see `compact`'s doc comment — so nothing about the
 //     event stream itself changes shape between v1 and v2)
+// v3 "stj" 0x03 (emitted instead of v2 whenever the sender has any active
+// hole — partial checkout, `openPartial`): identical to v2 EXCEPT
+// `uv text_base_count` is always encoded as 0 and no entries follow —
+// "version-only": `base_version` is still present (same-base peers merge
+// normally) but this batch can never seed a bootstrap (`Decoder`'s
+// `BaseSection.full` decodes false only for v3). See the wire-contract
+// doc comment above `openPartial` for the full rationale.
 
 // F3, delta 6 (`stemma-unification.md` §3 step 5): `struct_create`/
 // `struct_move` are ADDITIVE new tags (6/7) — a doc with no structural ops
@@ -2183,9 +2760,15 @@ const ValTag = enum(u8) { null_ = 0, false_ = 1, true_ = 2, int = 3, float = 4, 
 
 fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocator.Error![]u8 {
     const compacted = self.base_version.len > 0;
+    // Partial checkout (`openPartial`/`text_holes`): a holey sender emits
+    // v3 instead of v2 — `base_version` only, ZERO `text_base` entries,
+    // NEVER bootstrap-capable (`Decoder.BaseSection.full` decodes false)
+    // — see the "Partial checkout" section's wire-contract doc comment
+    // above `openPartial` for the full rationale.
+    const holey = self.text_holes.count() != 0;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, if (compacted) object_magic_v2 else object_magic_v1);
+    try out.appendSlice(gpa, if (!compacted) object_magic_v1 else if (holey) object_magic_v3 else object_magic_v2);
 
     var table: std.ArrayList(AgentId) = .empty;
     defer table.deinit(gpa);
@@ -2203,16 +2786,19 @@ fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocat
             else => {},
         }
     }
-    if (compacted) {
+    if (compacted and !holey) {
         var bit = self.text_bases.keyIterator();
         while (bit.next()) |k| try tableAdd(gpa, &table, k.agent);
+    }
+    if (compacted) {
         // A bootstrapping receiver needs to resolve `base_head`'s agent
         // (`versionSingleEntry(base_version).name`) BEFORE any event or
         // text-base entry has registered it for them — e.g. when `s` is
         // authored by an agent whose every event got folded into another
         // object's base (nothing else in the batch would ever mention
         // them). Mirrors `TextDoc.encodeEvents`'s identical `base_head`
-        // table entry.
+        // table entry. Still needed for v3 (a same-base peer's parent
+        // resolution may reference it).
         if (self.base_head) |h| try tableAdd(gpa, &table, h.agent);
     }
     try putUv(gpa, &out, table.items.len);
@@ -2226,15 +2812,19 @@ fn encodeEvents(self: *const ObjectDoc, gpa: Allocator, lvs: []const Lv) Allocat
     if (compacted) {
         try putUv(gpa, &out, self.base_version.len);
         try out.appendSlice(gpa, self.base_version);
-        try putUv(gpa, &out, self.text_bases.count());
-        var it = self.text_bases.iterator();
-        while (it.next()) |e| {
-            const id = e.key_ptr.*;
-            try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
-            try putUv(gpa, &out, id.seq);
-            try putUv(gpa, &out, e.value_ptr.scalars);
-            try putUv(gpa, &out, e.value_ptr.bytes.len);
-            try out.appendSlice(gpa, e.value_ptr.bytes);
+        if (holey) {
+            try putUv(gpa, &out, 0); // version-only: zero text_base entries, ever
+        } else {
+            try putUv(gpa, &out, self.text_bases.count());
+            var it = self.text_bases.iterator();
+            while (it.next()) |e| {
+                const id = e.key_ptr.*;
+                try putUv(gpa, &out, tableIndexOf(table.items, id.agent));
+                try putUv(gpa, &out, id.seq);
+                try putUv(gpa, &out, e.value_ptr.scalars);
+                try putUv(gpa, &out, e.value_ptr.bytes.len);
+                try out.appendSlice(gpa, e.value_ptr.bytes);
+            }
         }
     }
 
@@ -2417,6 +3007,12 @@ const Decoder = struct {
     const BaseSection = struct {
         version: []const u8, // borrowed — a `version()`-shaped token
         text_bases: []const TextBaseRef,
+        /// False for a v3 ("version-only") base section: `text_bases` is
+        /// always empty in that case, but emptiness alone doesn't mean
+        /// "nothing was ever compacted here" — `full` is what `merge`'s
+        /// bootstrap check actually gates on (see the wire-contract doc
+        /// comment above `openPartial`).
+        full: bool,
     };
 
     names: std.ArrayList([]const u8) = .empty,
@@ -2446,7 +3042,7 @@ const Decoder = struct {
         var cur: []const u8 = bytes;
         if (cur.len < object_magic_v1.len or !std.mem.startsWith(u8, cur, "stj")) return error.Corrupt;
         const wire_version = cur[3];
-        if (wire_version < 1 or wire_version > 2) return error.Corrupt;
+        if (wire_version < 1 or wire_version > 3) return error.Corrupt;
         cur = cur[object_magic_v1.len..];
 
         const agent_count = try getUv(&cur);
@@ -2455,10 +3051,10 @@ const Decoder = struct {
             const name = try getBytes(&cur, 4096);
             if (name.len == 0) return error.Corrupt;
             try self.names.append(gpa, name);
-            try self.seq_bases.append(gpa, if (wire_version == 2) try getUv(&cur) else 0);
+            try self.seq_bases.append(gpa, if (wire_version >= 2) try getUv(&cur) else 0);
         }
 
-        if (wire_version == 2) {
+        if (wire_version >= 2) {
             const vlen = try getUv(&cur);
             if (vlen == 0 or vlen > cur.len) return error.Corrupt;
             const vtoken = cur[0..vlen];
@@ -2487,7 +3083,11 @@ const Decoder = struct {
                     .bytes = tbytes,
                 });
             }
-            self.base = .{ .version = vtoken, .text_bases = self.text_base_pool.items[tb_start..] };
+            self.base = .{
+                .version = vtoken,
+                .text_bases = self.text_base_pool.items[tb_start..],
+                .full = wire_version == 2,
+            };
         }
 
         const event_count = try getUv(&cur);

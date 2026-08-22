@@ -1024,6 +1024,62 @@ test "partial: edits at hole boundaries stay legal and convergent" {
     try expectConverged(&[_]*TextDoc{ &host, &part });
 }
 
+test "partial: identity anchors are hole-aware — anchor/resolve around a hole names the correct character, unmoved by realize" {
+    const gpa = t.allocator;
+    var host: TextDoc = .empty;
+    defer host.deinit(gpa);
+    try host.setAgent(gpa, "host");
+    _ = try host.insert(gpa, 0, "aaaHHHHbbb");
+    var part = try partialPair(gpa, &host, 3, 7); // hole = "HHHH"
+    defer part.deinit(gpa);
+
+    // Real (non-base) edits landing exactly at both edges of the hole —
+    // same shape as "partial: edits at hole boundaries stay legal and
+    // convergent" above, giving `part` content "aaa[HHHH]bbb" with the
+    // middle span still an unrealized hole.
+    _ = try host.insert(gpa, 3, "[");
+    _ = try host.insert(gpa, 8, "]");
+    try syncBoth(gpa, &host, &part);
+    try t.expect(!part.baseRealized());
+
+    // `.before` at byte 3 names '[' — right before the hole; needs no
+    // hole compensation (a position before every hole is unaffected —
+    // included for symmetry/regression, not because it alone proves the
+    // fix).
+    const at_open = try part.anchorAt(gpa, 3, .before);
+    defer gpa.free(at_open.agent);
+    // `.before` at byte 8 names ']' — right AFTER the hole. THIS is the
+    // review's exact trace: the OLD (realized-only) conversion computed
+    // scalar index 4 here (uncompensated: `self.rope.offsetToScalar(8)`
+    // alone, ignoring the hole's 4 scalars) — global walker index 4 is
+    // the hole's OWN first placeholder item, so the old code reported
+    // `error.Compacted` for a position that names a perfectly
+    // resolvable REAL character.
+    const at_close = try part.anchorAt(gpa, 8, .before);
+    defer gpa.free(at_close.agent);
+
+    var offs_pre: [2]usize = undefined;
+    try part.resolveAnchors(gpa, &.{ at_open, at_close }, &offs_pre);
+    try t.expectEqual(@as(usize, 3), offs_pre[0]);
+    try t.expectEqual(@as(usize, 8), offs_pre[1]);
+
+    // Realizing is not an edit: neither anchor moves.
+    const h = part.unrealizedBase()[0];
+    try part.realizeBase(gpa, h.base_offset, host.base_bytes[3..7]);
+    try t.expect(part.baseRealized());
+    var offs_post: [2]usize = undefined;
+    try part.resolveAnchors(gpa, &.{ at_open, at_close }, &offs_post);
+    try t.expectEqualSlices(usize, &offs_pre, &offs_post);
+
+    // Only readable now that the doc is fully realized — check the
+    // actual CHARACTER, not just the offset.
+    const text = try part.text().toOwnedSlice(gpa);
+    defer gpa.free(text);
+    try t.expectEqualStrings("aaa[HHHH]bbb", text);
+    try t.expectEqual(@as(u8, '['), text[offs_post[0]]);
+    try t.expectEqual(@as(u8, ']'), text[offs_post[1]]);
+}
+
 test "partial: remote edit into the hole rejects whole, realize-then-merge succeeds" {
     const gpa = t.allocator;
     var host: TextDoc = .empty;
