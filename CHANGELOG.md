@@ -4,7 +4,22 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1] — 2026-08-22
+
+### Fixed
+
+- **`ObjectDoc.openPartial` rejected every real compaction boundary** —
+  it accepted only the founder's degenerate creation event. It now
+  accepts genuinely edited-then-compacted boundaries (`head.seq <=
+  seq_base`, with the creator identity proven and loudly asserted),
+  so partial checkout of real documents works.
+- **A single bootstrap batch carrying a base plus live edits lost the
+  edits** — the base's rope seed clobbered already-applied effects
+  (empty-base case), and the base metadata seeded after replay made a
+  non-empty base with trailing edits fail outright. Base metadata now
+  seeds before replay and rope content at the creation effect;
+  bootstrap failures roll back the seeded metadata completely
+  (OOM-swept).
 
 ## [0.5.0] — 2026-08-22
 
