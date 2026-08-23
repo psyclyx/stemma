@@ -4,7 +4,17 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.2] — 2026-08-23
+
+### Fixed
+
+- **`ObjectDoc` batch validation was O(N²)** — `Decoder.validate`
+  rescanned the batch prefix per event. Ported `TextDoc`'s incremental
+  per-agent `Seen` ranges (which fixed the same class there in 0.1.0's
+  run-RLE work): a 131k-event batch now validates in ~64ms instead of
+  ~19s (~300×). Identical accept/reject semantics, verified against the
+  old code; the atomic-rejection fuzz battery is unchanged. A permanent
+  bench canary guards the class.
 
 ## [0.5.1] — 2026-08-22
 
