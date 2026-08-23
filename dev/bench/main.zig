@@ -354,6 +354,40 @@ fn benchCollab(io: Io, w: *Io.Writer) !void {
     }
 }
 
+/// A whole-file commit as one batch: N list-scalar events from a single
+/// agent (append-only, so `listInsert` itself stays O(1) amortized —
+/// unlike `mapSet`'s per-map `treeSlot` linear scan, which would confound
+/// the measurement with an unrelated O(n) map-key lookup), merged into an
+/// empty doc in one `open()` call. This is the shape that made
+/// `ObjectDoc.Decoder.validate`'s per-agent contiguity check O(events^2)
+/// before it tracked a per-agent seen-range incrementally (`seenEarlier`
+/// used to linearly rescan the batch prefix on every event) — see
+/// BENCHMARKS.md. `TextDoc`'s equivalent `validate` already used the
+/// incremental shape, so it has no comparable regression here.
+fn benchCollabObject(io: Io, w: *Io.Writer) !void {
+    const ObjectDoc = stemma.ObjectDoc;
+    inline for (.{ 4096, 32768, 131072 }) |n| {
+        var author: ObjectDoc = .empty;
+        defer author.deinit(gpa);
+        try author.setAgent(gpa, "author");
+        const list_obj = (try author.mapSet(gpa, null, "items", .list)).?;
+        for (0..n) |i| {
+            _ = try author.listInsert(gpa, list_obj, i, .{ .int = @intCast(i) });
+        }
+        const bytes = try author.serialize(gpa);
+        defer gpa.free(bytes);
+        const merge_blocks = 3;
+        var samples: [merge_blocks]u64 = undefined;
+        for (&samples) |*s| {
+            var timer = Timer.start_(io);
+            var d = try ObjectDoc.open(gpa, bytes);
+            s.* = timer.lap();
+            d.deinit(gpa);
+        }
+        try report(w, std.fmt.comptimePrint("collab merge object {d} scalars", .{n}), &samples, n, "ns");
+    }
+}
+
 fn runSuite(comptime RopeT: type, io: Io, w: *Io.Writer, comptime prefix: []const u8, filter: ?[]const u8) !void {
     const want = struct {
         fn want(f: ?[]const u8, name: []const u8) bool {
@@ -384,7 +418,10 @@ pub fn main(init: std.process.Init) !void {
     // answer the chunk-capacity / branch-factor question on the same
     // workloads.
     try runSuite(Rope, io, w, "", filter);
-    if (filter == null or std.mem.indexOf(u8, "collab", filter.?) != null) try benchCollab(io, w);
+    if (filter == null or std.mem.indexOf(u8, "collab", filter.?) != null) {
+        try benchCollab(io, w);
+        try benchCollabObject(io, w);
+    }
     if (filter != null) {
         try runSuite(stemma.RopeWith(.{ .chunk_capacity = 128 }), io, w, "c128/", filter);
         try runSuite(stemma.RopeWith(.{ .chunk_capacity = 512 }), io, w, "c512/", filter);

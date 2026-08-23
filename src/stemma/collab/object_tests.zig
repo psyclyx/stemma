@@ -497,6 +497,79 @@ test "malicious json batches rejected without damage" {
     try t.expectEqualStrings(before, after);
 }
 
+// `Decoder.validate`'s per-agent contiguity check (W7b) was rewritten from
+// an O(events) rescan per event (`seenEarlier`, quadratic overall) to an
+// incremental per-agent seen-range built in one pass. These three batches
+// are hand-encoded (v1 wire, see the `OpTag`/wire-contract doc comments
+// above `Decoder`) to exercise the specific shapes that rewrite has to get
+// exactly right: same-batch cross-agent interleaving that must still be
+// ACCEPTED, a same-agent gap that must still be REJECTED atomically, and a
+// parent ref resolved against an earlier event in the SAME batch (not yet
+// known to the doc) rather than against stored history.
+test "validate: same-batch agent interleaving (a0 b0 a1 b1) is accepted, not rejected as out of order" {
+    const gpa = t.allocator;
+    var victim: ObjectDoc = .empty;
+    defer victim.deinit(gpa);
+    try victim.setAgent(gpa, "victim");
+
+    const interleaved = "stj\x01" ++ [_]u8{ 2, 1 } ++ "a" ++ [_]u8{1} ++ "b" ++ [_]u8{4} ++
+        [_]u8{ 0, 0, 0, 0, 0, 3 } ++ "ka0" ++ [_]u8{ 3, 2 } ++ // a seq0: ka0=1
+        [_]u8{ 1, 0, 0, 0, 0, 3 } ++ "kb0" ++ [_]u8{ 3, 4 } ++ // b seq0: kb0=2
+        [_]u8{ 0, 1, 0, 0, 0, 3 } ++ "ka1" ++ [_]u8{ 3, 6 } ++ // a seq1: ka1=3
+        [_]u8{ 1, 1, 0, 0, 0, 3 } ++ "kb1" ++ [_]u8{ 3, 8 }; // b seq1: kb1=4
+    gpa.free(try victim.merge(gpa, interleaved));
+
+    const json = try victim.toJson(gpa);
+    defer gpa.free(json);
+    try t.expectEqualStrings("{\"ka0\":1,\"ka1\":3,\"kb0\":2,\"kb1\":4}", json);
+}
+
+test "validate: a same-agent seq gap in one batch is rejected atomically (error.MissingDependency)" {
+    const gpa = t.allocator;
+    var victim: ObjectDoc = .empty;
+    defer victim.deinit(gpa);
+    try victim.setAgent(gpa, "victim");
+    _ = try victim.mapSet(gpa, null, "safe", .{ .int = 1 });
+    const before = try victim.toJson(gpa);
+    defer gpa.free(before);
+    const events_before = victim.history.eventCount();
+
+    // agent "a": seq0 present, seq1 MISSING, seq2 present — the seq2 event
+    // can't extend "a"'s seen-range (which stops at [0,1) after seq0), so
+    // it must fail the contiguity check exactly like the old linear scan
+    // would (it never finds seq1 anywhere earlier in the batch).
+    const gap = "stj\x01" ++ [_]u8{ 1, 1 } ++ "a" ++ [_]u8{2} ++
+        [_]u8{ 0, 0, 0, 0, 0, 2 } ++ "k0" ++ [_]u8{ 3, 2 } ++ // a seq0: k0=1
+        [_]u8{ 0, 2, 0, 0, 0, 2 } ++ "k2" ++ [_]u8{ 3, 4 }; // a seq2: k2=2 (gap at seq1)
+    try t.expectError(error.MissingDependency, victim.merge(gpa, gap));
+
+    try t.expectEqual(events_before, victim.history.eventCount());
+    const after = try victim.toJson(gpa);
+    defer gpa.free(after);
+    try t.expectEqualStrings(before, after);
+}
+
+test "validate: a parent ref resolved against an earlier event in the SAME batch (not yet in doc history)" {
+    const gpa = t.allocator;
+    var victim: ObjectDoc = .empty;
+    defer victim.deinit(gpa);
+    try victim.setAgent(gpa, "victim");
+
+    // agent "b" seq0 declares agent "a" seq1 as a parent; "a" seq1 is
+    // itself only 2 events earlier in this SAME batch (index 1), not
+    // anywhere in `victim`'s history yet — the parent-resolution fallback
+    // must find it via the batch-local seen range, not `doc.history`.
+    const cross_parent = "stj\x01" ++ [_]u8{ 2, 1 } ++ "a" ++ [_]u8{1} ++ "b" ++ [_]u8{3} ++
+        [_]u8{ 0, 0, 0, 0, 0, 3 } ++ "ka0" ++ [_]u8{ 3, 2 } ++ // a seq0: ka0=1
+        [_]u8{ 0, 1, 0, 0, 0, 3 } ++ "ka1" ++ [_]u8{ 3, 4 } ++ // a seq1: ka1=2
+        [_]u8{ 1, 0, 1, 0, 1, 0, 0, 3 } ++ "kb0" ++ [_]u8{ 3, 6 }; // b seq0, parent=(a,1): kb0=3
+    gpa.free(try victim.merge(gpa, cross_parent));
+
+    const json = try victim.toJson(gpa);
+    defer gpa.free(json);
+    try t.expectEqualStrings("{\"ka0\":1,\"ka1\":2,\"kb0\":3}", json);
+}
+
 test "three peers, seeded random gossip over mixed structures, convergence" {
     const gpa = t.allocator;
     var docs: [3]ObjectDoc = .{ .empty, .empty, .empty };

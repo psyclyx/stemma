@@ -1687,7 +1687,7 @@ pub fn merge(self: *ObjectDoc, gpa: Allocator, bytes: []const u8) MergeError![]C
         batch_head = .{ .agent = agent, .seq = entry.seq };
     }
 
-    try dec.validate(self, aids, eff_base, batch_head);
+    try dec.validate(gpa, self, aids, eff_base, batch_head);
 
     // Commit the bootstrap watermarks now (validated) — event-adding
     // below needs `nextSeq` to already reflect them.
@@ -3374,25 +3374,50 @@ const Decoder = struct {
     /// boundary, or the batch's if bootstrapping) is the one compacted
     /// reference a parent ref may name without being separately known or
     /// batch-local — same discipline as `TextDoc`'s.
+    ///
+    /// "Earlier in batch" is one contiguous seen-range per agent, tracked
+    /// incrementally as the single pass proceeds (same shape as
+    /// `TextDoc.Decoder.validate`): a causally closed batch has per-agent
+    /// ascending contiguous seqs, so the range is exact for honest
+    /// encoders; adversarial orderings merely fail to extend it and get
+    /// rejected. O(events + parents), not O(events^2).
     fn validate(
         self: *const Decoder,
+        gpa: Allocator,
         doc: *const ObjectDoc,
         aids: []const AgentId,
         eff_base: []const u64,
         batch_head: ?EventId,
-    ) error{MissingDependency}!void {
-        for (self.events.items, 0..) |ev, i| {
+    ) (Allocator.Error || error{MissingDependency})!void {
+        // Per agent, the batch-seen range [first, next); empty when equal.
+        const Seen = struct { first: u64 = 0, next: u64 = 0 };
+        const seen = try gpa.alloc(Seen, self.names.items.len);
+        defer gpa.free(seen);
+        @memset(seen, .{});
+        const inRange = struct {
+            fn inRange(s: Seen, seq: u64) bool {
+                return seq >= s.first and seq < s.next;
+            }
+        }.inRange;
+
+        for (self.events.items) |ev| {
+            defer {
+                const s = &seen[ev.agent_idx];
+                if (s.first == s.next) {
+                    s.* = .{ .first = ev.seq, .next = ev.seq + 1 };
+                } else if (ev.seq == s.next) s.next += 1;
+            }
             const id: EventId = .{ .agent = aids[ev.agent_idx], .seq = ev.seq };
             const stored = doc.history.agents.items[@intFromEnum(id.agent)].lv_by_seq.items.len;
             const next = eff_base[ev.agent_idx] + stored;
             if (ev.seq < next) continue; // duplicate or compacted
             const contiguous = ev.seq == next or
-                (ev.seq > 0 and self.seenEarlier(i, ev.agent_idx, ev.seq - 1));
+                (ev.seq > 0 and inRange(seen[ev.agent_idx], ev.seq - 1));
             if (!contiguous) return error.MissingDependency;
             for (self.parentsOf(ev)) |pref| {
                 const pid: EventId = .{ .agent = aids[pref.agent_idx], .seq = pref.seq };
                 if (doc.history.lvOf(pid) != null) continue;
-                if (self.seenEarlier(i, pref.agent_idx, pref.seq)) continue;
+                if (inRange(seen[pref.agent_idx], pref.seq)) continue;
                 if (batch_head) |h| {
                     if (h.agent == pid.agent and h.seq == pid.seq) continue;
                 }
@@ -3403,17 +3428,10 @@ const Decoder = struct {
             for (b.text_bases) |tb| {
                 const id: EventId = .{ .agent = aids[tb.obj.agent_idx], .seq = tb.obj.seq };
                 if (doc.history.lvOf(id) != null) continue;
-                if (self.seenEarlier(self.events.items.len, tb.obj.agent_idx, tb.obj.seq)) continue;
+                if (inRange(seen[tb.obj.agent_idx], tb.obj.seq)) continue;
                 return error.MissingDependency;
             }
         }
-    }
-
-    fn seenEarlier(self: *const Decoder, before: usize, agent_idx: u32, seq: u64) bool {
-        for (self.events.items[0..before]) |ev| {
-            if (ev.agent_idx == agent_idx and ev.seq == seq) return true;
-        }
-        return false;
     }
 };
 

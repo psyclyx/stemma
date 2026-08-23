@@ -59,3 +59,25 @@ collab merge growing x2048        447 ns/op  (best      437)  n=3
   grows (x256 → x2048 is 8× the history for ~1.2× the cost) rather than
   climbing with document lifetime. `compact` bounds it further by freezing
   all-peers-stable history into a base.
+
+## ObjectDoc batch validation — O(n²) → O(n) — 2026-08-23
+
+```
+collab merge object 4096 scalars      414 ns/op  (best      411)  n=3
+collab merge object 32768 scalars     447 ns/op  (best      420)  n=3
+collab merge object 131072 scalars    456 ns/op  (best      450)  n=3
+```
+
+- **`ObjectDoc.Decoder.validate` had the same hidden O(n²) `seenEarlier`
+  shape `TextDoc`'s validate was fixed for on 2026-08-15 (above) — that
+  fix only landed on `TextDoc`; `ObjectDoc`'s copy stayed a per-event
+  linear rescan of the batch prefix. A whole-file commit (one batch, one
+  event per scalar — weft's non-bulk save path) hits it hardest: merging a
+  single N-event batch into an empty doc went 3.2 µs/op (N=4096) → 33
+  µs/op (N=32768) → 146 µs/op (N=131072) before the fix — visibly
+  quadratic (8× N → ~10× per-op, ~80× total time). Replaced with the same
+  incremental per-agent seen-range `TextDoc` already used (built in one
+  pass alongside the existing contiguity/parent checks, same
+  accept/reject decisions on every input — the atomic-rejection fuzz
+  batteries pass unmodified): now flat at ~410–460 ns/op regardless of N —
+  a 131072-scalar merge went 19.1s → 60ms, ~320× faster.
