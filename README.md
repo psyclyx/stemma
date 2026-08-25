@@ -35,8 +35,8 @@ left open instead:
   while a snapshot is actually alive.
 - **Owned vs borrowed storage.** Leaves either own their chunk or borrow a
   span of caller-provided immutable backing (`fromBacking`, e.g. an mmap'd
-  file). A multi-gigabyte file opens as a handful of borrowed spans — near
-  zero resident memory — and edits splinter only the leaves they touch.
+  file). A multi-gigabyte file opens as borrowed spans without copying its
+  content into resident memory, and edits splinter only the leaves they touch.
 - **Metrics vs memory.** Summary dimensions are comptime options
   (`RopeWith(.{...})`): a build that doesn't speak LSP drops UTF-16 tracking
   and pays zero bytes and zero scan work for it. `Rope` is the
@@ -73,10 +73,12 @@ be thread-safe if snapshots cross threads.
 ## The collaboration layer
 
 Local edits record causally-stamped events; there is no CRDT metadata on
-the document itself (the eg-walker model). `merge` integrates a remote
-batch and returns the same byte-space `[]Edit` stream local edits produce,
-so `AnchorSet`s and cursors survive remote edits with no extra machinery.
-Two materializers share the graph, the wire format, and the sync protocol:
+the document itself (the eg-walker model). `TextDoc.merge` integrates a
+remote batch and returns the same byte-space `[]Edit` stream local edits
+produce, so `AnchorSet`s and cursors survive remote edits with no extra
+machinery. `ObjectDoc.merge` returns typed `[]Change` values spanning its
+map, list, structure, and text domains. Two materializers share the graph
+and causal sync model:
 
 - **`TextDoc`** — a collaborative text document (a `Rope` plus its graph).
 - **`ObjectDoc`** — a collaborative JSON-shaped object tree: maps, lists,
@@ -94,9 +96,11 @@ Both share:
 
 - **FugueMax ordering** — maximally non-interleaving concurrent insertions
   in both directions, fixed by block-contiguity tests.
-- **Opaque portable versions** — `version` / `eventsSince` are wire-ready
-  and run-RLE encoded (a typing burst is one frame; `WireFormat.unit`
-  serves pre-RLE decoders). Replica-local identifiers never cross the wire.
+- **Opaque causal frontiers** — `version` returns a canonical, portable
+  encoding of the event-graph heads visible to a snapshot; `eventsSince`
+  uses it for sync. It is an antichain, not a scalar clock: callers compare
+  causal relation, never increment or numerically order it. Replica-local
+  identifiers never cross the wire.
 - **Persistence** — `serialize` / `open` store the event graph, which is
   the document of record; the materialized value is derived from it.
 
@@ -112,20 +116,22 @@ supersession).
 
 Both carry **`materializeAt`** (time travel to any known version —
 object-scoped on `ObjectDoc`) and a **bulk load** path
-(`openFromContent`: a large file opens as a compacted base, one retained
-event, not content-length events) and **partial bases** (`openPartial` /
+(`openFromContent`: a large file opens as a compacted base, with zero
+retained text events on `TextDoc` and one text-object creation event on
+`ObjectDoc`, never content-length events) and **partial bases** (`openPartial` /
 `realizeBase` — a replica of a huge document fetches only the base spans
 it touches; a merge into an unrealized span rejects whole with
 `error.Unrealized`, realize-then-retry; per-object on `ObjectDoc`).
-`TextDoc` additionally carries a **wasm32 target** (`zig build wasm`) so
-browser peers speak the same protocol.
+`TextDoc` additionally carries run-RLE event batches (a typing burst is one
+frame; `WireFormat.unit` serves pre-RLE decoders) and a **wasm32 target**
+(`zig build wasm`) so browser peers speak the same protocol.
 
 Hostile input cannot crash a replica: malformed and malicious batches
 (including out-of-range positions) are rejected atomically and leave the
 document untouched, fuzz-gated. Convergence is oracle-tested — multi-peer
 seeded gossip, concurrent conflict shapes, batch splitting, fuzzed
-sessions — with all replicas byte-identical and every merge's edit stream
-validated. Transport, presence payloads, and collaborative undo policy are
+sessions — with all replicas byte-identical and every merge's change/edit
+stream validated. Transport, presence payloads, and collaborative undo policy are
 the caller's.
 
 Not yet, and ledgered as such: list-content and structural compaction
@@ -136,11 +142,11 @@ and incremental persistence.
 
 ## Status
 
-v0.5.2. The rope and both collaboration materializers are implemented,
+v0.6.0. The rope and both collaboration materializers are implemented,
 tested, and benchmarked (see [BENCHMARKS.md](BENCHMARKS.md)). Headlines on
-a Ryzen 9 5950X: ~20 ns/keystroke bare, ~60 ns through `TextDoc` (the
-collab tax is event bookkeeping, no CRDT work on the local path), ~2 ns
-snapshots, 27 GB/s chunk scans.
+a Ryzen 9 5950X: ~20 ns/keystroke bare, ~65 ns through `TextDoc` (the
+collab tax is event bookkeeping, no CRDT work on the local path), ~3 ns
+snapshots, 23 GB/s chunk scans.
 
 Merges resume a persistent walker over an order-statistics sequence, so a
 sync costs O(log n) per event in the events since the last merge, not a

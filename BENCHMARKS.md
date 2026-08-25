@@ -13,38 +13,38 @@ thread_safe=true`.
 
 ```
 typing ascii                       19 ns/op  (best       19)  n=11
-typing unicode                     20 ns/op  (best       20)  n=11
-typing ascii +snap                 18 ns/op  (best       17)  n=11
-random-edit 1MiB                  360 ns/op  (best      343)  n=11
-conv offsetToPoint                228 ns/op  (best      225)  n=11
-conv pointToOffset                338 ns/op  (best      334)  n=11
-conv offsetToUtf16                194 ns/op  (best      189)  n=11
-load fromSlice 32MiB            1.957 GB/s   (best    2.031)  n=11
-load fromBacking 32MiB          3.009 GB/s   (best    3.038)  n=11
-load chunk scan 32MiB          27.652 GB/s   (best   28.566)  n=11
-load snapshot+drop                  2 ns/op  (best        2)  n=11
+typing unicode                     21 ns/op  (best       21)  n=11
+typing ascii +snap                 19 ns/op  (best       18)  n=11
+random-edit 1MiB                  333 ns/op  (best      327)  n=11
+conv offsetToPoint                253 ns/op  (best      228)  n=11
+conv pointToOffset                369 ns/op  (best      345)  n=11
+conv offsetToUtf16                217 ns/op  (best      194)  n=11
+load fromSlice 32MiB            1.823 GB/s   (best    1.937)  n=11
+load fromBacking 32MiB          2.998 GB/s   (best    3.043)  n=11
+load chunk scan 32MiB          22.702 GB/s   (best   24.813)  n=11
+load snapshot+drop                  3 ns/op  (best        2)  n=11
 ```
 
 - **typing** is the uniqueness fast path: in-place leaf mutation, zero
   allocation per keystroke. Holding a live snapshot (`+snap`, refreshed every
   1024 ops) is statistically identical — spine copy-on-write amortizes.
-- **snapshot+drop at ~2 ns** is the O(1) refcount-bump claim, measured.
-- **fromBacking vs fromSlice** (3.0 vs 2.0 GB/s): borrowed leaves skip the
+- **snapshot+drop at ~3 ns** is the O(1) refcount-bump claim, measured.
+- **fromBacking vs fromSlice** (3.0 vs 1.8 GB/s): borrowed leaves skip the
   copy; what remains is the summary scan, the inherent floor for a
   metrics-carrying rope.
 
 ## Collaboration layer
 
 ```
-collab doc-typing ascii            61 ns/op  (best       60)  n=11
-collab merge linear 4k units      258 ns/op  (best      258)  n=5
+collab doc-typing ascii            64 ns/op  (best       62)  n=11
+collab merge linear 4k units      267 ns/op  (best      266)  n=5
 collab wire 4k units             4119 B rle vs   44683 B unit (10x)
-collab merge concurrent 1k+1k     792 ns/op  (best      774)  n=5
-collab merge growing x256         379 ns/op  (best      373)  n=3
-collab merge growing x2048        447 ns/op  (best      437)  n=3
+collab merge concurrent 1k+1k     827 ns/op  (best      808)  n=5
+collab merge growing x256         380 ns/op  (best      367)  n=3
+collab merge growing x2048        440 ns/op  (best      435)  n=3
 ```
 
-- **doc-typing ~60 ns vs ~20 ns bare rope**: the local collab tax is event
+- **doc-typing ~65 ns vs ~20 ns bare rope**: the local collab tax is event
   recording (frontier snapshot + graph append). No CRDT work happens on the
   local path — this is bookkeeping only.
 - **Wire (run-RLE frames)**: a monotone typing or deletion burst encodes as
@@ -63,9 +63,9 @@ collab merge growing x2048        447 ns/op  (best      437)  n=3
 ## ObjectDoc batch validation — O(n²) → O(n) — 2026-08-23
 
 ```
-collab merge object 4096 scalars      414 ns/op  (best      411)  n=3
-collab merge object 32768 scalars     447 ns/op  (best      420)  n=3
-collab merge object 131072 scalars    456 ns/op  (best      450)  n=3
+collab merge object 4096 scalars      388 ns/op  (best      379)  n=3
+collab merge object 32768 scalars     422 ns/op  (best      415)  n=3
+collab merge object 131072 scalars    450 ns/op  (best      443)  n=3
 ```
 
 - **`ObjectDoc.Decoder.validate` had the same hidden O(n²) `seenEarlier`
@@ -80,4 +80,4 @@ collab merge object 131072 scalars    456 ns/op  (best      450)  n=3
   pass alongside the existing contiguity/parent checks, same
   accept/reject decisions on every input — the atomic-rejection fuzz
   batteries pass unmodified): now flat at ~410–460 ns/op regardless of N —
-  a 131072-scalar merge went 19.1s → 60ms, ~320× faster.
+  a 131072-scalar merge went 19.1s → 59ms, ~320× faster.

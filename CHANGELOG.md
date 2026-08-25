@@ -4,7 +4,21 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] — 2026-08-25
+
+### Fixed
+
+- **`AnchorSet.shift` could corrupt its sorted order after a replacement** —
+  a left-biased anchor at the removed range's end could sort after
+  right-biased anchors collapsed onto the same offset. Later `set`/`remove`
+  operations could then run past the order array. The collapse window now
+  includes that boundary-left group; randomized add/remove/set/shift coverage
+  asserts the full ordering invariant, including dead slots.
+- **Equivalent causal frontiers could serialize differently across
+  replicas** — frontier heads were emitted in replica-local event-index order.
+  Tokens now encode the portable `(agent name, sequence)` heads in canonical
+  order. The wire format is unchanged; frontiers remain opaque causal
+  antichains, never scalar clocks.
 
 ## [0.5.2] — 2026-08-23
 
