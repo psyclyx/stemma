@@ -21,16 +21,44 @@ pub const VersionError = Allocator.Error || error{ Corrupt, MissingDependency };
 /// Encode the current frontier as an opaque, replica-portable token
 /// (agent NAMES + seqs — local numbering never crosses the wire).
 pub fn encodeVersion(gpa: Allocator, history: anytype) Allocator.Error![]u8 {
+    const PortableHead = struct {
+        name: []const u8,
+        seq: u64,
+    };
+
+    var heads: std.ArrayList(PortableHead) = .empty;
+    defer heads.deinit(gpa);
+    try heads.ensureTotalCapacity(gpa, history.frontier.items.len);
+    for (history.frontier.items) |lv| {
+        const id = history.idOf(lv);
+        try heads.append(gpa, .{
+            .name = history.agentName(id.agent),
+            .seq = id.seq,
+        });
+    }
+
+    // `Lv` is intentionally replica-local.  The frontier itself may have
+    // the same portable heads in different local orders, so the order on
+    // the wire must be derived only from the portable identity.
+    const PortableOrder = struct {
+        fn less(_: void, a: PortableHead, b: PortableHead) bool {
+            return switch (std.mem.order(u8, a.name, b.name)) {
+                .lt => true,
+                .gt => false,
+                .eq => a.seq < b.seq,
+            };
+        }
+    };
+    std.mem.sort(PortableHead, heads.items, {}, PortableOrder.less);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, version_magic);
-    try putUv(gpa, &out, history.frontier.items.len);
-    for (history.frontier.items) |lv| {
-        const id = history.idOf(lv);
-        const name = history.agentName(id.agent);
-        try putUv(gpa, &out, name.len);
-        try out.appendSlice(gpa, name);
-        try putUv(gpa, &out, id.seq);
+    try putUv(gpa, &out, heads.items.len);
+    for (heads.items) |head| {
+        try putUv(gpa, &out, head.name.len);
+        try out.appendSlice(gpa, head.name);
+        try putUv(gpa, &out, head.seq);
     }
     return out.toOwnedSlice(gpa);
 }

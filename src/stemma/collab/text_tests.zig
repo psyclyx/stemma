@@ -488,6 +488,37 @@ test "compareVersions: equal, ancestor, descendant, concurrent" {
     try t.expectError(error.MissingDependency, alice.compareVersions(gpa, v1, unknown));
 }
 
+test "version tokens canonically order concurrent heads across replicas" {
+    const gpa = t.allocator;
+    var alice: TextDoc = .empty;
+    defer alice.deinit(gpa);
+    var bob: TextDoc = .empty;
+    defer bob.deinit(gpa);
+    try alice.setAgent(gpa, "alice");
+    try bob.setAgent(gpa, "bob");
+
+    // Each replica creates one concurrent event first.  Merging in opposite
+    // directions gives the two graphs opposite local Lv orders while leaving
+    // them with the same portable frontier {alice#0, bob#0}.
+    _ = try alice.insert(gpa, 0, "a");
+    _ = try bob.insert(gpa, 0, "b");
+    const alice_events = try alice.serialize(gpa);
+    defer gpa.free(alice_events);
+    const bob_events = try bob.serialize(gpa);
+    defer gpa.free(bob_events);
+
+    const alice_edits = try alice.merge(gpa, bob_events);
+    defer gpa.free(alice_edits);
+    const bob_edits = try bob.merge(gpa, alice_events);
+    defer gpa.free(bob_edits);
+
+    const alice_version = try alice.version(gpa);
+    defer gpa.free(alice_version);
+    const bob_version = try bob.version(gpa);
+    defer gpa.free(bob_version);
+    try t.expectEqualSlices(u8, alice_version, bob_version);
+}
+
 test "materializeAt: time travel to any known version" {
     const gpa = t.allocator;
     var d: TextDoc = .empty;
