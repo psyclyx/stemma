@@ -145,12 +145,18 @@ pub fn shift(self: *AnchorSet, edit: Edit) void {
     const items = self.order.items;
     const removed_end = edit.offset + edit.removed;
 
-    // Window of anchors whose original offset < removed_end: these
-    // collapse onto (offset, .left) or (offset+inserted, .right) and need
-    // repartitioning. Everything after moves by a uniform delta.
+    // Window of anchors which can collide after the edit. Positions inside
+    // the removed range collapse onto (offset, .left) or
+    // (offset+inserted, .right). A LEFT-biased anchor exactly at removed_end
+    // also lands at offset+inserted and must join the repartition: otherwise
+    // it remains after the collapsed RIGHT anchors at that same offset,
+    // violating the set's (offset,bias) ordering invariant. Everything after
+    // that boundary-left group moves by a uniform delta and stays ordered.
     var i = start;
-    while (i < items.len and self.slots.items[items[i]].anchor.offset < removed_end) : (i += 1) {
+    while (i < items.len) : (i += 1) {
         const s = &self.slots.items[items[i]];
+        if (s.anchor.offset > removed_end or
+            (s.anchor.offset == removed_end and s.anchor.bias != .left)) break;
         s.anchor = s.anchor.shift(edit);
     }
     var j = i;
@@ -205,6 +211,15 @@ pub const RangeIterator = struct {
 
 const t = std.testing;
 
+fn expectOrderSorted(aset: *const AnchorSet) !void {
+    var previous: ?Anchor = null;
+    for (aset.order.items) |slot| {
+        const current = aset.slots.items[slot].anchor;
+        if (previous) |p| try t.expect(!keyLessThan(current, p));
+        previous = current;
+    }
+}
+
 test "AnchorSet: sorted shift matches per-anchor shift" {
     const gpa = t.allocator;
     var aset: AnchorSet = .empty;
@@ -217,6 +232,8 @@ test "AnchorSet: sorted shift matches per-anchor shift" {
     defer naive.deinit(gpa);
     var handles: std.ArrayList(AnchorSet.Handle) = .empty;
     defer handles.deinit(gpa);
+    var alive: std.ArrayList(bool) = .empty;
+    defer alive.deinit(gpa);
 
     // Seed anchors across a 1000-byte document.
     for (0..200) |_| {
@@ -226,7 +243,19 @@ test "AnchorSet: sorted shift matches per-anchor shift" {
         };
         try naive.append(gpa, a);
         try handles.append(gpa, try aset.add(gpa, a));
+        try alive.append(gpa, true);
     }
+
+    // Keep dead slots in the sorted order while edits run. This is the state
+    // in which a bad repartition can remain latent until a later set/remove.
+    for (0..32) |_| {
+        const idx = random.uintLessThan(usize, alive.items.len);
+        if (alive.items[idx]) {
+            aset.remove(handles.items[idx]);
+            alive.items[idx] = false;
+        }
+    }
+    try expectOrderSorted(&aset);
 
     // Random edits; every anchor must match its individually-shifted twin.
     var doc_len: usize = 1000;
@@ -238,10 +267,47 @@ test "AnchorSet: sorted shift matches per-anchor shift" {
         doc_len = doc_len - removed + inserted;
 
         aset.shift(e);
-        for (naive.items, handles.items) |*a, h| {
+        for (naive.items, handles.items, alive.items) |*a, h, is_alive| {
             a.* = a.shift(e);
-            try t.expectEqual(a.*, aset.get(h));
+            if (is_alive) try t.expectEqual(a.*, aset.get(h));
         }
+        // Check every order entry, including dead slots, after every shift.
+        try expectOrderSorted(&aset);
+
+        // Occasionally mutate the set between shifts too. The reference
+        // model tracks only live handles, while old handles remain inert
+        // until a recycled slot is represented by a later append.
+        switch (random.uintLessThan(usize, 8)) {
+            0 => {
+                const idx = random.uintLessThan(usize, naive.items.len);
+                if (alive.items[idx]) {
+                    const a: Anchor = .{
+                        .offset = random.uintLessThan(usize, doc_len + 1),
+                        .bias = if (random.boolean()) .left else .right,
+                    };
+                    aset.set(handles.items[idx], a);
+                    naive.items[idx] = a;
+                }
+            },
+            1 => {
+                const idx = random.uintLessThan(usize, naive.items.len);
+                if (alive.items[idx]) {
+                    aset.remove(handles.items[idx]);
+                    alive.items[idx] = false;
+                }
+            },
+            2 => {
+                const a: Anchor = .{
+                    .offset = random.uintLessThan(usize, doc_len + 1),
+                    .bias = if (random.boolean()) .left else .right,
+                };
+                try naive.append(gpa, a);
+                try handles.append(gpa, try aset.add(gpa, a));
+                try alive.append(gpa, true);
+            },
+            else => {},
+        }
+        try expectOrderSorted(&aset);
     }
 }
 
@@ -276,4 +342,31 @@ test "AnchorSet: handles stable across add/remove/compact; range queries" {
     try t.expectEqual(@as(usize, 10), it2.next().?.anchor.offset);
     try t.expectEqual(@as(usize, 30), it2.next().?.anchor.offset);
     try t.expectEqual(@as(usize, 99), it2.next().?.anchor.offset);
+}
+
+test "AnchorSet: replacement keeps collapsed rights after boundary lefts" {
+    var aset: AnchorSet = .empty;
+    defer aset.deinit(t.allocator);
+
+    // This is the editor shape: a right-biased caret and range start at the
+    // replacement start, with the range's left-biased end at removed_end.
+    // All three land at byte 3 after an equal-length replacement. The left
+    // endpoint must sort before both rights or lowerBound-based set/remove
+    // can no longer find otherwise-live handles.
+    const caret = try aset.add(t.allocator, .{ .offset = 0, .bias = .right });
+    const start = try aset.add(t.allocator, .{ .offset = 0, .bias = .right });
+    const end = try aset.add(t.allocator, .{ .offset = 3, .bias = .left });
+
+    aset.shift(.{ .offset = 0, .removed = 3, .inserted = 3 });
+    try t.expectEqual(@as(usize, 3), aset.get(caret).offset);
+    try t.expectEqual(@as(usize, 3), aset.get(start).offset);
+    try t.expectEqual(@as(usize, 3), aset.get(end).offset);
+
+    // Both operations search from lowerBound; the historical corruption
+    // either ran off the array in set() or left removal bookkeeping invalid.
+    aset.set(caret, .{ .offset = 0, .bias = .right });
+    aset.remove(start);
+    aset.remove(end);
+    try t.expectEqual(@as(usize, 0), aset.get(caret).offset);
+    try t.expectEqual(@as(usize, 1), aset.count());
 }
