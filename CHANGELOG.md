@@ -4,7 +4,33 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] — 2026-08-28
+
+### Added
+
+- **Identity anchors into loaded base content** — `openFromContent` gives a
+  text object its content as a base with zero `text_ins` events, but every
+  base scalar carried a placeholder, so `anchorAt` into loaded content
+  returned `error.Compacted`. Anything naming a character rather than an
+  offset — a caret, a shared cursor, a region grant, a diagnostic — was
+  therefore unavailable on exactly the content a file load produces, which
+  forced callers to choose between a cheap load and an addressable one.
+  `EventAnchor` gains an `offset` field naming a scalar WITHIN the anchored
+  event, defaulting to 0 (what every single-scalar `text_ins` already
+  means), and a base scalar is named as (the object's creating event,
+  offset). Base items already sit at arenas `0..count` in scalar order, so
+  resolution is arithmetic: no new events, no reserved sequence ranges, no
+  change to merge semantics, and no wire change — `EventAnchor` is a query
+  type and is never serialized. Two replicas that load the same bytes under
+  the same key derive the same anchors, since the base agent is
+  content-addressed.
+
+  Only a base LOADED from content is addressable this way. A base from
+  `compact` still reports `error.Compacted`: its characters *did* have
+  per-event identities, and minting (creating event, offset) names for them
+  would disagree with an uncompacted replica still holding the originals.
+  A base adopted from a peer's batch is likewise left unaddressable, which
+  fails closed rather than inventing a name the sender never used.
 
 ## [0.6.0] — 2026-08-25
 

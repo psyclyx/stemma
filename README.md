@@ -142,7 +142,7 @@ and incremental persistence.
 
 ## Status
 
-v0.6.0. The rope and both collaboration materializers are implemented,
+v0.7.0. The rope and both collaboration materializers are implemented,
 tested, and benchmarked (see [BENCHMARKS.md](BENCHMARKS.md)). Headlines on
 a Ryzen 9 5950X: ~20 ns/keystroke bare, ~65 ns through `TextDoc` (the
 collab tax is event bookkeeping, no CRDT work on the local path), ~3 ns
