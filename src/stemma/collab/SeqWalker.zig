@@ -117,6 +117,21 @@ pub fn SeqWalker(comptime storage: Storage) type {
             .dense => std.ArrayList(i32),
             .sparse => std.AutoHashMapUnmanaged(Lv, i32),
         } = .empty,
+        /// The event whose insertion the base items stand for, when the base
+        /// has one — see `EventAnchor.offset`. Set for a base LOADED from
+        /// content (`ObjectDoc.openFromContent`), where the creating event is
+        /// the whole provenance of every base scalar and every replica that
+        /// loads the same bytes agrees on it. Null for a base produced by
+        /// `compact`, whose characters DID have per-event identities that
+        /// compaction discarded: minting (creating event, offset) names there
+        /// would disagree with an uncompacted replica still holding the
+        /// originals, so those stay `error.Compacted`.
+        base_id: ?EventId = null,
+        /// Base item count, i.e. the exclusive upper bound on a base anchor's
+        /// `offset`. Base items occupy arenas `0..base_count` in scalar order
+        /// (`Sequence.initBase` appends them first and the arena is
+        /// append-only), so a base anchor's `offset` IS its arena index.
+        base_count: usize = 0,
 
         pub const empty: Self = .{};
 
@@ -125,9 +140,13 @@ pub fn SeqWalker(comptime storage: Storage) type {
             self.item_of.deinit(gpa);
         }
 
-        /// Must precede any live item; see `Sequence.initBase`.
-        pub fn initBase(self: *Self, gpa: Allocator, count: usize, placeholder_lv: Lv) Allocator.Error!void {
+        /// Must precede any live item; see `Sequence.initBase`. `base_id` is
+        /// the creating event to anchor base scalars against, or null to leave
+        /// them unaddressable (see the field's doc comment).
+        pub fn initBase(self: *Self, gpa: Allocator, count: usize, placeholder_lv: Lv, base_id: ?EventId) Allocator.Error!void {
             try self.s.initBase(gpa, count, placeholder_lv);
+            self.base_id = base_id;
+            self.base_count = count;
         }
 
         fn recordArena(self: *Self, gpa: Allocator, lv: Lv, arena: i32) Allocator.Error!void {
@@ -217,6 +236,16 @@ pub const EventAnchor = struct {
     /// the caller (`anchorAt` allocates it; free with `gpa.free`).
     agent: []const u8 = "",
     seq: u64 = 0,
+    /// Which scalar WITHIN the named event's insertion, when one event
+    /// covers more than one character. `text_ins` inserts a single scalar,
+    /// so it is always 0 there — the field exists for the one event that
+    /// is not one character wide: a loaded base's creating `map_set`
+    /// (`ObjectDoc.openFromContent`), whose single retained event stands
+    /// for every scalar of the loaded content. Naming a character as
+    /// (event, offset) rather than folding the offset into `seq` is what
+    /// keeps a base addressable without minting per-character events, and
+    /// is the same shape a future run-encoded insert would want.
+    offset: u64 = 0,
     side: AnchorSide = .before,
 };
 
@@ -253,18 +282,32 @@ pub fn anchorAt(
     target_index: u64,
     side: AnchorSide,
 ) AnchorError!EventAnchor {
-    var it = sw.s.aliveIterator();
+    // Walked by arena rather than through `aliveIterator` because a base
+    // item's identity IS its arena index (`base_count`) — there is no `lv`
+    // to ask `idOf` for.
+    var it = sw.s.allIterator();
     var i: u64 = 0;
-    while (it.next()) |alive| : (i += 1) {
+    while (it.next()) |arena| {
+        const item = &sw.s.items.items[@intCast(arena)];
+        if (!item.effect_visible) continue;
         if (i == target_index) {
-            if (alive.lv == base_placeholder_lv) return error.Compacted;
-            const id = history.idOf(alive.lv);
+            if (item.lv == base_placeholder_lv) {
+                const base = sw.base_id orelse return error.Compacted;
+                return .{
+                    .agent = try gpa.dupe(u8, history.agentName(base.agent)),
+                    .seq = base.seq,
+                    .offset = @intCast(arena),
+                    .side = side,
+                };
+            }
+            const id = history.idOf(item.lv);
             return .{
                 .agent = try gpa.dupe(u8, history.agentName(id.agent)),
                 .seq = id.seq,
                 .side = side,
             };
         }
+        i += 1;
     }
     unreachable; // target_index < alive count by construction
 }
@@ -314,6 +357,20 @@ pub fn resolveAnchors(
         }
         const agent = history.findAgent(a.agent) orelse return error.MissingDependency;
         const id: EventId = .{ .agent = agent, .seq = a.seq };
+        // A base anchor names the creating event plus a scalar within the
+        // loaded content, so it resolves arithmetically — `lvOf` would find
+        // the creating `map_set`, which was never applied to this sequence.
+        if (sw.base_id) |base| {
+            if (base.agent == id.agent and base.seq == id.seq) {
+                if (a.offset >= sw.base_count) return error.Corrupt;
+                const arena: i32 = @intCast(a.offset);
+                const item = &sw.s.items.items[@intCast(arena)];
+                var scalar = alive_before[@intCast(arena)];
+                if (item.effect_visible and a.side == .after) scalar += 1;
+                o.* = scalar;
+                continue;
+            }
+        }
         const lv = history.lvOf(id) orelse {
             return if (history.isKnown(id)) error.Compacted else error.MissingDependency;
         };

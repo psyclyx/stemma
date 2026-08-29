@@ -148,7 +148,9 @@ const Replay = struct {
     /// Must precede any live item; only valid when the cache is fresh
     /// (`walked == 0`), since the placeholders must sit first in `sw`.
     fn initBase(self: *Replay, gpa: Allocator, count: usize) Allocator.Error!void {
-        try self.sw.initBase(gpa, count, base_lv);
+        // A `TextDoc` base only ever comes from `compact`, never from a content
+        // load, so its scalars stay unaddressable (`SeqWalker.base_id`).
+        try self.sw.initBase(gpa, count, base_lv, null);
     }
 
     const ReplayError = Allocator.Error || error{Corrupt};

@@ -113,7 +113,17 @@ pub fn between(gpa: Allocator, a: ?[]const u8, b: ?[]const u8) Allocator.Error![
 /// `ObjectDoc.zig`'s compaction doc comment for why list content doesn't).
 /// Owned by the `ObjectDoc`; `Walker` only borrows it (read-only, to seed
 /// a fresh per-object `SeqWalker`'s `initBase`).
-pub const TextBase = struct { bytes: []const u8, scalars: usize };
+pub const TextBase = struct {
+    bytes: []const u8,
+    scalars: usize,
+    /// Whether base scalars can be named by identity anchors, as (this
+    /// object's creating event, offset) — see `SeqWalker.base_id` for why
+    /// that holds for a base LOADED from content and not for one produced by
+    /// `compact`. Not carried on the wire: a base adopted from a peer's batch
+    /// stays false, which fails closed (`error.Compacted`) rather than
+    /// minting a name the sender might not agree to.
+    anchorable: bool = false,
+};
 /// Keyed by the text object's PORTABLE creation identity, not its `Lv` —
 /// under whole-doc compaction the object's OWN creation event (a
 /// `map_set` or `list_ins`) can itself end up compacted away, same as
@@ -448,8 +458,9 @@ pub const Walker = struct {
             // `TextBase`). Must happen before any real item is applied
             // (`SeqWalker.initBase`'s own precondition).
             if (self.text_bases) |bases| {
-                if (bases.get(self.graph.idOf(obj))) |base| {
-                    try gop.value_ptr.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv);
+                const obj_id = self.graph.idOf(obj);
+                if (bases.get(obj_id)) |base| {
+                    try gop.value_ptr.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv, if (base.anchorable) obj_id else null);
                 }
             }
         }

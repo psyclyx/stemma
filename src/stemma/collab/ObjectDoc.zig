@@ -1275,7 +1275,11 @@ pub fn openFromContent(gpa: Allocator, content: []const u8, key: []const u8) (Al
     {
         const bytes_owned = try gpa.dupe(u8, content);
         errdefer gpa.free(bytes_owned);
-        try doc.text_bases.put(gpa, obj, .{ .bytes = bytes_owned, .scalars = scalars });
+        // Anchorable: `obj`'s creating event is the entire provenance of this
+        // content, and it is content-addressed, so every replica that loads
+        // the same bytes under the same key derives the same event to anchor
+        // against (`SeqWalker.base_id`).
+        try doc.text_bases.put(gpa, obj, .{ .bytes = bytes_owned, .scalars = scalars, .anchorable = true });
     }
     {
         var rope = try Rope.fromSlice(gpa, content);
@@ -1991,8 +1995,9 @@ fn silentObjectReplay(self: *const ObjectDoc, gpa: Allocator, obj_lv: Lv) Alloca
     // directly from `self.text_bases` here.
     if (w.seqs.fetchRemove(obj_lv)) |kv| return kv.value;
     var sw: SeqWalker = .empty;
-    if (self.text_bases.get(self.history.idOf(obj_lv))) |base| {
-        try sw.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv);
+    const base_obj_id = self.history.idOf(obj_lv);
+    if (self.text_bases.get(base_obj_id)) |base| {
+        try sw.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv, if (base.anchorable) base_obj_id else null);
     }
     return sw;
 }
@@ -2156,7 +2161,7 @@ pub fn materializeAt(
         // `silentObjectReplay` uses for the analogous current-version case.
         var s: SeqWalker = .empty;
         if (self.text_bases.get(obj_id)) |base| {
-            try s.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv);
+            try s.initBase(gpa, base.scalars, seq_walker.base_placeholder_lv, if (base.anchorable) obj_id else null);
         }
         break :blk s;
     };

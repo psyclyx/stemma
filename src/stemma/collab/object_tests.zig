@@ -2902,3 +2902,86 @@ fn randomGapKey(gpa: std.mem.Allocator, d: *const ObjectDoc, kids: []const Objec
     }
     return ObjectDoc.orderKeyBetween(gpa, a, b);
 }
+
+test "openFromContent: loaded content is anchorable, and identically on every replica" {
+    const gpa = t.allocator;
+    // A bulk-loaded base is the shape a file load takes: zero `text_ins`
+    // events, so the content is fast to open. It must still be ADDRESSABLE —
+    // a caret, a diagnostic, a shared cursor and a region grant all name a
+    // character in it, and a base whose characters have no identity forces
+    // every one of those to fall back to offsets that edits invalidate.
+    var a = try ObjectDoc.openFromContent(gpa, "alpha beta gamma\n", "body");
+    defer a.deinit(gpa);
+    const a_body = a.root().mapGet("body").?.objId().?;
+
+    // Anchor the 'b' of "beta" (offset 6) — content that came from the load
+    // and was never typed.
+    const anchor = try a.objectAnchorAt(gpa, a_body, 6, .before);
+    defer gpa.free(anchor.agent);
+
+    var out: [1]usize = undefined;
+    try a.resolveObjectAnchors(gpa, a_body, &.{anchor}, &out);
+    try t.expectEqual(@as(usize, 6), out[0]);
+
+    // It tracks the CHARACTER, not the offset: inserting ahead of it moves it.
+    try a.setAgent(gpa, "alice");
+    _ = try a.textInsert(gpa, a_body, 0, "XY");
+    try a.resolveObjectAnchors(gpa, a_body, &.{anchor}, &out);
+    try t.expectEqual(@as(usize, 8), out[0]);
+
+    // And the identity is DETERMINISTIC across independent loads of the same
+    // bytes — the property that lets two peers who each opened the file name
+    // the same character without shipping any per-character metadata.
+    var b = try ObjectDoc.openFromContent(gpa, "alpha beta gamma\n", "body");
+    defer b.deinit(gpa);
+    const b_body = b.root().mapGet("body").?.objId().?;
+    const b_anchor = try b.objectAnchorAt(gpa, b_body, 6, .before);
+    defer gpa.free(b_anchor.agent);
+    try t.expectEqualStrings(anchor.agent, b_anchor.agent);
+    try t.expectEqual(anchor.seq, b_anchor.seq);
+}
+
+test "openFromContent: base anchors coexist with typed text, and fail closed out of range" {
+    const gpa = t.allocator;
+    var d = try ObjectDoc.openFromContent(gpa, "0123456789", "body");
+    defer d.deinit(gpa);
+    const body = d.root().mapGet("body").?.objId().?;
+
+    // A character from the load...
+    const from_base = try d.objectAnchorAt(gpa, body, 3, .before);
+    defer gpa.free(from_base.agent);
+    try d.setAgent(gpa, "alice");
+    _ = try d.textInsert(gpa, body, 0, "ab");
+    // ...and one that was typed. Both name characters in the same object,
+    // through the same anchor type, and the caller cannot tell them apart.
+    const from_typed = try d.objectAnchorAt(gpa, body, 1, .before);
+    defer gpa.free(from_typed.agent);
+
+    var out: [2]usize = undefined;
+    try d.resolveObjectAnchors(gpa, body, &.{ from_base, from_typed }, &out);
+    try t.expectEqual(@as(usize, 5), out[0]);
+    try t.expectEqual(@as(usize, 1), out[1]);
+
+    // Deleting the typed run ahead of the base anchor moves it back by the
+    // two scalars removed, and collapses the typed anchor — which pointed
+    // INTO that run — to the deletion point instead of losing it.
+    _ = try d.textDelete(gpa, body, .{ .start = 0, .end = 2 });
+    try d.resolveObjectAnchors(gpa, body, &.{ from_base, from_typed }, &out);
+    try t.expectEqual(@as(usize, 3), out[0]);
+    try t.expectEqual(@as(usize, 0), out[1]);
+
+    // And deleting the anchored base character itself collapses its anchor
+    // the same way, rather than reporting a stale or out-of-range position.
+    _ = try d.textDelete(gpa, body, .{ .start = 3, .end = 4 });
+    try d.resolveObjectAnchors(gpa, body, &.{from_base}, out[0..1]);
+    try t.expectEqual(@as(usize, 3), out[0]);
+    const final = try bodyText(gpa, &d, body);
+    defer gpa.free(final);
+    try t.expectEqualStrings("012456789", final);
+
+    // An offset past the base's own scalar count is not a position anyone
+    // could have anchored — it is a corrupt anchor, not a clamp.
+    const bogus: @TypeOf(from_base) = .{ .agent = from_base.agent, .seq = from_base.seq, .offset = 10_000, .side = .before };
+    var one: [1]usize = undefined;
+    try t.expectError(error.Corrupt, d.resolveObjectAnchors(gpa, body, &.{bogus}, &one));
+}
