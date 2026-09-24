@@ -14,8 +14,10 @@ let
   overlay = final: _prev: mkPackages final;
 in
 {
-  nixpkgs ? npins.nixpkgs,
+  sources ? npins,
+  nixpkgs ? sources.nixpkgs,
   pkgs ? import nixpkgs { },
+  ...
 }:
 let
   finalPkgs = pkgs.extend overlay;
