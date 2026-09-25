@@ -12,9 +12,25 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Static library artifact (installed by `zig build`) ──
+    // Its own module (not `stemma_mod`) so its strip policy cannot leak into
+    // the tests or into downstream consumers of the public module. The
+    // installed archive is a distribution artifact, so release builds omit
+    // debug info (Debug keeps it for local debugging). Without this, the
+    // archive's DWARF records the compiler-generated builtin.zig's location
+    // in the global cache directory — a per-build temp path under the Nix
+    // build hook — making the shipped bytes nondeterministic. Linked
+    // artifacts (executables, shared libraries) never show this because the
+    // final link drops that DWARF; an archive has no link step, so the
+    // release artifact is built stripped at the source instead.
+    const stemma_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/stemma/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize != .Debug,
+    });
     const lib = b.addLibrary(.{
         .name = "stemma",
-        .root_module = stemma_mod,
+        .root_module = stemma_lib_mod,
         .linkage = .static,
     });
     b.installArtifact(lib);
