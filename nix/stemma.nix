@@ -4,8 +4,6 @@
   zig_0_16,
   pname ? "stemma",
   version ? "0.7.0",
-  optimize ? "fast",
-  cpu ? "baseline",
 }:
 
 let
@@ -13,6 +11,7 @@ let
 in
 stdenv.mkDerivation {
   inherit pname version;
+
   # Only the files the build actually consumes: the build graph and the
   # library sources. Entry points (default.nix, shell.nix), npins/, docs,
   # and dev/ benchmarks are not package inputs, so editing them must not
@@ -26,19 +25,10 @@ stdenv.mkDerivation {
     ];
   };
 
-  # zig.hook drives `zig build` (configure/build/install phases) using the
-  # pinned Zig from nixpkgs. No C deps, so no buildInputs.
+  # The plain nixpkgs zig build: zig.hook runs build/install with the
+  # toolchain's default optimize/cpu flags. Nothing else is needed for a
+  # normal zig build.
   nativeBuildInputs = [ zig.hook ];
-
-  zigBuildFlags = [
-    "--release=${optimize}"
-    "-Dcpu=${cpu}"
-  ];
-
-  # The Zig `test` step is exercised via `nix-shell --run 'zig build test'`
-  # and CI rather than baked into the derivation's check phase.
-  dontUseZigCheck = true;
-  dontSetZigDefaultFlags = true;
 
   meta = {
     description = "Event-graph CRDT library with an editor-grade text rope at its core";
