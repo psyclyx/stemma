@@ -2,7 +2,6 @@
   lib,
   stdenv,
   zig_0_16,
-  src ? ../.,
   pname ? "stemma",
   version ? "0.7.0",
   optimize ? "fast",
@@ -11,26 +10,21 @@
 
 let
   zig = zig_0_16;
-
-  cleanSrc = lib.cleanSourceWith {
-    inherit src;
-    filter =
-      path: type:
-      let
-        name = builtins.baseNameOf path;
-      in
-      !(builtins.elem name [
-        ".direnv"
-        ".worktrees"
-        ".zig-cache"
-        "zig-out"
-      ])
-      && lib.cleanSourceFilter path type;
-  };
 in
 stdenv.mkDerivation {
   inherit pname version;
-  src = cleanSrc;
+  # Only the files the build actually consumes: the build graph and the
+  # library sources. Entry points (default.nix, shell.nix), npins/, docs,
+  # and dev/ benchmarks are not package inputs, so editing them must not
+  # churn the source hash.
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../build.zig
+      ../build.zig.zon
+      ../src
+    ];
+  };
 
   # zig.hook drives `zig build` (configure/build/install phases) using the
   # pinned Zig from nixpkgs. No C deps, so no buildInputs.

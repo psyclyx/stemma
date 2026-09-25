@@ -2,10 +2,9 @@ let
   npins = import ./npins;
 
   mkPackages = pkgs: {
-    # Pass src explicitly: nix/stemma.nix has a `src` formal, and without this
-    # callPackage would fill it from pkgs.src (a throwing alias). The
-    # derivation cleans the tree itself.
-    stemma = pkgs.callPackage ./nix/stemma.nix { src = ./.; };
+    # The derivation fileset-scopes its own src (see nix/stemma.nix), so no
+    # src plumbing is needed here.
+    stemma = pkgs.callPackage ./nix/stemma.nix { };
   };
 
   # Scoped against `final` so packages can reference each other; lazy, so no
